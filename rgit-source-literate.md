@@ -1066,7 +1066,6 @@ saveFetchedBundle remote (Just bPath) = do
         Just _ -> void $ Git.fetchFromBundle fetchedBundleName
         Nothing -> return ()
 
-    -- ... rest unchanged
     -- Output fetch results in git format
     case (maybeOldHash, maybeNewHash) of
         (Nothing, Just newHash) -> do
@@ -1780,7 +1779,7 @@ getLocalHead = do
 
 getHashFromBundle :: String -> IO (Maybe String)
 getHashFromBundle name = do
-    (code, out, _) <- runGit (GetBundleHead $ bundlePath name)
+    (code, out, _) <- runGit (GetBundleHead $ internalBundlePath name)
     return $ guard (code == ExitSuccess && not (null out)) >> listToMaybe (words out)
 
 runGitCommand :: GitCommand -> IO ExitCode
@@ -1900,7 +1899,7 @@ setupRemote url = addRemote "origin" url
 -- pull from the fetched bundle; without it, the ref would point to a hash not in the repo.
 fetchFromBundle :: String -> IO ExitCode
 fetchFromBundle name = do
-    let bundle = bundlePath name
+    let bundle = internalBundlePath name
     (code, out, err) <- readProcessWithExitCode "git"
         (baseFlags ++ ["fetch", bundle, "refs/heads/main:refs/remotes/origin/main"]) ""
     putStr out
