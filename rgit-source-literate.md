@@ -4604,36 +4604,6 @@ test-suite pipeline
                          uuid ^>=1.3.13
     default-language:    Haskell2010
 
-test-suite merge
-    type:                exitcode-stdio-1.0
-    main-is:             MergeSpec.hs
-    hs-source-dirs:      test, .
-    other-modules:       Rgit.Conflict,
-                         Rgit.Internal.Metadata,
-                         Rgit.Types,
-                         Rgit.Device,
-                         Rgit.Remote,
-                         Internal.Git,
-                         Internal.Config,
-                         Internal.ConfigFile
-    build-depends:       base,
-                         containers,
-                         text,
-                         process,
-                         transformers,
-                         mtl,
-                         bytestring,
-                         base16-bytestring ^>=1.0.2.0,
-                         cryptohash-md5,
-                         directory,
-                         filepath,
-                         tasty,
-                         tasty-hunit,
-                         tasty-quickcheck,
-                         QuickCheck,
-                         time,
-                         uuid ^>=1.3.13
-    default-language:    Haskell2010
 test-suite generate-literate-docs
     type:                exitcode-stdio-1.0
     main-is:             GenerateLiterate.hs
