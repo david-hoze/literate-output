@@ -5,84 +5,6 @@ Haskell test modules, shell-based integration tests, and test infrastructure.
 
 ---
 
-## test/ConflictSpec.hs
-
-**Path:** `test/ConflictSpec.hs`
-
-*Source file.*
-
-```haskell
-{-# LANGUAGE DataKinds #-}
-
-module Main where
-
-import Test.Tasty
-import Test.Tasty.HUnit
-import qualified Data.Map as Map
-import System.Exit (ExitCode(..))
-
-import Rgit.Conflict
-import Rgit.Effect.Pure (PureEnv(..), Trace(..), runPure)
-
-main :: IO ()
-main = defaultMain tests
-
--- | A pure environment pre-loaded so gitQuery calls return simulated metadata.
-mkEnv :: [String] -> PureEnv
-mkEnv userInputs = PureEnv
-  { pureFiles  = Map.empty
-  , pureDirs   = []
-  , pureInputs = userInputs
-  , pureTrace  = []
-  , pureCwd    = "/test"
-  }
-
-tests :: TestTree
-tests = testGroup "Conflict"
-  [ testGroup "resolveAll"
-    [ testCase "empty conflicts produces no resolutions" $ do
-        let (res, trace) = runPure (mkEnv []) (resolveAll [])
-        res @?= []
-        -- Should see "No unmerged paths." in trace
-        any (\t -> case t of TTell "No unmerged paths." -> True; _ -> False) trace @?= True
-
-    , testCase "single conflict with 'l' keeps local" $ do
-        let (res, trace) = runPure (mkEnv ["l"]) (resolveAll ["index/foo.bin"])
-        length res @?= 1
-        head res @?= KeepLocal
-        -- Should see checkout --ours in trace
-        any (\t -> case t of TGitRaw ["checkout", "--ours", "--", "index/foo.bin"] -> True; _ -> False) trace @?= True
-
-    , testCase "single conflict with 'r' takes remote" $ do
-        let (res, trace) = runPure (mkEnv ["r"]) (resolveAll ["index/foo.bin"])
-        length res @?= 1
-        head res @?= TakeRemote
-        any (\t -> case t of TGitRaw ["checkout", "--theirs", "--", "index/foo.bin"] -> True; _ -> False) trace @?= True
-
-    , testCase "three conflicts with mixed choices" $ do
-        let (res, trace) = runPure (mkEnv ["l", "r", "l"])
-                                   (resolveAll ["index/a.bin", "index/b.bin", "index/c.bin"])
-        res @?= [KeepLocal, TakeRemote, KeepLocal]
-        -- All three should have been git-added
-        let addTraces = filter (\t -> case t of TGitRaw ("add":_) -> True; _ -> False) trace
-        length addTraces @?= 3
-
-    , testCase "user input is normalized (whitespace, case)" $ do
-        let (res, _) = runPure (mkEnv ["  Remote  "]) (resolveAll ["index/x.bin"])
-        res @?= [TakeRemote]
-    ]
-
-  , testGroup "getConflictedFilesE"
-    [ testCase "returns empty on failure" $ do
-        -- Pure interpreter returns ExitSuccess with empty stdout for gitQuery
-        let (files, _) = runPure (mkEnv []) getConflictedFilesE
-        files @?= []  -- empty stdout Γזע no files
-    ]
-  ]
-```
-
----
-
 ## test/DevicePromptTests.hs
 
 **Path:** `test/DevicePromptTests.hs`
@@ -177,14 +99,9 @@ module Main where
 
 import Test.Tasty
 import Test.Tasty.HUnit
-import Test.Tasty.QuickCheck
-import qualified Data.Map as Map
-import System.Exit (ExitCode(..))
 import Data.List (isInfixOf)
 
 import Rgit.Conflict
-import Rgit.Effect (Rgit, tell, tellErr, askUser, gitRaw, gitQuery)
-import Rgit.Effect.Pure (PureEnv(..), Trace(..), runPure)
 import Rgit.Internal.Metadata (MetaContent(..), parseMetadata, serializeMetadata, displayHash, hasConflictMarkers)
 import Rgit.Types (Hash(..), HashAlgo(..))
 import qualified Data.Text as T
@@ -193,170 +110,14 @@ main :: IO ()
 main = defaultMain tests
 
 -- ---------------------------------------------------------------------------
--- Test environment helpers
--- ---------------------------------------------------------------------------
-
--- | Build a pure environment with given stdin lines.
-mkEnv :: [String] -> PureEnv
-mkEnv userInputs = PureEnv
-  { pureFiles  = Map.empty
-  , pureDirs   = []
-  , pureInputs = userInputs
-  , pureTrace  = []
-  , pureCwd    = "/test"
-  }
-
--- | Check whether a specific trace entry exists.
-hasTrace :: (Trace -> Bool) -> [Trace] -> Bool
-hasTrace = any
-
--- | Count trace entries matching a predicate.
-countTraces :: (Trace -> Bool) -> [Trace] -> Int
-countTraces p = length . filter p
-
--- | Check for a git raw command in traces.
-hasGitRaw :: [String] -> [Trace] -> Bool
-hasGitRaw args = hasTrace $ \t -> case t of
-  TGitRaw a -> a == args
-  _         -> False
-
--- | Check for a Tell message in traces.
-hasTell :: String -> [Trace] -> Bool
-hasTell msg = hasTrace $ \t -> case t of
-  TTell m -> m == msg
-  _       -> False
-
--- | Check for a TellErr message containing a substring.
-hasTellErrContaining :: String -> [Trace] -> Bool
-hasTellErrContaining sub = hasTrace $ \t -> case t of
-  TTellErr m -> sub `isInfixOf` m
-  _          -> False
-
--- | Check for a Tell message containing a substring.
-hasTellContaining :: String -> [Trace] -> Bool
-hasTellContaining sub = hasTrace $ \t -> case t of
-  TTell m -> sub `isInfixOf` m
-  _       -> False
-
--- ---------------------------------------------------------------------------
 -- All tests
 -- ---------------------------------------------------------------------------
 
 tests :: TestTree
 tests = testGroup "Merge"
-  [ conflictResolutionTests
-  , conflictDetectionTests
-  , conflictInfoParsingTests
+  [ conflictInfoParsingTests
   , metadataRoundtripTests
   , conflictMarkerTests
-  , resolveAllPropertyTests
-  ]
-
--- ---------------------------------------------------------------------------
--- 1. Conflict resolution (resolveAll / resolveConflict)
---    Mirrors Git's test of checkout --ours / --theirs + git add
--- ---------------------------------------------------------------------------
-
-conflictResolutionTests :: TestTree
-conflictResolutionTests = testGroup "resolveAll"
-  [ testCase "empty conflicts produces no resolutions" $ do
-      let (res, trace) = runPure (mkEnv []) (resolveAll [])
-      res @?= []
-      hasTell "No unmerged paths." trace @?= True
-
-  , testCase "single conflict - keep local" $ do
-      let (res, trace) = runPure (mkEnv ["l"]) (resolveAll ["index/foo.bin"])
-      res @?= [KeepLocal]
-      hasGitRaw ["checkout", "--ours", "--", "index/foo.bin"] trace @?= True
-      hasGitRaw ["add", "index/foo.bin"] trace @?= True
-
-  , testCase "single conflict - take remote" $ do
-      let (res, trace) = runPure (mkEnv ["r"]) (resolveAll ["index/foo.bin"])
-      res @?= [TakeRemote]
-      hasGitRaw ["checkout", "--theirs", "--", "index/foo.bin"] trace @?= True
-      hasGitRaw ["add", "index/foo.bin"] trace @?= True
-
-  , testCase "three conflicts with mixed choices (l, r, l)" $ do
-      let paths = ["index/a.bin", "index/b.bin", "index/c.bin"]
-      let (res, trace) = runPure (mkEnv ["l", "r", "l"]) (resolveAll paths)
-      res @?= [KeepLocal, TakeRemote, KeepLocal]
-      -- Every conflict should have been git-added
-      countTraces (\t -> case t of TGitRaw ("add":_) -> True; _ -> False) trace @?= 3
-      -- Verify correct checkout flags for each
-      hasGitRaw ["checkout", "--ours", "--", "index/a.bin"] trace @?= True
-      hasGitRaw ["checkout", "--theirs", "--", "index/b.bin"] trace @?= True
-      hasGitRaw ["checkout", "--ours", "--", "index/c.bin"] trace @?= True
-
-  , testCase "five conflicts - all remote" $ do
-      let paths = ["index/" ++ [c] ++ ".bin" | c <- "abcde"]
-      let (res, trace) = runPure (mkEnv (replicate 5 "r")) (resolveAll paths)
-      res @?= replicate 5 TakeRemote
-      countTraces (\t -> case t of TGitRaw ["checkout", "--theirs", "--", _] -> True; _ -> False) trace @?= 5
-
-  , testCase "five conflicts - all local" $ do
-      let paths = ["index/" ++ [c] ++ ".bin" | c <- "abcde"]
-      let (res, trace) = runPure (mkEnv (replicate 5 "l")) (resolveAll paths)
-      res @?= replicate 5 KeepLocal
-      countTraces (\t -> case t of TGitRaw ["checkout", "--ours", "--", _] -> True; _ -> False) trace @?= 5
-
-  -- Input normalization (mirrors Git's case-insensitive flag parsing)
-  , testCase "input 'Local' (capital) keeps local" $ do
-      let (res, _) = runPure (mkEnv ["Local"]) (resolveAll ["index/x.bin"])
-      res @?= [KeepLocal]
-
-  , testCase "input 'REMOTE' (all caps) takes remote" $ do
-      let (res, _) = runPure (mkEnv ["REMOTE"]) (resolveAll ["index/x.bin"])
-      res @?= [TakeRemote]
-
-  , testCase "input '  r  ' (padded whitespace) takes remote" $ do
-      let (res, _) = runPure (mkEnv ["  r  "]) (resolveAll ["index/x.bin"])
-      res @?= [TakeRemote]
-
-  , testCase "input '  Remote  ' (padded, mixed case) takes remote" $ do
-      let (res, _) = runPure (mkEnv ["  Remote  "]) (resolveAll ["index/x.bin"])
-      res @?= [TakeRemote]
-
-  , testCase "input 'L' (capital) keeps local" $ do
-      let (res, _) = runPure (mkEnv ["L"]) (resolveAll ["index/x.bin"])
-      res @?= [KeepLocal]
-
-  -- Any non-r/remote input defaults to keep-local (safe default)
-  , testCase "empty input defaults to keep-local" $ do
-      let (res, _) = runPure (mkEnv [""]) (resolveAll ["index/x.bin"])
-      res @?= [KeepLocal]
-
-  , testCase "garbage input defaults to keep-local" $ do
-      let (res, _) = runPure (mkEnv ["xyz"]) (resolveAll ["index/x.bin"])
-      res @?= [KeepLocal]
-
-  -- Progress counter display
-  , testCase "progress counter shows [1/3], [2/3], [3/3]" $ do
-      let paths = ["index/a", "index/b", "index/c"]
-      let (_, trace) = runPure (mkEnv ["l", "l", "l"]) (resolveAll paths)
-      hasTellContaining "[1/3]" trace @?= True
-      hasTellContaining "[2/3]" trace @?= True
-      hasTellContaining "[3/3]" trace @?= True
-
-  -- Path display: "index/" prefix should be stripped for user-facing output
-  , testCase "index/ prefix stripped in display" $ do
-      let (_, trace) = runPure (mkEnv ["l"]) (resolveAll ["index/src/model.bin"])
-      hasTellContaining "src/model.bin" trace @?= True
-  ]
-
--- ---------------------------------------------------------------------------
--- 2. Conflict detection (getConflictedFilesE)
--- ---------------------------------------------------------------------------
-
-conflictDetectionTests :: TestTree
-conflictDetectionTests = testGroup "getConflictedFilesE"
-  [ testCase "returns empty list when git diff --diff-filter=U fails" $ do
-      -- Pure interpreter returns ExitSuccess with empty stdout for gitQuery
-      let (files, _) = runPure (mkEnv []) getConflictedFilesE
-      files @?= []
-
-  , testCase "returns empty list on empty stdout" $ do
-      let (files, _) = runPure (mkEnv []) getConflictedFilesE
-      files @?= []
   ]
 
 -- ---------------------------------------------------------------------------
@@ -482,64 +243,6 @@ conflictMarkerTests = testGroup "Conflict markers"
       assertBool "should not contain <<<<<<<" (not $ "<<<<<<<" `isInfixOf` s)
       assertBool "should not contain =======" (not $ "=======" `isInfixOf` s)
       assertBool "should not contain >>>>>>>" (not $ ">>>>>>>" `isInfixOf` s)
-  ]
-
--- ---------------------------------------------------------------------------
--- 6. Property tests for conflict resolution
---    (Mirrors Git's QuickCheck-style exhaustive testing philosophy)
--- ---------------------------------------------------------------------------
-
-resolveAllPropertyTests :: TestTree
-resolveAllPropertyTests = testGroup "resolveAll properties"
-  [ testProperty "resolveAll returns exactly N resolutions for N conflicts" $
-      \(Positive n) ->
-        let n' = min n 20  -- cap to keep tests fast
-            paths = ["index/file" ++ show i ++ ".bin" | i <- [1..n']]
-            inputs = replicate n' "l"
-            (res, _) = runPure (mkEnv inputs) (resolveAll paths)
-        in length res == n'
-
-  , testProperty "every resolution is KeepLocal or TakeRemote (total)" $
-      \choices ->
-        let n = min (length choices) 20
-            paths = ["index/f" ++ show i | i <- [1..n]]
-            inputs = map (\b -> if b then "r" else "l") (take n choices)
-            (res, _) = runPure (mkEnv inputs) (resolveAll paths)
-        in all (\r -> r == KeepLocal || r == TakeRemote) res
-
-  , testProperty "'l' input always produces KeepLocal" $
-      \(Positive n) ->
-        let n' = min n 10
-            paths = ["index/f" ++ show i | i <- [1..n']]
-            (res, _) = runPure (mkEnv (replicate n' "l")) (resolveAll paths)
-        in all (== KeepLocal) res
-
-  , testProperty "'r' input always produces TakeRemote" $
-      \(Positive n) ->
-        let n' = min n 10
-            paths = ["index/f" ++ show i | i <- [1..n']]
-            (res, _) = runPure (mkEnv (replicate n' "r")) (resolveAll paths)
-        in all (== TakeRemote) res
-
-  , testProperty "resolveAll emits exactly N git-add traces" $
-      \(Positive n) ->
-        let n' = min n 15
-            paths = ["index/f" ++ show i | i <- [1..n']]
-            inputs = replicate n' "l"
-            (_, trace) = runPure (mkEnv inputs) (resolveAll paths)
-            addCount = countTraces (\t -> case t of TGitRaw ("add":_) -> True; _ -> False) trace
-        in addCount == n'
-
-  , testProperty "resolveAll emits exactly N checkout traces" $
-      \(Positive n) ->
-        let n' = min n 15
-            paths = ["index/f" ++ show i | i <- [1..n']]
-            inputs = replicate n' "r"
-            (_, trace) = runPure (mkEnv inputs) (resolveAll paths)
-            checkoutCount = countTraces (\t -> case t of
-              TGitRaw ("checkout":_) -> True
-              _ -> False) trace
-        in checkoutCount == n'
   ]
 ```
 

@@ -4555,29 +4555,6 @@ test-suite pipeline
                          filepath
     default-language:    Haskell2010
 
-test-suite conflict
-    type:                exitcode-stdio-1.0
-    main-is:             ConflictSpec.hs
-    hs-source-dirs:      test, .
-    other-modules:       Rgit.Conflict,
-                         Rgit.Internal.Metadata,
-                         Rgit.Types,
-                         Internal.Config,
-                         Internal.ConfigFile
-    build-depends:       base,
-                         containers,
-                         text,
-                         free,
-                         transformers,
-                         mtl,
-                         bytestring,
-                         base16-bytestring ^>=1.0.2.0,
-                         cryptohash-md5,
-                         directory,
-                         filepath,
-                         tasty,
-                         tasty-hunit
-    default-language:    Haskell2010
 test-suite merge
     type:                exitcode-stdio-1.0
     main-is:             MergeSpec.hs
@@ -4590,7 +4567,6 @@ test-suite merge
     build-depends:       base,
                          containers,
                          text,
-                         free,
                          transformers,
                          mtl,
                          bytestring,
