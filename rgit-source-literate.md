@@ -5079,24 +5079,24 @@ main = do
 
   -- Git: stage, commit, push (gracefully handle failures)
   putStrLn "Committing literate output..."
-  addResult <- try (callProcess "git" ["-C", root, "add",
-    "literate-output/rgit-source-literate.md",
-    "literate-output/rgit-tests-literate.md"]) :: IO (Either SomeException ())
+  addResult <- try (callProcess "git" ["-C", litDir, "add",
+    "rgit-source-literate.md",
+    "rgit-tests-literate.md"]) :: IO (Either SomeException ())
   case addResult of
     Left _ -> putStrLn "Warning: git add failed (continuing anyway)"
     Right () -> do
       -- Only commit if there are staged changes
       -- git diff --cached --quiet returns success (0) when there are NO changes
-      noChanges <- gitIn root ["diff", "--cached", "--quiet"]
+      noChanges <- gitIn litDir ["diff", "--cached", "--quiet"]
       if noChanges
         then putStrLn "No changes to literate output."
         else do
-          commitResult <- try (callProcess "git" ["-C", root, "commit", "-m", "Update literate output"]) :: IO (Either SomeException ())
+          commitResult <- try (callProcess "git" ["-C", litDir, "commit", "-m", "Update literate output"]) :: IO (Either SomeException ())
           case commitResult of
             Left _ -> putStrLn "Warning: git commit failed (continuing anyway)"
             Right () -> do
               putStrLn "Pushing to origin..."
-              pushResult <- try (callProcess "git" ["-C", root, "push", "origin"]) :: IO (Either SomeException ())
+              pushResult <- try (callProcess "git" ["-C", litDir, "push", "origin"]) :: IO (Either SomeException ())
               case pushResult of
                 Left _ -> putStrLn "Warning: git push failed (continuing anyway)"
                 Right () -> putStrLn "Done."
