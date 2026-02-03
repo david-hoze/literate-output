@@ -68,7 +68,7 @@ import Data.List (isPrefixOf)
 import qualified System.Directory as Dir
 import System.Directory (copyFile, removeFile, createDirectoryIfMissing, removeDirectory, listDirectory, doesDirectoryExist)
 import System.FilePath ((</>), normalise, takeDirectory)
-import Control.Monad (when, unless, void, forM_, forM)
+import Control.Monad (when, unless, void, forM_)
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString.Lazy.Char8 as LBSC
 import System.Exit (ExitCode(..), exitWith)
@@ -78,8 +78,7 @@ import qualified Internal.Transport as Transport
 import Internal.Config (rgitDir, rgitIgnore, rgitGitDir, fetchedBundleName, fetchedBundlePath, rgitIndexPath, rgitDevicesDir, rgitRemotesDir)
 import qualified Rgit.Internal.Metadata as Metadata
 import Rgit.Internal.Metadata (MetaContent(..), parseMetadata, displayHash, serializeMetadata)
-import qualified System.Info as Info
-import Data.Char (toLower, isSpace)
+import Data.Char (isSpace)
 import qualified Rgit.Scan as Scan
 import qualified Rgit.Diff as Diff
 import qualified Rgit.Plan as Plan
@@ -93,15 +92,14 @@ import Control.Monad.Trans.Reader (asks)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Class (lift)
 import Control.Exception (try, throwIO, SomeException, IOException)
-import System.IO (hFlush, stdout, stderr, hPutStrLn, hIsTerminalDevice, stdin)
+import System.IO (hFlush, stdout, stderr, hPutStrLn, hIsTerminalDevice)
 import Data.Maybe (fromMaybe, listToMaybe, maybe, maybeToList)
 import Data.Either (either)
-import Data.Text (unpack)
 import Rgit.Utils (toPosix, filterOutRgitPaths)
 import qualified Rgit.Device as Device
 import qualified Rgit.DevicePrompt as DevicePrompt
 import qualified Rgit.Conflict as Conflict
-import Rgit.Remote (Remote, remoteName, displayRemote, resolveRemote, remoteUrl)
+import Rgit.Remote (Remote, remoteName, displayRemote, resolveRemote, remoteUrl, RemoteState(..), FetchResult(..))
 import Prelude hiding (init)
 import Control.Exception (bracket)
 
@@ -116,21 +114,6 @@ data PullOptions = PullOptions
 
 defaultPullOptions :: PullOptions
 defaultPullOptions = PullOptions False False
-
--- Domain types (moved from Transport in Step 4)
-data RemoteState 
-    = StateEmpty                        -- Case A: No files at all
-    | StateValidRgit                    -- Case B: .rgit/ exists and looks okay
-    | StateNonRgitOccupied [String]     -- Case C: Files exist, but no .rgit/ (stores sample filenames)
-    | StateCorruptedRgit String         -- Case D: .rgit/ exists but something is wrong
-    | StateNetworkError String          -- Network/Auth failure
-    deriving (Show, Eq)
-
-data FetchResult 
-    = BundleFound FilePath 
-    | RemoteEmpty 
-    | NetworkError String
-    deriving (Show, Eq)
 
 -- ============================================================================
 -- Git passthrough (thin wrappers)
@@ -737,10 +720,6 @@ getCurrentDirE = Dir.getCurrentDirectory
 exitWithE :: ExitCode -> IO ()
 exitWithE = exitWith
 
--- Previously an "escape hatch" from the effect system. Now it's just identity.
-liftIOE :: IO a -> IO a
-liftIOE = id
-
 safeRemoveE :: FilePath -> IO ()
 safeRemoveE = safeRemove
 
@@ -988,18 +967,11 @@ syncRemoteFilesToLocal :: RgitM ()
 syncRemoteFilesToLocal = withRemote $ \remote -> do
     cwd <- asks envCwd
     localFiles <- asks envLocalFiles
-    lift $ tell $ "[DEBUG] syncRemoteFilesToLocal: cwd=" ++ cwd
-    lift $ tell $ "[DEBUG] syncRemoteFilesToLocal: localFiles count=" ++ show (length localFiles)
-    lift $ tell $ "[DEBUG] syncRemoteFilesToLocal: localFiles paths=" ++ show (map path localFiles)
-    remoteResult <- lift $ liftIOE $ Remote.Scan.fetchRemoteFiles remote  -- ESCAPE: rclone JSON parsing
+    remoteResult <- lift $ Remote.Scan.fetchRemoteFiles remote
     either
         (\_ -> lift $ tellErr "Error: Failed to fetch remote file list.")
         (\remoteFiles -> do
-            lift $ tell $ "[DEBUG] syncRemoteFilesToLocal: remoteFiles count=" ++ show (length remoteFiles)
-            lift $ tell $ "[DEBUG] syncRemoteFilesToLocal: remoteFiles paths=" ++ show (map path remoteFiles)
             let actions = Pipeline.pullSyncFiles localFiles remoteFiles
-            lift $ tell $ "[DEBUG] syncRemoteFilesToLocal: actions count=" ++ show (length actions)
-            lift $ tell $ "[DEBUG] syncRemoteFilesToLocal: actions=" ++ show actions
             lift $ tell "--- Pulling changes from remote ---"
             if null actions
                 then lift $ tell "Working tree already up to date with remote."
@@ -1125,20 +1097,20 @@ pullAcceptRemoteImpl remote = do
     lift $ tell "Accepting remote file state as truth..."
     lift $ tell "Scanning remote files..."
 
-    result <- lift $ liftIOE $ Remote.Scan.fetchRemoteFiles remote  -- ESCAPE: rclone JSON parsing
+    result <- lift $ Remote.Scan.fetchRemoteFiles remote
     case result of
         Left _ -> lift $ tellErr "Error: Failed to fetch remote file list."
         Right remoteFiles -> do
             let filteredRemoteFiles = filterOutRgitPaths remoteFiles
             lift $ tell "Updating local metadata to match remote state..."
-            lift $ liftIOE $ Scan.writeMetadataFiles cwd filteredRemoteFiles  -- ESCAPE: filesystem traversal
+            lift $ Scan.writeMetadataFiles cwd filteredRemoteFiles
             lift $ void $ gitRaw ["add", "."]
             hasChanges <- lift hasStagedChangesE
             when hasChanges $ lift $ void $ gitRaw ["commit", "-m", "Accept remote file state as truth"]
             lift $ tell "Syncing files from remote..."
             syncRemoteFilesToLocal
-            lift $ liftIOE $ updateMetadataAfterSync cwd  -- ESCAPE: Scan.scanWorkingDir + Git
-            lift $ void $ liftIOE Git.updateRemoteTrackingBranchToHead  -- ESCAPE: Git internal
+            lift $ updateMetadataAfterSync cwd
+            lift $ void $ Git.updateRemoteTrackingBranchToHead
             lift $ tell "Pull with --accept-remote completed."
 
 -- | Pull with --manual-merge: detect remote divergence and create conflict directories.
@@ -1147,20 +1119,20 @@ pullManualMergeImpl remote = do
     cwd <- asks envCwd
     lift $ tell "Fetching remote metadata... done."
 
-    maybeBundlePath <- lift $ liftIOE $ fetchRemoteBundle remote
+    maybeBundlePath <- lift $ fetchRemoteBundle remote
     case maybeBundlePath of
         Nothing -> lift $ tellErr "Error: Could not fetch remote bundle."
         Just bPath -> do
-            lift $ liftIOE $ saveFetchedBundle remote (Just bPath)
+            lift $ saveFetchedBundle remote (Just bPath)
 
-            remoteMeta <- lift $ liftIOE $ Verify.loadMetadataFromBundle fetchedBundleName
+            remoteMeta <- lift $ Verify.loadMetadataFromBundle fetchedBundleName
             lift $ tell "Scanning remote files... done."
-            result <- lift $ liftIOE $ Remote.Scan.fetchRemoteFiles remote
+            result <- lift $ Remote.Scan.fetchRemoteFiles remote
             case result of
                 Left _ -> lift $ tellErr "Error: Could not fetch remote file list."
                 Right remoteFiles -> do
                     let filteredRemoteFiles = filterOutRgitPaths remoteFiles
-                    localMeta <- lift $ liftIOE $ Verify.loadMetadataIndex (cwd </> rgitIndexPath)
+                    localMeta <- lift $ Verify.loadMetadataIndex (cwd </> rgitIndexPath)
 
                     let remoteFileMap = Map.fromList
                           [ (normalise e.path, (h, e.kind))
@@ -1189,7 +1161,7 @@ pullManualMergeImpl remote = do
 
                             createConflictDirectories remote divergentFiles remoteFileMap remoteMetaMap localMetaMap
 
-                            lift $ liftIOE $ printConflictList divergentFiles remoteFileMap remoteMetaMap localMetaMap
+                            lift $ printConflictList divergentFiles remoteFileMap remoteMetaMap localMetaMap
                             lift $ do
                                 tell ""
                                 tell "To resolve:"
@@ -1272,26 +1244,25 @@ printConflictList divergentFiles remoteFileMap remoteMetaMap localMetaMap = do
 pullWithCleanup :: Remote -> RgitM ()
 pullWithCleanup remote = do
     env <- asks id
-    -- ESCAPE: exception handling with try requires real IO for exception safety
     result <- liftIO $ try @SomeException (runRgitM env (pullLogic remote))
     case result of
         Left ex -> do
-            inProgress <- lift $ liftIOE Git.isMergeInProgress
+            inProgress <- lift $ Git.isMergeInProgress
             if inProgress
                 then do
                     lift $ void $ gitRaw ["merge", "--abort"]
                     lift $ tell "Merge aborted. Your working tree is unchanged."
-                else lift $ liftIOE $ throwIO ex
+                else lift $ throwIO ex
         Right _ -> return ()
 
 pullLogic :: Remote -> RgitM ()
 pullLogic remote = do
     cwd <- asks envCwd
-    maybeBundlePath <- lift $ liftIOE $ fetchRemoteBundle remote
+    maybeBundlePath <- lift $ fetchRemoteBundle remote
     case maybeBundlePath of
         Nothing -> return ()
         Just bPath -> do
-            lift $ liftIOE $ saveFetchedBundle remote (Just bPath)
+            lift $ saveFetchedBundle remote (Just bPath)
             (_, countOut, _) <- lift $ gitQuery ["rev-list", "--count", "refs/remotes/origin/main"]
             let n = takeWhile (`elem` ['0'..'9']) (filter (/= '\n') countOut)
             lift $ tell $ "remote: Counting objects: " ++ (if null n then "0" else n) ++ ", done."
@@ -1303,7 +1274,7 @@ pullLogic remote = do
             case oldHash of
                 Nothing -> do
                     lift $ tell $ "Checking out " ++ take 7 newHash ++ " (first pull)"
-                    checkoutCode <- lift $ liftIOE Git.checkoutRemoteAsMain
+                    checkoutCode <- lift $ Git.checkoutRemoteAsMain
                     if checkoutCode == ExitSuccess
                         then do
                             syncRemoteFilesToLocal
@@ -1326,8 +1297,8 @@ pullLogic remote = do
                         when hasChanges $ lift $ void $ gitRaw ["commit", "-m", "Merge remote"]
                         syncRemoteFilesToLocal
                         lift $ tell "Syncing binaries... done."
-                        lift $ liftIOE $ updateMetadataAfterSync cwd
-                        lift $ void $ liftIOE Git.updateRemoteTrackingBranchToHead
+                        lift $ updateMetadataAfterSync cwd
+                        lift $ void $ Git.updateRemoteTrackingBranchToHead
                     else do
                         lift $ tell finalMergeOut
                         lift $ tellErr finalMergeErr
@@ -1340,11 +1311,11 @@ pullLogic remote = do
                         resolutions <- lift $ Conflict.resolveAll conflicts
                         let total = length resolutions
 
-                        invalid <- lift $ liftIOE $ Metadata.validateMetadataDir (cwd </> rgitIndexPath)
+                        invalid <- lift $ Metadata.validateMetadataDir (cwd </> rgitIndexPath)
                         unless (null invalid) $ do
                             lift $ void $ gitRaw ["merge", "--abort"]
                             lift $ tellErr "fatal: Metadata files contain conflict markers. Merge aborted."
-                            lift $ liftIOE $ throwIO (userError "Invalid metadata")
+                            lift $ throwIO (userError "Invalid metadata")
 
                         conflictsNow <- lift Conflict.getConflictedFilesE
                         when (null conflictsNow) $ do
@@ -1354,8 +1325,8 @@ pullLogic remote = do
                                 tell $ "Merge complete. " ++ show total ++ " conflict(s) resolved."
                         syncRemoteFilesToLocal
                         lift $ tell "Syncing binaries... done."
-                        lift $ liftIOE $ updateMetadataAfterSync cwd
-                        when (null conflictsNow) $ lift $ void $ liftIOE Git.updateRemoteTrackingBranchToHead
+                        lift $ updateMetadataAfterSync cwd
+                        when (null conflictsNow) $ lift $ void $ Git.updateRemoteTrackingBranchToHead
 
 printVerifyIssue :: (String -> String) -> Verify.VerifyIssue -> IO ()
 printVerifyIssue fmtHash = \case
@@ -1483,7 +1454,7 @@ doRestore args = do
                          not ("--worktree" `elem` args || "-W" `elem` args)
         unless stagedOnly $ do
             let rawPaths = restoreCheckoutPaths args
-            paths <- lift $ liftIOE $ expandPathsToFiles cwd rawPaths  -- ESCAPE: Dir + Git ls-files
+            paths <- lift $ expandPathsToFiles cwd rawPaths
             forM_ paths $ \path -> do
                 let metaPath = cwd </> rgitIndexPath </> path
                 let workPath = cwd </> path
@@ -1507,7 +1478,7 @@ doCheckout args = do
     when (code == ExitSuccess) $ do
         cwd <- asks envCwd
         let rawPaths = restoreCheckoutPaths args'
-        paths <- lift $ liftIOE $ expandPathsToFiles cwd rawPaths  -- ESCAPE: Dir + Git ls-files
+        paths <- lift $ expandPathsToFiles cwd rawPaths
         forM_ paths $ \path -> do
             let metaPath = cwd </> rgitIndexPath </> path
             let workPath = cwd </> path
@@ -3749,6 +3720,8 @@ module Rgit.Remote
   , displayRemote   -- for user-facing messages
   , resolveRemote
   , getDefaultRemote
+  , RemoteState(..) -- remote state classification
+  , FetchResult(..) -- bundle fetch result
   ) where
 
 import qualified Internal.Git as Git
@@ -3807,6 +3780,22 @@ getDefaultRemote :: FilePath -> IO (Maybe Remote)
 getDefaultRemote cwd = do
     name <- Git.getTrackedRemoteName  -- defaults to "origin" if not configured
     resolveRemote cwd name
+
+-- | Classification of remote state (used by Bit.hs to determine what action to take)
+data RemoteState 
+    = StateEmpty                        -- Case A: No files at all
+    | StateValidRgit                    -- Case B: .rgit/ exists and looks okay
+    | StateNonRgitOccupied [String]     -- Case C: Files exist, but no .rgit/ (stores sample filenames)
+    | StateCorruptedRgit String         -- Case D: .rgit/ exists but something is wrong
+    | StateNetworkError String          -- Network/Auth failure
+    deriving (Show, Eq)
+
+-- | Result of attempting to fetch a bundle from remote
+data FetchResult 
+    = BundleFound FilePath 
+    | RemoteEmpty 
+    | NetworkError String
+    deriving (Show, Eq)
 ```
 
 ---
