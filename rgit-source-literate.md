@@ -75,7 +75,7 @@ import System.Exit (ExitCode(..), exitWith)
 import qualified Data.Map as Map
 import qualified Internal.Git as Git
 import qualified Internal.Transport as Transport
-import Internal.Config (rgitDir, rgitIgnore, rgitGitDir, fetchedBundle, fetchedBundleName, fetchedBundlePath, rgitIndexPath, rgitDevicesDir, rgitRemotesDir, bundleCwdPath, bundleGitRelPath, fromCwdPath, fromGitRelPath, BundleName(..))
+import Internal.Config (rgitDir, rgitIgnore, rgitGitDir, fetchedBundle, rgitIndexPath, rgitDevicesDir, rgitRemotesDir, bundleCwdPath, bundleGitRelPath, fromCwdPath, fromGitRelPath, BundleName(..))
 import qualified Rgit.Internal.Metadata as Metadata
 import Rgit.Internal.Metadata (MetaContent(..), parseMetadata, displayHash, serializeMetadata)
 import Data.Char (isSpace)
@@ -399,7 +399,8 @@ push = withRemote $ \remote -> do
                 BundleFound bPath -> do
                     let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
                     liftIO $ copyFile bPath fetchedPath
-                    processExistingRemote bPath
+                    liftIO $ safeRemove bPath
+                    processExistingRemote
                 _ -> liftIO $ hPutStrLn stderr "Error: Remote .rgit found but metadata is missing."
 
         StateNonRgitOccupied samples -> do
@@ -620,11 +621,6 @@ getLocalHeadE :: IO (Maybe String)
 getLocalHeadE = do
     (code, out, _) <- Git.runGitWithOutput ["rev-parse", "HEAD"]
     return $ if code == ExitSuccess then Just (filter (not . isSpace) out) else Nothing
-
-getHashFromBundleE :: FilePath -> IO (Maybe String)
-getHashFromBundleE path = do
-    (code, out, _) <- Git.runGitWithOutput ["bundle", "list-heads", path]
-    return $ if code == ExitSuccess && not (null out) then listToMaybe (words out) else Nothing
 
 checkIsAheadE :: String -> String -> IO Bool
 checkIsAheadE rHash lHash = do
@@ -894,34 +890,30 @@ syncRemoteFiles = withRemote $ \remote -> do
         remoteResult
 
 
-processExistingRemote :: FilePath -> RgitM ()
-processExistingRemote bPath = do
+processExistingRemote :: RgitM ()
+processExistingRemote = do
     force <- asks envForce
     forceWithLease <- asks envForceWithLease
     mRemote <- asks envRemote
     -- Handle --force: skip all checks and push anyway
     if force
         then do
-            lift $ do
-                tellErr "Warning: --force used. Overwriting remote history..."
-                safeRemoveE bPath
+            lift $ tellErr "Warning: --force used. Overwriting remote history..."
             maybe (lift $ tellErr "Error: No remote configured.") pushToRemote mRemote
         else do
             -- Handle --force-with-lease: compare remote bundle hash against fetched_remote.bundle
             if forceWithLease
                 then do
-                    maybeRemoteHash <- lift $ getHashFromBundleE bPath
+                    maybeRemoteHash <- liftIO $ Git.getHashFromBundle fetchedBundle
                     let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
                     hasFetchedBundle <- lift $ fileExistsE fetchedPath
 
                     case (maybeRemoteHash, hasFetchedBundle) of
                         (Just rHash, True) -> do
-                            maybeFetchedHash <- lift $ Git.getHashFromBundle fetchedBundle
+                            maybeFetchedHash <- liftIO $ Git.getHashFromBundle fetchedBundle
                             case maybeFetchedHash of
                                 Just fHash | rHash == fHash -> do
-                                    lift $ do
-                                        tell "Remote check passed (--force-with-lease). Proceeding with push..."
-                                        safeRemoveE bPath
+                                    lift $ tell "Remote check passed (--force-with-lease). Proceeding with push..."
                                     maybe (lift $ tellErr "Error: No remote configured.") pushToRemote mRemote
                                 Just _fHash -> lift $ do
                                     tellErr "---------------------------------------------------"
@@ -929,20 +921,13 @@ processExistingRemote bPath = do
                                     tellErr "Someone else pushed to the remote."
                                     tellErr "Run 'rgit fetch' to update your local view of the remote."
                                     tellErr "---------------------------------------------------"
-                                    safeRemoveE bPath
-                                Nothing -> lift $ do
-                                    tellErr "Error: Could not extract hash from fetched bundle."
-                                    safeRemoveE bPath
+                                Nothing -> lift $ tellErr "Error: Could not extract hash from fetched bundle."
                         (Just _, False) -> do
-                            lift $ do
-                                tellErr "Warning: No local fetched bundle found. Proceeding with push (--force-with-lease)..."
-                                safeRemoveE bPath
+                            lift $ tellErr "Warning: No local fetched bundle found. Proceeding with push (--force-with-lease)..."
                             maybe (lift $ tellErr "Error: No remote configured.") pushToRemote mRemote
-                        (Nothing, _) -> lift $ do
-                            tellErr "Error: Could not extract hash from remote bundle."
-                            safeRemoveE bPath
+                        (Nothing, _) -> lift $ tellErr "Error: Could not extract hash from remote bundle."
                 else do
-                    maybeRemoteHash <- lift $ getHashFromBundleE bPath
+                    maybeRemoteHash <- liftIO $ Git.getHashFromBundle fetchedBundle
                     maybeLocalHash <- lift getLocalHeadE
 
                     case (maybeLocalHash, maybeRemoteHash) of
@@ -951,20 +936,15 @@ processExistingRemote bPath = do
 
                             if isAhead
                                 then do
-                                    lift $ do
-                                        tell "Remote check passed. Proceeding with push..."
-                                        safeRemoveE bPath
+                                    lift $ tell "Remote check passed. Proceeding with push..."
                                     maybe (lift $ tellErr "Error: No remote configured.") pushToRemote mRemote
                                 else lift $ do
                                     tellErr "---------------------------------------------------"
                                     tellErr "ERROR: Remote history has diverged or is ahead!"
                                     tellErr "Please run 'rgit pull' before pushing."
                                     tellErr "---------------------------------------------------"
-                                    safeRemoveE bPath
 
-                        _ -> lift $ do
-                            tellErr "Error: Could not extract hashes for comparison."
-                            safeRemoveE bPath
+                        _ -> lift $ tellErr "Error: Could not extract hashes for comparison."
 
 -- | Sync files from remote to local (make local match remote). Used after pull.
 syncRemoteFilesToLocal :: RgitM ()
