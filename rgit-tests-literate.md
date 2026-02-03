@@ -724,7 +724,7 @@ cd test\cli\work_a & echo second file> baz.txt & rgit add baz.txt & rgit commit 
 
 cd test\cli\work_b & rgit fetch & rgit pull
 <<<
->>>2 /From (gdrive-test|\.rgit\\fetched_remote\.bundle)|Merge made|Syncing|Updating|remote: Counting/
+>>>2 /From (gdrive-test|\.git\\fetched_remote\.bundle)|Merge made|Syncing|Updating|remote: Counting/
 >>>= 0
 
 findstr /C:"second file" test\cli\work_b\.rgit\index\baz.txt >nul
