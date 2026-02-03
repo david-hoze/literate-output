@@ -75,7 +75,7 @@ import System.Exit (ExitCode(..), exitWith)
 import qualified Data.Map as Map
 import qualified Internal.Git as Git
 import qualified Internal.Transport as Transport
-import Internal.Config (rgitDir, rgitIgnore, rgitGitDir, fetchedBundleName, fetchedBundlePath, rgitIndexPath, rgitDevicesDir, rgitRemotesDir)
+import Internal.Config (rgitDir, rgitIgnore, rgitGitDir, fetchedBundle, fetchedBundleName, fetchedBundlePath, rgitIndexPath, rgitDevicesDir, rgitRemotesDir, bundleCwdPath, bundleGitRelPath, fromCwdPath, fromGitRelPath, BundleName(..))
 import qualified Rgit.Internal.Metadata as Metadata
 import Rgit.Internal.Metadata (MetaContent(..), parseMetadata, displayHash, serializeMetadata)
 import Data.Char (isSpace)
@@ -397,7 +397,8 @@ push = withRemote $ \remote -> do
             fetchResult <- liftIO $ fetchBundle remote
             case fetchResult of
                 BundleFound bPath -> do
-                    liftIO $ copyFile bPath fetchedBundlePath
+                    let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
+                    liftIO $ copyFile bPath fetchedPath
                     processExistingRemote bPath
                 _ -> liftIO $ hPutStrLn stderr "Error: Remote .rgit found but metadata is missing."
 
@@ -475,7 +476,8 @@ remoteShow mRemoteName = do
         Just remote -> do
             liftIO $ putStrLn display
             liftIO $ putStrLn ""
-            hasBundle <- liftIO $ Dir.doesFileExist fetchedBundlePath
+            let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
+            hasBundle <- liftIO $ Dir.doesFileExist fetchedPath
             if hasBundle
                 then liftIO $ showRemoteStatusFromBundle name (Just (remoteUrl remote))
                 else do
@@ -830,16 +832,17 @@ fetchBundle remote = do
 -- | Push the git bundle to remote. Uses bracket to ensure temp bundle cleanup.
 pushBundle :: Remote -> IO ()
 pushBundle remote = do
-    let tempBundle = "rgit.bundle"
+    let tempBundle = BundleName "rgit"
+        tempBundleCwdPath = fromCwdPath (bundleCwdPath tempBundle)
 
     -- bracket <setup> <cleanup> <action>
     bracket
         (Git.createBundle tempBundle) -- 1. Acquire
-        (\_ -> cleanupTemp $ Git.bundlePath tempBundle) -- 2. Release (Always runs)
+        (\_ -> cleanupTemp tempBundleCwdPath) -- 2. Release (Always runs)
         (\gCode -> do                 -- 3. Work
             if gCode /= ExitSuccess
                 then hPutStrLn stderr "Error creating bundle"
-                else uploadToRemote (Git.bundlePath tempBundle) remote
+                else uploadToRemote tempBundleCwdPath remote
         )
 
 -- Helper for the upload logic to keep the bracket clean
@@ -871,9 +874,9 @@ pushToRemote remote = do
 -- so rgit status shows up to date instead of "ahead of remote".
 updateLocalBundleAfterPush :: RgitM ()
 updateLocalBundleAfterPush = do
-    code <- liftIO $ Git.createBundle fetchedBundleName
+    code <- liftIO $ Git.createBundle fetchedBundle
     when (code == ExitSuccess) $ do
-        void $ liftIO $ Git.updateRemoteTrackingBranch fetchedBundleName
+        void $ liftIO $ Git.updateRemoteTrackingBranch fetchedBundle
 
 syncRemoteFiles :: RgitM ()
 syncRemoteFiles = withRemote $ \remote -> do
@@ -908,11 +911,12 @@ processExistingRemote bPath = do
             if forceWithLease
                 then do
                     maybeRemoteHash <- lift $ getHashFromBundleE bPath
-                    hasFetchedBundle <- lift $ fileExistsE fetchedBundlePath
+                    let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
+                    hasFetchedBundle <- lift $ fileExistsE fetchedPath
 
                     case (maybeRemoteHash, hasFetchedBundle) of
                         (Just rHash, True) -> do
-                            maybeFetchedHash <- lift $ getHashFromBundleE fetchedBundleName
+                            maybeFetchedHash <- lift $ Git.getHashFromBundle fetchedBundle
                             case maybeFetchedHash of
                                 Just fHash | rHash == fHash -> do
                                     lift $ do
@@ -1049,21 +1053,22 @@ fetchRemoteBundle remote = do
 saveFetchedBundle :: Remote -> Maybe FilePath -> IO ()
 saveFetchedBundle remote Nothing = pure ()
 saveFetchedBundle remote (Just bPath) = do
-    hadPrevious <- Dir.doesFileExist fetchedBundlePath
+    let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
+    hadPrevious <- Dir.doesFileExist fetchedPath
     maybeOldHash <- if hadPrevious
-        then Git.getHashFromBundle fetchedBundleName
+        then Git.getHashFromBundle fetchedBundle
         else return Nothing
 
     -- Copy FIRST, then read hash from the correct location
-    copyFile bPath fetchedBundlePath
+    copyFile bPath fetchedPath
     safeRemove bPath
-    maybeNewHash <- Git.getHashFromBundle fetchedBundleName  -- was: bPath
+    maybeNewHash <- Git.getHashFromBundle fetchedBundle
 
     _ <- Git.setupRemote (remoteUrl remote)
     _ <- Git.setupBranchTracking
 
     case maybeNewHash of
-        Just _ -> void $ Git.fetchFromBundle fetchedBundleName
+        Just _ -> void $ Git.fetchFromBundle fetchedBundle
         Nothing -> return ()
 
     -- Output fetch results in git format
@@ -1122,7 +1127,7 @@ pullManualMergeImpl remote = do
         Just bPath -> do
             lift $ saveFetchedBundle remote (Just bPath)
 
-            remoteMeta <- lift $ Verify.loadMetadataFromBundle fetchedBundleName
+            remoteMeta <- lift $ Verify.loadMetadataFromBundle fetchedBundle
             lift $ tell "Scanning remote files... done."
             result <- lift $ Remote.Scan.fetchRemoteFiles remote
             case result of
@@ -1356,9 +1361,9 @@ showRemoteStatusFromBundle name mUrl = do
     putStrLn $ "  Fetch URL: " ++ url
     putStrLn $ "  Push  URL: " ++ url
     putStrLn ""
-    compareHistory maybeLocal fetchedBundleName
+    compareHistory maybeLocal fetchedBundle
 
-compareHistory :: Maybe String -> String -> IO ()
+compareHistory :: Maybe String -> BundleName -> IO ()
 compareHistory maybeLocal bundleName = do
     maybeRemote <- Git.getHashFromBundle bundleName
     case (maybeLocal, maybeRemote) of
@@ -1502,7 +1507,17 @@ module Internal.Config where
 
 import System.FilePath ((</>))
 
-rgitDir, rgitTargetPath, rgitIgnore, rgitGitDir, fetchedBundleName, fetchedBundlePath, rgitIndexPath, rgitDevicesDir, rgitRemotesDir :: FilePath
+-- | Logical bundle name (e.g. "fetched_remote", "rgit"). NOT a file path.
+newtype BundleName = BundleName String deriving (Show, Eq)
+
+-- | Path relative to the git working directory (.rgit/index/).
+-- Used for git commands that run with -C .rgit/index.
+newtype GitRelPath = GitRelPath FilePath deriving (Show, Eq)
+
+-- | Path relative to CWD. Used for direct filesystem operations (copyFile, doesFileExist, etc).
+newtype CwdPath = CwdPath FilePath deriving (Show, Eq)
+
+rgitDir, rgitTargetPath, rgitIgnore, rgitGitDir, rgitIndexPath, rgitDevicesDir, rgitRemotesDir :: FilePath
 rgitDir           = ".rgit"
 rgitTargetPath    = rgitDir </> "target"
 rgitIgnore        = rgitDir </> "ignore"
@@ -1510,8 +1525,36 @@ rgitDevicesDir    = rgitDir </> "devices"
 rgitRemotesDir    = rgitDir </> "remotes"
 rgitIndexPath     = rgitDir </> "index"
 rgitGitDir        = rgitIndexPath </> ".git"
+
+-- | The logical name of the fetched remote bundle
+fetchedBundle :: BundleName
+fetchedBundle = BundleName "fetched_remote"
+
+-- | Legacy string name for gradual migration
+fetchedBundleName :: FilePath
 fetchedBundleName = "fetched_remote"
+
+-- | Legacy CWD path for gradual migration
+fetchedBundlePath :: FilePath
 fetchedBundlePath = rgitIndexPath </> ".git" </> (fetchedBundleName ++ ".bundle")
+
+-- | Convert a bundle name to a path relative to git working directory (.rgit/index/)
+-- Use this for git commands that run with -C .rgit/index
+bundleGitRelPath :: BundleName -> GitRelPath
+bundleGitRelPath (BundleName n) = GitRelPath (".git" </> (n ++ ".bundle"))
+
+-- | Convert a bundle name to a path relative to CWD
+-- Use this for filesystem operations (copyFile, doesFileExist, etc.)
+bundleCwdPath :: BundleName -> CwdPath
+bundleCwdPath (BundleName n) = CwdPath (rgitIndexPath </> ".git" </> (n ++ ".bundle"))
+
+-- | Unwrap CwdPath to FilePath
+fromCwdPath :: CwdPath -> FilePath
+fromCwdPath (CwdPath p) = p
+
+-- | Unwrap GitRelPath to FilePath
+fromGitRelPath :: GitRelPath -> FilePath
+fromGitRelPath (GitRelPath p) = p
 ```
 
 ---
@@ -1655,7 +1698,6 @@ dropWhileEnd p = reverse . dropWhile p . reverse
 ```haskell
 module Internal.Git
     ( add
-    , bundlePath
     , commit
     , commitFile
     , diff
@@ -1777,9 +1819,10 @@ getLocalHead = do
     (code, out, _) <- runGit GetHead
     return $ (guard (code == ExitSuccess) >> Just (filter (not . isSpace) out))
 
-getHashFromBundle :: String -> IO (Maybe String)
+getHashFromBundle :: BundleName -> IO (Maybe String)
 getHashFromBundle name = do
-    (code, out, _) <- runGit (GetBundleHead $ internalBundlePath name)
+    let (GitRelPath relPath) = bundleGitRelPath name
+    (code, out, _) <- runGit (GetBundleHead relPath)
     return $ guard (code == ExitSuccess && not (null out)) >> listToMaybe (words out)
 
 runGitCommand :: GitCommand -> IO ExitCode
@@ -1800,11 +1843,10 @@ commitFile message file = runGitCommand (CommitFile message file)
 
 init dir = runGitCommand (Init dir)
 
-internalBundlePath name = gitDir </> (name ++ ".bundle")
-
-createBundle name = runGitCommand (CreateBundle $ internalBundlePath name)
-
-bundlePath name = rgitIndexPath </> internalBundlePath name
+createBundle :: BundleName -> IO ExitCode
+createBundle name = do
+    let (GitRelPath relPath) = bundleGitRelPath name
+    runGitCommand (CreateBundle relPath)
 
 config name value = runGitCommand (Config name value)
 
@@ -1897,9 +1939,9 @@ setupRemote url = addRemote "origin" url
 -- | Pull from a bundle file into the local repo: fetch the bundle's refs so all
 -- objects and refs/remotes/origin/main exist in .rgit/index/.git. This is the "real"
 -- pull from the fetched bundle; without it, the ref would point to a hash not in the repo.
-fetchFromBundle :: String -> IO ExitCode
+fetchFromBundle :: BundleName -> IO ExitCode
 fetchFromBundle name = do
-    let bundle = internalBundlePath name
+    let (GitRelPath bundle) = bundleGitRelPath name
     (code, out, err) <- readProcessWithExitCode "git"
         (baseFlags ++ ["fetch", bundle, "refs/heads/main:refs/remotes/origin/main"]) ""
     putStr out
@@ -1908,7 +1950,7 @@ fetchFromBundle name = do
 
 -- | Update the remote tracking branch refs/remotes/origin/main to point to the hash from the bundle.
 -- Use when the objects are already in the repo (e.g. after push); for fetch/pull use fetchFromBundle.
-updateRemoteTrackingBranch :: String -> IO ExitCode
+updateRemoteTrackingBranch :: BundleName -> IO ExitCode
 updateRemoteTrackingBranch name = do
     maybeHash <- getHashFromBundle name
     case maybeHash of
@@ -4247,7 +4289,7 @@ import Rgit.Internal.Metadata (MetaContent(..), parseMetadata, readMetadataOrCom
 import qualified Rgit.Remote.Scan as Remote.Scan
 import qualified Rgit.Remote
 import qualified Internal.Transport as Transport
-import Internal.Config (fetchedBundlePath, rgitIndexPath)
+import Internal.Config (fetchedBundle, fetchedBundlePath, rgitIndexPath, bundleCwdPath, fromCwdPath, BundleName)
 import System.Process (readProcessWithExitCode)
 import System.Exit (ExitCode(..))
 import Data.Char (isSpace)
@@ -4324,7 +4366,7 @@ verifyLocal cwd = do
 -- | Extract metadata from a bundle's HEAD commit.
 -- First fetches the bundle into the repo, then reads metadata from refs/remotes/origin/main.
 -- Returns list of (relative path, hash, size) for files under index/.
-loadMetadataFromBundle :: String -> IO [(Path, Hash 'MD5, Integer)]
+loadMetadataFromBundle :: BundleName -> IO [(Path, Hash 'MD5, Integer)]
 loadMetadataFromBundle bundleName = do
   -- First, fetch the bundle into the repo so we can read from it
   fetchCode <- Git.fetchFromBundle bundleName
@@ -4379,26 +4421,27 @@ loadMetadataFromBundle bundleName = do
 verifyRemote :: FilePath -> Rgit.Remote.Remote -> IO (Int, [VerifyIssue])
 verifyRemote cwd remote = do
   -- 1. Fetch the remote bundle if needed
-  bundleExists <- doesFileExist fetchedBundlePath
+  let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
+  bundleExists <- doesFileExist fetchedPath
   when (not bundleExists) $ do
     let localDest = ".rgit/temp_remote.bundle"
     fetchResult <- Transport.copyFromRemoteDetailed remote ".rgit/rgit.bundle" localDest
     case fetchResult of
       Transport.CopySuccess -> do
-        -- Copy to fetchedBundlePath for consistency
-        BS.readFile localDest >>= BS.writeFile fetchedBundlePath
-        when (localDest /= fetchedBundlePath) $ safeRemove localDest
+        -- Copy to fetchedPath for consistency
+        BS.readFile localDest >>= BS.writeFile fetchedPath
+        when (localDest /= fetchedPath) $ safeRemove localDest
       _ -> do
         hPutStrLn stderr "Error: Could not fetch remote bundle."
         return ()
   
   -- Check if bundle exists now (if fetch failed, we can't continue)
-  bundleExistsNow <- doesFileExist fetchedBundlePath
+  bundleExistsNow <- doesFileExist fetchedPath
   if not bundleExistsNow
     then return (0, [])
     else do
       -- 2. Load metadata from the bundle
-      remoteMeta <- loadMetadataFromBundle fetchedBundlePath
+      remoteMeta <- loadMetadataFromBundle fetchedBundle
       
       -- 3. Fetch actual remote files
       Remote.Scan.fetchRemoteFiles remote >>= either
