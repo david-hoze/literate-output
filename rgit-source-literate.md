@@ -2171,6 +2171,16 @@ import qualified Data.ByteString.Lazy.Char8 as LBS
 import GHC.Generics (Generic)
 import Data.Maybe (fromMaybe)
 import Data.String (fromString)
+import Rgit.Remote (Remote, remoteUrl)
+
+-- | Build a full remote path from Remote + relative path.
+-- Handles trailing-slash normalization internally.
+remoteFilePath :: Remote -> FilePath -> String
+remoteFilePath remote relPath =
+    let base = remoteUrl remote
+        -- Ensure exactly one separator between base and relative path
+        base' = if not (null base) && last base == '/' then init base else base
+    in base' ++ "/" ++ relPath
 
 -- Dumb transport-level data types
 data TransportItem = TransportItem
@@ -2212,22 +2222,25 @@ data CheckResult = CheckResult
 
 -- Low-level rclone operations
 
--- | Copy a file from local to remote
-copyToRemote :: FilePath -> String -> IO ExitCode
-copyToRemote localPath remotePath = do
-    (code, _, _) <- readProcessWithExitCode "rclone" ["copyto", localPath, remotePath] ""
+-- | Copy local file to remote at relative path
+copyToRemote :: FilePath -> Remote -> FilePath -> IO ExitCode
+copyToRemote localPath remote relPath = do
+    let fullRemote = remoteFilePath remote relPath
+    (code, _, _) <- readProcessWithExitCode "rclone" ["copyto", localPath, fullRemote] ""
     return code
 
--- | Copy a file from remote to local
-copyFromRemote :: String -> FilePath -> IO ExitCode
-copyFromRemote remotePath localPath = do
-    (code, _, _) <- readProcessWithExitCode "rclone" ["copyto", remotePath, localPath] ""
+-- | Copy file from remote (relative path) to local
+copyFromRemote :: Remote -> FilePath -> FilePath -> IO ExitCode
+copyFromRemote remote relPath localPath = do
+    let fullRemote = remoteFilePath remote relPath
+    (code, _, _) <- readProcessWithExitCode "rclone" ["copyto", fullRemote, localPath] ""
     return code
 
--- | Copy a file from remote to local with detailed error classification
-copyFromRemoteDetailed :: String -> FilePath -> IO CopyResult
-copyFromRemoteDetailed remotePath localPath = do
-    (code, _, err) <- readProcessWithExitCode "rclone" ["copyto", remotePath, localPath] ""
+-- | Copy from remote with detailed error classification
+copyFromRemoteDetailed :: Remote -> FilePath -> FilePath -> IO CopyResult
+copyFromRemoteDetailed remote relPath localPath = do
+    let fullRemote = remoteFilePath remote relPath
+    (code, _, err) <- readProcessWithExitCode "rclone" ["copyto", fullRemote, localPath] ""
     case code of
         ExitSuccess -> return CopySuccess
         ExitFailure _ 
@@ -2235,39 +2248,44 @@ copyFromRemoteDetailed remotePath localPath = do
             | "no such host" `isInfixOf` err || "dial tcp" `isInfixOf` err -> return (CopyNetworkError err)
             | otherwise -> return (CopyOtherError err)
 
--- | Move a file on remote (src -> dest)
-moveRemote :: String -> String -> IO ExitCode
-moveRemote src dest = do
+-- | Move a file on remote (both paths relative to remote root)
+moveRemote :: Remote -> FilePath -> FilePath -> IO ExitCode
+moveRemote remote srcRel destRel = do
+    let src = remoteFilePath remote srcRel
+        dest = remoteFilePath remote destRel
     (code, _, _) <- readProcessWithExitCode "rclone" ["moveto", src, dest] ""
     return code
 
--- | Delete a file on remote
-deleteRemote :: String -> IO ExitCode
-deleteRemote remotePath = do
-    (code, _, _) <- readProcessWithExitCode "rclone" ["deletefile", remotePath] ""
+-- | Delete a file on remote (relative path)
+deleteRemote :: Remote -> FilePath -> IO ExitCode
+deleteRemote remote relPath = do
+    let fullRemote = remoteFilePath remote relPath
+    (code, _, _) <- readProcessWithExitCode "rclone" ["deletefile", fullRemote] ""
     return code
 
--- | Purge a remote directory (delete all contents)
-purgeRemote :: String -> IO ExitCode
-purgeRemote remotePath = do
-    (code, _, _) <- readProcessWithExitCode "rclone" ["purge", remotePath] ""
+-- | Purge entire remote (no relative path Γאפ purges the remote root)
+purgeRemote :: Remote -> IO ExitCode
+purgeRemote remote = do
+    let fullRemote = remoteUrl remote
+    (code, _, _) <- readProcessWithExitCode "rclone" ["purge", fullRemote] ""
     return code
 
--- | Create a directory on remote
-mkdirRemote :: String -> IO ExitCode
-mkdirRemote remotePath = do
-    (code, _, _) <- readProcessWithExitCode "rclone" ["mkdir", remotePath] ""
+-- | Create directory on remote (relative path)
+mkdirRemote :: Remote -> FilePath -> IO ExitCode
+mkdirRemote remote relPath = do
+    let fullRemote = remoteFilePath remote relPath
+    (code, _, _) <- readProcessWithExitCode "rclone" ["mkdir", fullRemote] ""
     return code
 
--- | List remote directory as JSON (raw output)
-listRemoteJson :: String -> Int -> IO (ExitCode, String, String)
-listRemoteJson remotePath maxDepth = do
-    readProcessWithExitCode "rclone" ["lsjson", "--max-depth", show maxDepth, remotePath] ""
+-- | List remote directory as JSON (at remote root)
+listRemoteJson :: Remote -> Int -> IO (ExitCode, String, String)
+listRemoteJson remote maxDepth =
+    readProcessWithExitCode "rclone" ["lsjson", "--max-depth", show maxDepth, remoteUrl remote] ""
 
--- | List remote directory items (parsed, dumb data structure)
-listRemoteItems :: String -> Int -> IO (Either String [TransportItem])
-listRemoteItems remotePath maxDepth = do
-    (code, out, err) <- listRemoteJson remotePath maxDepth
+-- | List remote directory items (at remote root, parsed)
+listRemoteItems :: Remote -> Int -> IO (Either String [TransportItem])
+listRemoteItems remote maxDepth = do
+    (code, out, err) <- listRemoteJson remote maxDepth
     case code of
         ExitFailure _ -> 
             if "directory not found" `isInfixOf` err 
@@ -2278,18 +2296,17 @@ listRemoteItems remotePath maxDepth = do
                 Nothing -> return (Left "Failed to parse rclone JSON output")
                 Just items -> return (Right [TransportItem (name item) (isDir item) | item <- items])
 
--- | List remote recursively with hashes as JSON
-listRemoteJsonWithHash :: String -> IO (ExitCode, String, String)
-listRemoteJsonWithHash remotePath =
-    readProcessWithExitCode "rclone" ["lsjson", remotePath, "--hash", "--recursive"] ""
+-- | List remote recursively with hashes
+listRemoteJsonWithHash :: Remote -> IO (ExitCode, String, String)
+listRemoteJsonWithHash remote =
+    readProcessWithExitCode "rclone" ["lsjson", remoteUrl remote, "--hash", "--recursive"] ""
 
--- | Run rclone check with --combined output; parse results. Excludes .rgit/**.
--- Does NOT throw on non-zero exit (1 = differences found).
-checkRemote :: FilePath -> String -> IO CheckResult
-checkRemote localPath remoteUrl = do
+-- | Check local against remote
+checkRemote :: FilePath -> Remote -> IO CheckResult
+checkRemote localPath remote = do
     let args = [ "check"
                , localPath
-               , remoteUrl
+               , remoteUrl remote
                , "--combined", "-"
                , "--exclude", ".rgit/**"
                ]
@@ -3749,7 +3766,11 @@ makeSwapPlan pathA pathB =
 
 ```haskell
 module Rgit.Remote
-  ( Remote(..)
+  ( Remote          -- export type but NOT constructor/fields
+  , mkRemote        -- smart constructor
+  , remoteName      -- only the name is public
+  , remoteUrl       -- for Transport only (should import from Internal)
+  , displayRemote   -- for user-facing messages
   , resolveRemote
   , getDefaultRemote
   ) where
@@ -3763,9 +3784,25 @@ import Data.Maybe (fromMaybe)
 
 -- | A resolved remote. Bit.hs works with this; only Transport sees the url.
 data Remote = Remote
-  { remoteName :: String    -- "origin", "backup", "nas", etc.
-  , remoteUrl  :: String    -- Resolved URL/path for Transport (e.g. "gdrive:Projects/foo", "/mnt/usb/backup")
+  { _remoteName :: String    -- "origin", "backup", "nas", etc.
+  , _remoteUrl  :: String    -- Resolved URL/path for Transport (e.g. "gdrive:Projects/foo", "/mnt/usb/backup")
   } deriving (Show, Eq)
+
+-- | Get the remote name
+remoteName :: Remote -> String
+remoteName = _remoteName
+
+-- | Get the remote URL (for Transport only)
+remoteUrl :: Remote -> String
+remoteUrl = _remoteUrl
+
+-- | For user-facing display only. Never use this to construct paths.
+displayRemote :: Remote -> String
+displayRemote r = _remoteName r ++ " (" ++ _remoteUrl r ++ ")"
+
+-- | Smart constructor
+mkRemote :: String -> String -> Remote
+mkRemote = Remote
 
 -- | Resolve a remote name to a Remote. Checks:
 --   1. .rgit/remotes/<name> (device resolution via Device.hs)
@@ -3779,13 +3816,13 @@ resolveRemote cwd name = do
         Just target -> do
             res <- Device.resolveRemoteTarget cwd target
             case res of
-                Device.Resolved url -> return (Just (Remote name url))
+                Device.Resolved url -> return (Just (mkRemote name url))
                 Device.NotConnected _ -> return Nothing
         Nothing -> do
             -- Fall back to git remote URL
             mUrl <- Git.getRemoteUrl name
             case mUrl of
-                Just url | not (null url) -> return (Just (Remote name url))
+                Just url | not (null url) -> return (Just (mkRemote name url))
                 _ -> return Nothing
 
 -- | Get the default remote for push/pull/fetch.
@@ -3827,6 +3864,7 @@ import qualified Data.Text as T
 import Data.Time (UTCTime)
 import Rgit.Types
 import qualified Internal.Transport as Transport
+import Rgit.Remote (Remote)
 
 ----------------------------------------------------------------------
 -- Errors
@@ -3841,9 +3879,9 @@ data RemoteError
 -- Public API
 ----------------------------------------------------------------------
 
-fetchRemoteFiles :: String -> IO (Either RemoteError [FileEntry])
-fetchRemoteFiles remotePath = do
-    (code, raw, _err) <- Transport.listRemoteJsonWithHash remotePath
+fetchRemoteFiles :: Remote -> IO (Either RemoteError [FileEntry])
+fetchRemoteFiles remote = do
+    (code, raw, _err) <- Transport.listRemoteJsonWithHash remote
     case code of
         ExitSuccess -> pure $ maybe
             (Left (DecodeFailed "Invalid rclone JSON output"))
@@ -4607,9 +4645,10 @@ test-suite generate-literate-docs
 *Source file.*
 
 ```haskell
--- | Generate two literate-programming Markdown files:
+-- | Generate three literate-programming Markdown files:
 --   * rgit-source-literate.md Γאפ rgit.cabal + all .hs source files (excluding test/)
 --   * rgit-tests-literate.md  Γאפ everything under test/
+--   * rgit-docs-literate.md   Γאפ all .md files under docs/
 --
 -- After generation, stages them in git, commits, and pushes to origin.
 --
@@ -4696,6 +4735,19 @@ gatherTestFiles root = go "test"
             then go relPath
             else return [relPath]
 
+-- | Collect all .md files under docs/, relative to @root@.
+gatherDocsFiles :: FilePath -> IO [FilePath]
+gatherDocsFiles root = do
+  let docsDir = root </> "docs"
+  exists <- doesDirectoryExist docsDir
+  if not exists then return []
+  else do
+    entries <- listDirectory docsDir
+    let mdFiles = [ "docs" </> name | name <- entries
+                  , takeExtension name == ".md"
+                  , head name /= '.' ]
+    return (sort mdFiles)
+
 -- | Map file extension to fenced-code-block language tag.
 getLang :: FilePath -> String
 getLang path = case map toLower (takeExtension path) of
@@ -4718,6 +4770,7 @@ getExplanation rel
   | "test/cli/" `isPrefixOf` rel       = "*CLI test Γאפ shell-based integration test.*"
   | "test/" `isPrefixOf` rel           = "*Test module.*"
   | "scripts/" `isPrefixOf` rel        = "*Build script.*"
+  | "docs/" `isPrefixOf` rel           = "*Documentation file.*"
   | otherwise                          = "*Source file.*"
 
 -- | Normalise backslashes to forward slashes.
@@ -4737,9 +4790,11 @@ main = do
 
   hsFiles   <- gatherHsFiles root
   testFiles <- gatherTestFiles root
+  docsFiles <- gatherDocsFiles root
 
   let sourceFiles = sort $ "rgit.cabal" : hsFiles
       testSorted  = sort testFiles
+      docsSorted  = sort docsFiles
 
   let litDir = root </> "literate-output"
   createDirectoryIfMissing True litDir
@@ -4762,11 +4817,21 @@ main = do
     root testSorted
   putStrLn $ "Wrote " ++ testsPath ++ " (" ++ show (length testSorted) ++ " files)"
 
+  -- Docs files
+  let docsPath = litDir </> "rgit-docs-literate.md"
+  writeDocument docsPath
+    "rgit Γאפ Documentation (Literate Programming Document)"
+    "This document contains all documentation files for the rgit project:\n\
+    \specifications, refactoring plans, and design documents."
+    root docsSorted
+  putStrLn $ "Wrote " ++ docsPath ++ " (" ++ show (length docsSorted) ++ " files)"
+
   -- Git: stage, commit, push (gracefully handle failures)
   putStrLn "Committing literate output..."
   addResult <- try (callProcess "git" ["-C", litDir, "add",
     "rgit-source-literate.md",
-    "rgit-tests-literate.md"]) :: IO (Either SomeException ())
+    "rgit-tests-literate.md",
+    "rgit-docs-literate.md"]) :: IO (Either SomeException ())
   case addResult of
     Left _ -> putStrLn "Warning: git add failed (continuing anyway)"
     Right () -> do
