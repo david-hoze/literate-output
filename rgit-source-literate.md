@@ -117,6 +117,21 @@ data PullOptions = PullOptions
 defaultPullOptions :: PullOptions
 defaultPullOptions = PullOptions False False
 
+-- Domain types (moved from Transport in Step 4)
+data RemoteState 
+    = StateEmpty                        -- Case A: No files at all
+    | StateValidRgit                    -- Case B: .rgit/ exists and looks okay
+    | StateNonRgitOccupied [String]     -- Case C: Files exist, but no .rgit/ (stores sample filenames)
+    | StateCorruptedRgit String         -- Case D: .rgit/ exists but something is wrong
+    | StateNetworkError String          -- Network/Auth failure
+    deriving (Show, Eq)
+
+data FetchResult 
+    = BundleFound FilePath 
+    | RemoteEmpty 
+    | NetworkError String
+    deriving (Show, Eq)
+
 -- ============================================================================
 -- Git passthrough (thin wrappers)
 -- ============================================================================
@@ -406,25 +421,25 @@ push :: RgitM ()
 push = withRemoteUrl $ \url -> do
     force <- asks envForce
     liftIO $ putStrLn $ "Inspecting remote: " ++ url
-    state <- liftIO $ Transport.classifyRemote url
+    state <- liftIO $ classifyRemoteState url
 
     case state of
-        Transport.StateEmpty -> do
+        StateEmpty -> do
             liftIO $ putStrLn "Remote is empty. Initializing..."
             syncRemoteFiles
             liftIO $ pushBundle url
             updateLocalBundleAfterPush
 
-        Transport.StateValidRgit -> do
+        StateValidRgit -> do
             liftIO $ putStrLn "Remote is an rgit repo. Checking history..."
-            fetchResult <- liftIO $ Transport.fetchBundle url
+            fetchResult <- liftIO $ fetchBundle url
             case fetchResult of
-                Transport.BundleFound bPath -> do
+                BundleFound bPath -> do
                     liftIO $ copyFile bPath fetchedBundlePath
                     processExistingRemote bPath
                 _ -> liftIO $ hPutStrLn stderr "Error: Remote .rgit found but metadata is missing."
 
-        Transport.StateNonRgitOccupied samples -> do
+        StateNonRgitOccupied samples -> do
             if force
                 then do
                     liftIO $ hPutStrLn stderr "Warning: --force used. Overwriting non-rgit remote..."
@@ -438,10 +453,10 @@ push = withRemoteUrl $ \url -> do
                     liftIO $ hPutStrLn stderr "To initialize anyway (destructive): rgit init --force"
                     liftIO $ hPutStrLn stderr "-------------------------------------------------------"
 
-        Transport.StateNetworkError err ->
+        StateNetworkError err ->
             liftIO $ hPutStrLn stderr $ "Aborting: Network error -> " ++ err
 
-        Transport.StateCorruptedRgit msg ->
+        StateCorruptedRgit msg ->
             liftIO $ hPutStrLn stderr $ "Aborting: [X] Corrupted remote -> " ++ msg
 
 pull :: PullOptions -> RgitM ()
@@ -840,6 +855,41 @@ resolveRemoteByName cwd remoteName = do
         Nothing -> Git.getRemoteUrl remoteName
 
 -- ============================================================================
+-- Domain logic functions (moved from Transport in Step 4)
+-- ============================================================================
+
+-- | Classify remote state (empty, valid rgit, non-rgit, corrupted, network error)
+-- This is domain logic: it knows what .rgit/ means and interprets remote contents
+classifyRemoteState :: String -> IO RemoteState
+classifyRemoteState remoteUrl = do
+    result <- Transport.listRemoteItems remoteUrl 1
+    case result of
+        Left err -> return (StateNetworkError err)
+        Right items -> return (interpretRemoteItems items)
+
+-- | Pure interpretation of remote items into domain state
+interpretRemoteItems :: [Transport.TransportItem] -> RemoteState
+interpretRemoteItems items
+    | null items = StateEmpty
+    | ".rgit" `elem` map Transport.tiName items = StateValidRgit
+    | otherwise = StateNonRgitOccupied (take 3 (map Transport.tiName items))
+
+-- | Download the remote bundle for comparison. Returns temp bundle path or error.
+-- This is domain logic: it knows about .rgit/ layout and bundle files
+fetchBundle :: String -> IO FetchResult
+fetchBundle remoteUrl = do
+    let remotePath = remoteUrl ++ "/.rgit/rgit.bundle"
+    let localDest = ".rgit/temp_remote.bundle"
+    
+    result <- Transport.copyFromRemoteDetailed remotePath localDest
+    case result of
+        Transport.CopySuccess -> return (BundleFound localDest)
+        Transport.CopyNotFound -> return RemoteEmpty
+        Transport.CopyNetworkError _ -> 
+            return (NetworkError "Network unreachable: Check your internet connection or remote name.")
+        Transport.CopyOtherError err -> return (NetworkError err)
+
+-- ============================================================================
 -- Core operations implementations
 -- ============================================================================
 
@@ -1022,10 +1072,10 @@ updateMetadataAfterSync cwd = do
 -- Returns the temp bundle path on success, Nothing otherwise.
 fetchRemoteBundle :: String -> IO (Maybe FilePath)
 fetchRemoteBundle url = do
-    remoteState <- Transport.classifyRemote url
+    remoteState <- classifyRemoteState url
 
     case remoteState of
-        Transport.StateNetworkError _err -> do
+        StateNetworkError _err -> do
             hPutStrLn stderr $ unlines
                 [ _err
                 , "fatal: Could not read from remote repository."
@@ -1035,11 +1085,11 @@ fetchRemoteBundle url = do
                 ]
             return Nothing
 
-        Transport.StateEmpty -> do
+        StateEmpty -> do
             -- Git fetch silently succeeds when remote is empty
             return Nothing
 
-        Transport.StateNonRgitOccupied samples -> do
+        StateNonRgitOccupied samples -> do
             hPutStrLn stderr $ "StateNonRgitOccupied: " ++ show samples
             hPutStrLn stderr $ unlines
                 [ "fatal: Could not read from remote repository."
@@ -1049,7 +1099,7 @@ fetchRemoteBundle url = do
                 ]
             return Nothing
 
-        Transport.StateCorruptedRgit _msg -> do
+        StateCorruptedRgit _msg -> do
             hPutStrLn stderr $ "StateCorruptedRgit: " ++ _msg
             hPutStrLn stderr $ unlines
                 [ "fatal: Could not read from remote repository."
@@ -1059,10 +1109,10 @@ fetchRemoteBundle url = do
                 ]
             return Nothing
 
-        Transport.StateValidRgit -> do
-            fetchResult <- Transport.fetchBundle url
+        StateValidRgit -> do
+            fetchResult <- fetchBundle url
             case fetchResult of
-                Transport.BundleFound bPath -> return $ Just bPath
+                BundleFound bPath -> return $ Just bPath
                 _ -> do
                     hPutStrLn stderr $ unlines
                         [ "fatal: Could not read from remote repository."
@@ -2120,18 +2170,18 @@ hasStagedChanges = do
 module Internal.Transport
     ( copyToRemote
     , copyFromRemote
+    , copyFromRemoteDetailed
+    , CopyResult(..)
     , moveRemote
     , deleteRemote
     , purgeRemote
     , mkdirRemote
     , listRemoteJson
     , listRemoteJsonWithHash
+    , listRemoteItems
+    , TransportItem(..)
     , checkRemote
-    , classifyRemote
-    , fetchBundle
-    , RemoteState(..)
     , CheckResult(..)
-    , FetchResult(..)
     ) where
 
 import System.Process (readProcessWithExitCode)
@@ -2147,15 +2197,13 @@ import GHC.Generics (Generic)
 import Data.Maybe (fromMaybe)
 import Data.String (fromString)
 
--- Types from Rclone.hs
-data RemoteState 
-    = StateEmpty                        -- Case A: No files at all
-    | StateValidRgit                    -- Case B: .rgit/ exists and looks okay
-    | StateNonRgitOccupied [String]     -- Case C: Files exist, but no .rgit/ (stores sample filenames)
-    | StateCorruptedRgit String         -- Case D: .rgit/ exists but something is wrong
-    | StateNetworkError String          -- Network/Auth failure
-    deriving (Show, Eq)
+-- Dumb transport-level data types
+data TransportItem = TransportItem
+    { tiName  :: String
+    , tiIsDir :: Bool
+    } deriving (Show, Eq)
 
+-- Internal type for JSON parsing
 data RcloneItem = RcloneItem 
     { name   :: String
     , isDir  :: Bool 
@@ -2167,10 +2215,12 @@ instance Aeson.FromJSON RcloneItem where
         <$> v Aeson..: fromString "Name"
         <*> v Aeson..: fromString "IsDir"
 
-data FetchResult 
-    = BundleFound FilePath 
-    | RemoteEmpty 
-    | NetworkError String
+-- Detailed copy result for domain-level error handling
+data CopyResult 
+    = CopySuccess 
+    | CopyNotFound 
+    | CopyNetworkError String 
+    | CopyOtherError String
     deriving (Show, Eq)
 
 -- | Result of an rclone check operation (--combined output).
@@ -2199,6 +2249,17 @@ copyFromRemote remotePath localPath = do
     (code, _, _) <- readProcessWithExitCode "rclone" ["copyto", remotePath, localPath] ""
     return code
 
+-- | Copy a file from remote to local with detailed error classification
+copyFromRemoteDetailed :: String -> FilePath -> IO CopyResult
+copyFromRemoteDetailed remotePath localPath = do
+    (code, _, err) <- readProcessWithExitCode "rclone" ["copyto", remotePath, localPath] ""
+    case code of
+        ExitSuccess -> return CopySuccess
+        ExitFailure _ 
+            | "directory not found" `isInfixOf` err || "object not found" `isInfixOf` err -> return CopyNotFound
+            | "no such host" `isInfixOf` err || "dial tcp" `isInfixOf` err -> return (CopyNetworkError err)
+            | otherwise -> return (CopyOtherError err)
+
 -- | Move a file on remote (src -> dest)
 moveRemote :: String -> String -> IO ExitCode
 moveRemote src dest = do
@@ -2223,10 +2284,24 @@ mkdirRemote remotePath = do
     (code, _, _) <- readProcessWithExitCode "rclone" ["mkdir", remotePath] ""
     return code
 
--- | List remote directory as JSON
+-- | List remote directory as JSON (raw output)
 listRemoteJson :: String -> Int -> IO (ExitCode, String, String)
 listRemoteJson remotePath maxDepth = do
     readProcessWithExitCode "rclone" ["lsjson", "--max-depth", show maxDepth, remotePath] ""
+
+-- | List remote directory items (parsed, dumb data structure)
+listRemoteItems :: String -> Int -> IO (Either String [TransportItem])
+listRemoteItems remotePath maxDepth = do
+    (code, out, err) <- listRemoteJson remotePath maxDepth
+    case code of
+        ExitFailure _ -> 
+            if "directory not found" `isInfixOf` err 
+            then return (Right [])  -- Empty directory
+            else return (Left err)  -- Network or other error
+        ExitSuccess -> do
+            case Aeson.decode (LBS.pack out) :: Maybe [RcloneItem] of
+                Nothing -> return (Left "Failed to parse rclone JSON output")
+                Just items -> return (Right [TransportItem (name item) (isDir item) | item <- items])
 
 -- | List remote recursively with hashes as JSON
 listRemoteJsonWithHash :: String -> IO (ExitCode, String, String)
@@ -2271,45 +2346,6 @@ checkRemote localPath remoteUrl = do
                      ]
         in go
 
--- | Classify remote state (empty, valid rgit, non-rgit, corrupted, network error)
-classifyRemote :: String -> IO RemoteState
-classifyRemote remoteUrl = do
-    -- We only check the top level to see if .rgit exists
-    (code, out, err) <- listRemoteJson remoteUrl 1
-    
-    case code of
-        ExitFailure _ -> 
-            if "directory not found" `isInfixOf` err 
-            then return StateEmpty 
-            else return $ StateNetworkError err
-            
-        ExitSuccess -> do
-            let items = fromMaybe [] (Aeson.decode (LBS.pack out) :: Maybe [RcloneItem])
-            let filenames = map name items
-            let hasRgit = ".rgit" `elem` filenames
-            
-            case (null filenames, hasRgit) of
-                (True, _) -> return StateEmpty
-                (False, True) -> return StateValidRgit -- We could drill deeper here for State D
-                (False, False) -> return $ StateNonRgitOccupied (take 3 filenames)
-
--- | Download the remote bundle for comparison. Returns temp bundle path or error.
-fetchBundle :: String -> IO FetchResult
-fetchBundle remoteUrl = do
-    let remotePath = remoteUrl ++ "/.rgit/rgit.bundle"
-    let localDest = ".rgit/temp_remote.bundle"
-    
-    -- Need stderr for error classification
-    (code, _, err) <- readProcessWithExitCode "rclone" ["copyto", remotePath, localDest] ""
-    
-    case code of
-        ExitSuccess -> return $ BundleFound localDest
-        ExitFailure _ -> 
-            if "directory not found" `isInfixOf` err || "object not found" `isInfixOf` err
-                then return RemoteEmpty
-                else if "no such host" `isInfixOf` err || "dial tcp" `isInfixOf` err
-                    then return $ NetworkError "Network unreachable: Check your internet connection or remote name."
-                    else return $ NetworkError err
 ```
 
 ---
@@ -4239,6 +4275,8 @@ import Internal.Config (fetchedBundlePath, rgitIndexPath)
 import System.Process (readProcessWithExitCode)
 import System.Exit (ExitCode(..))
 import Data.Char (isSpace)
+import System.IO (hPutStrLn, stderr)
+import Control.Monad (when)
 import Control.Monad (when, unless)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
@@ -4367,12 +4405,14 @@ verifyRemote cwd remoteUrl = do
   -- 1. Fetch the remote bundle if needed
   bundleExists <- doesFileExist fetchedBundlePath
   when (not bundleExists) $ do
-    fetchResult <- Transport.fetchBundle remoteUrl
+    let remotePath = remoteUrl ++ "/.rgit/rgit.bundle"
+    let localDest = ".rgit/temp_remote.bundle"
+    fetchResult <- Transport.copyFromRemoteDetailed remotePath localDest
     case fetchResult of
-      Transport.BundleFound tempPath -> do
+      Transport.CopySuccess -> do
         -- Copy to fetchedBundlePath for consistency
-        BS.readFile tempPath >>= BS.writeFile fetchedBundlePath
-        when (tempPath /= fetchedBundlePath) $ safeRemove tempPath
+        BS.readFile localDest >>= BS.writeFile fetchedBundlePath
+        when (localDest /= fetchedBundlePath) $ safeRemove localDest
       _ -> do
         hPutStrLn stderr "Error: Could not fetch remote bundle."
         return ()
