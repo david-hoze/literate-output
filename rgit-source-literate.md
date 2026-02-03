@@ -4089,6 +4089,63 @@ makeSwapPlan pathA pathB =
 
 ---
 
+## Rgit/Remote.hs
+
+**Path:** `Rgit/Remote.hs`
+
+*Source file.*
+
+```haskell
+module Rgit.Remote
+  ( Remote(..)
+  , resolveRemote
+  , getDefaultRemote
+  ) where
+
+import qualified Internal.Git as Git
+import qualified Rgit.Device as Device
+import Internal.Config (rgitRemotesDir)
+import System.FilePath ((</>))
+import System.Directory (doesFileExist)
+import Data.Maybe (fromMaybe)
+
+-- | A resolved remote. Bit.hs works with this; only Transport sees the url.
+data Remote = Remote
+  { remoteName :: String    -- "origin", "backup", "nas", etc.
+  , remoteUrl  :: String    -- Resolved URL/path for Transport (e.g. "gdrive:Projects/foo", "/mnt/usb/backup")
+  } deriving (Show, Eq)
+
+-- | Resolve a remote name to a Remote. Checks:
+--   1. .rgit/remotes/<name> (device resolution via Device.hs)
+--   2. Git config (git remote get-url <name>)
+-- Returns Nothing if remote doesn't exist or device is not connected.
+resolveRemote :: FilePath -> String -> IO (Maybe Remote)
+resolveRemote cwd name = do
+    -- Try .rgit/remotes/<name> first (device-aware resolution)
+    mTarget <- Device.readRemoteFile cwd name
+    case mTarget of
+        Just target -> do
+            res <- Device.resolveRemoteTarget cwd target
+            case res of
+                Device.Resolved url -> return (Just (Remote name url))
+                Device.NotConnected _ -> return Nothing
+        Nothing -> do
+            -- Fall back to git remote URL
+            mUrl <- Git.getRemoteUrl name
+            case mUrl of
+                Just url | not (null url) -> return (Just (Remote name url))
+                _ -> return Nothing
+
+-- | Get the default remote for push/pull/fetch.
+-- Checks branch tracking config, falls back to "origin".
+getDefaultRemote :: FilePath -> IO (Maybe Remote)
+getDefaultRemote cwd = do
+    name <- Git.getTrackedRemoteName  -- defaults to "origin" if not configured
+    resolveRemote cwd name
+```
+
+---
+
 ## Rgit/Remote/Scan.hs
 
 **Path:** `Rgit/Remote/Scan.hs`
@@ -4769,6 +4826,7 @@ executable rgit
                       Rgit.Utils,
                       Rgit.Plan,
                       Rgit.Pipeline,
+                      Rgit.Remote,
                       Rgit.Remote.Scan,
                       Rgit.Scan,
                       Rgit.Types,
