@@ -4562,11 +4562,13 @@ test-suite merge
     other-modules:       Rgit.Conflict,
                          Rgit.Internal.Metadata,
                          Rgit.Types,
+                         Internal.Git,
                          Internal.Config,
                          Internal.ConfigFile
     build-depends:       base,
                          containers,
                          text,
+                         process,
                          transformers,
                          mtl,
                          bytestring,
