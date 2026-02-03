@@ -1049,26 +1049,24 @@ fetchRemoteBundle remote = do
 saveFetchedBundle :: Remote -> Maybe FilePath -> IO ()
 saveFetchedBundle remote Nothing = pure ()
 saveFetchedBundle remote (Just bPath) = do
-    -- Check if we had a previous bundle to compare
     hadPrevious <- Dir.doesFileExist fetchedBundlePath
     maybeOldHash <- if hadPrevious
         then Git.getHashFromBundle fetchedBundleName
         else return Nothing
-    maybeNewHash <- Git.getHashFromBundle bPath
 
-    -- Copy the new bundle
+    -- Copy FIRST, then read hash from the correct location
     copyFile bPath fetchedBundlePath
     safeRemove bPath
+    maybeNewHash <- Git.getHashFromBundle fetchedBundleName  -- was: bPath
 
-    -- Set up git remote and branch tracking if not already done
     _ <- Git.setupRemote (remoteUrl remote)
     _ <- Git.setupBranchTracking
 
-    -- Pull from the bundle into the local repo so .rgit/index/.git has the bundle's objects and refs
     case maybeNewHash of
         Just _ -> void $ Git.fetchFromBundle fetchedBundleName
         Nothing -> return ()
 
+    -- ... rest unchanged
     -- Output fetch results in git format
     case (maybeOldHash, maybeNewHash) of
         (Nothing, Just newHash) -> do
