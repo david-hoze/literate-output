@@ -174,9 +174,7 @@ mergeAbort :: IO ()
 mergeAbort = doMergeAbort
 
 unsetUpstream :: IO ()
-unsetUpstream = do
-    code <- Git.unsetBranchUpstream
-    when (code /= ExitSuccess) $ hPutStrLn stderr "fatal: Failed to unset upstream."
+unsetUpstream = void Git.unsetBranchUpstream
 
 remoteAdd :: String -> String -> IO ()
 remoteAdd = addRemote
