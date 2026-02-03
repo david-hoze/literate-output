@@ -104,7 +104,6 @@ import qualified Rgit.DevicePrompt as DevicePrompt
 import qualified Rgit.Conflict as Conflict
 import Prelude hiding (init)
 import Control.Exception (bracket)
-import qualified System.Process
 
 -- ============================================================================
 -- Types
@@ -722,8 +721,6 @@ gitRaw = Git.runGitRaw
 gitQuery :: [String] -> IO (ExitCode, String, String)
 gitQuery = Git.runGitWithOutput
 
-rcloneExec :: String -> [String] -> IO ExitCode
-rcloneExec = rcloneExecIO
 
 readFileE :: FilePath -> IO (Maybe String)
 readFileE = readFileMaybe
@@ -768,55 +765,36 @@ withRemoteUrl action = do
   mUrl <- asks envRemoteUrl
   maybe (liftIO $ hPutStrLn stderr "Error: No remote URL configured.") action mUrl
 
--- TEMPORARY: will be replaced by Transport calls in Step 3
-rcloneExecIO :: String -> [String] -> IO ExitCode
-rcloneExecIO cmd args = do
-    (code, out, err) <- System.Process.readProcessWithExitCode "rclone" (cmd : args) ""
-    putStr out
-    hPutStrLn stderr err
-    return code
-
 -- | Executes/Prints the command to be run in the shell (push: local -> remote).
 -- remoteRoot is the configured remote URL with trailing slash (e.g. from .rgit/target).
 executeCommand :: FilePath -> String -> RcloneAction -> IO ()
 executeCommand localRoot remoteRoot action = case action of
-        Copy src dest ->
+        Copy src dest -> do
             let localPath = toPosix (localRoot </> src)
                 remotePath = remoteRoot ++ toPosix dest
-            in do
-                putStrLn $ "[DEBUG] executeCommand Copy: src=" ++ src ++ " dest=" ++ dest
-                run "copyto" [localPath, remotePath]
+            void $ Transport.copyToRemote localPath remotePath
 
         Move src dest ->
-            run "moveto" [remoteRoot ++ toPosix src, remoteRoot ++ toPosix dest]
+            void $ Transport.moveRemote (remoteRoot ++ toPosix src) (remoteRoot ++ toPosix dest)
 
         Delete path ->
-            run "deletefile" [remoteRoot ++ toPosix path]
+            void $ Transport.deleteRemote (remoteRoot ++ toPosix path)
 
         Swap _ _ _ -> return ()  -- not produced by planAction; future-proofing
-  where
-    run cmd args = do
-        putStrLn $ "Executing: rclone " ++ cmd ++ " " ++ unwords args
-        void $ rcloneExecIO cmd args
 
 -- | Execute a single pull action: copy from remote to local or delete local file.
 -- Text files are already in the git bundle (index); copy from index to work dir instead of rclone.
 executePullCommand :: FilePath -> String -> RcloneAction -> IO ()
 executePullCommand localRoot remoteRoot action = case action of
         Copy src dest -> do
-            putStrLn $ "[DEBUG] executePullCommand Copy: src=" ++ src ++ " dest=" ++ dest
             fromIndex <- isTextFileInIndex localRoot dest
-            putStrLn $ "[DEBUG] isTextFileInIndex returned: " ++ show fromIndex
             if fromIndex
-            then do
-                putStrLn $ "[DEBUG] Taking optimization path: copyFromIndexToWorkTree"
-                copyFromIndexToWorkTree localRoot dest
+            then copyFromIndexToWorkTree localRoot dest
             else do
                 let remotePath = remoteRoot ++ toPosix dest
                     localPath = toPosix (localRoot </> dest)
                 createDirectoryIfMissing True (takeDirectory (localRoot </> dest))
-                putStrLn $ "Executing: rclone copyto " ++ remotePath ++ " " ++ localPath
-                void $ rcloneExecIO "copyto" [remotePath, localPath]
+                void $ Transport.copyFromRemote remotePath localPath
         Move src dest -> do
             fromIndex <- isTextFileInIndex localRoot src
             if fromIndex
@@ -825,8 +803,7 @@ executePullCommand localRoot remoteRoot action = case action of
                 let remoteSrcPath = remoteRoot ++ toPosix src
                     localSrcPath = localRoot </> src
                 createDirectoryIfMissing True (takeDirectory localSrcPath)
-                putStrLn $ "Executing: rclone copyto " ++ remoteSrcPath ++ " " ++ toPosix localSrcPath
-                void $ rcloneExecIO "copyto" [remoteSrcPath, toPosix localSrcPath]
+                void $ Transport.copyFromRemote remoteSrcPath (toPosix localSrcPath)
             let localDestPath = localRoot </> dest
             exists <- Dir.doesFileExist localDestPath
             when exists $ Dir.removeFile localDestPath
@@ -886,11 +863,10 @@ pushBundle remoteUrl = do
 uploadToRemote :: FilePath -> String -> IO ()
 uploadToRemote src dest = do
     putStrLn "Uploading bundle to remote..."
-    -- Need stderr for error messages
-    (rCode, _, rErr) <- System.Process.readProcessWithExitCode "rclone" ["copyto", src, dest] ""
+    rCode <- Transport.copyToRemote src dest
     if rCode == ExitSuccess
         then putStrLn "Metadata push complete."
-        else hPutStrLn stderr $ "Error uploading bundle: " ++ rErr
+        else hPutStrLn stderr "Error uploading bundle."
 
 -- Helper for cleanup that doesn't crash if the file was never made
 cleanupTemp :: FilePath -> IO ()
@@ -1253,7 +1229,7 @@ createConflictDirectories url divergentFiles remoteFileMap remoteMetaMap localMe
         when localExists $ lift $ copyFileE localPath (conflictDir </> "LOCAL")
 
         let remotePath = url ++ "/" ++ toPosix path
-        code <- lift $ rcloneExec "copyto" [remotePath, conflictDir </> "REMOTE"]
+        code <- liftIO $ Transport.copyFromRemote remotePath (conflictDir </> "REMOTE")
         when (code /= ExitSuccess) $ lift $ tellErr $ "Warning: Could not download remote file: " ++ path
 
         lift $ case Map.lookup (normalise path) localMetaMap of
@@ -2149,6 +2125,7 @@ module Internal.Transport
     , purgeRemote
     , mkdirRemote
     , listRemoteJson
+    , listRemoteJsonWithHash
     , checkRemote
     , classifyRemote
     , fetchBundle
@@ -2250,6 +2227,11 @@ mkdirRemote remotePath = do
 listRemoteJson :: String -> Int -> IO (ExitCode, String, String)
 listRemoteJson remotePath maxDepth = do
     readProcessWithExitCode "rclone" ["lsjson", "--max-depth", show maxDepth, remotePath] ""
+
+-- | List remote recursively with hashes as JSON
+listRemoteJsonWithHash :: String -> IO (ExitCode, String, String)
+listRemoteJsonWithHash remotePath =
+    readProcessWithExitCode "rclone" ["lsjson", remotePath, "--hash", "--recursive"] ""
 
 -- | Run rclone check with --combined output; parse results. Excludes .rgit/**.
 -- Does NOT throw on non-zero exit (1 = differences found).
@@ -3820,12 +3802,13 @@ import qualified Data.Map as Map
 import Data.Map (Map)
 import qualified Data.ByteString.Lazy.Char8 as LBSC
 import Data.Aeson (FromJSON(..), decode, withObject, (.:), (.:?))
-import System.Process (readProcess)
+import System.Exit (ExitCode(..))
 import System.FilePath (normalise)
 import Data.Maybe
 import qualified Data.Text as T
 import Data.Time (UTCTime)
 import Rgit.Types
+import qualified Internal.Transport as Transport
 
 ----------------------------------------------------------------------
 -- Errors
@@ -3842,11 +3825,13 @@ data RemoteError
 
 fetchRemoteFiles :: String -> IO (Either RemoteError [FileEntry])
 fetchRemoteFiles remotePath = do
-    raw <- readProcess "rclone" ["lsjson", remotePath, "--hash", "--recursive"] ""
-    pure $ maybe
-        (Left (DecodeFailed "Invalid rclone JSON output"))
-        (Right . map rcloneFileToFileEntry . filter (not . rfIsDir))
-        (decode (LBSC.pack raw) :: Maybe [RcloneFile])
+    (code, raw, _err) <- Transport.listRemoteJsonWithHash remotePath
+    case code of
+        ExitSuccess -> pure $ maybe
+            (Left (DecodeFailed "Invalid rclone JSON output"))
+            (Right . map rcloneFileToFileEntry . filter (not . rfIsDir))
+            (decode (LBSC.pack raw) :: Maybe [RcloneFile])
+        _ -> pure (Left RcloneFailed)
 
 ----------------------------------------------------------------------
 -- Conversion
