@@ -91,11 +91,10 @@ import Rgit.Plan (RcloneAction(..))
 import Rgit.Types
 import qualified Rgit.Remote.Scan as Remote.Scan
 import Control.Monad.Trans.Reader (asks)
+import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Class (lift)
 import Control.Exception (try, throwIO, SomeException, IOException)
 import System.IO (hFlush, stdout, stderr, hPutStrLn, hIsTerminalDevice, stdin)
-import Rgit.Effect (Rgit, tell, tellErr, gitRaw, gitQuery, rcloneExec, readFileE, writeFileAtomicE, copyFileE, fileExistsE, dirExistsE, createDirE, removeFileE, removeDirRecursiveE, exitWithE, askUser, getCurrentDirE, liftIOE)
-import Rgit.Effect.IO (runIO)
 import Data.Maybe (fromMaybe, listToMaybe, maybe, maybeToList)
 import Data.Either (either)
 import Data.Text (unpack)
@@ -123,29 +122,29 @@ defaultPullOptions = PullOptions False False
 -- Git passthrough (thin wrappers)
 -- ============================================================================
 
-add :: [String] -> Rgit ExitCode
-add args = gitRaw ("add" : args)
+add :: [String] -> IO ExitCode
+add args = Git.runGitRaw ("add" : args)
 
-commit :: [String] -> Rgit ExitCode
-commit args = gitRaw ("commit" : args)
+commit :: [String] -> IO ExitCode
+commit args = Git.runGitRaw ("commit" : args)
 
-diff :: [String] -> Rgit ExitCode
-diff args = gitRaw ("diff" : args)
+diff :: [String] -> IO ExitCode
+diff args = Git.runGitRaw ("diff" : args)
 
-reset :: [String] -> Rgit ExitCode
-reset args = gitRaw ("reset" : args)
+reset :: [String] -> IO ExitCode
+reset args = Git.runGitRaw ("reset" : args)
 
-rm :: [String] -> Rgit ExitCode
-rm args = gitRaw ("rm" : args)
+rm :: [String] -> IO ExitCode
+rm args = Git.runGitRaw ("rm" : args)
 
-mv :: [String] -> Rgit ExitCode
-mv args = gitRaw ("mv" : args)
+mv :: [String] -> IO ExitCode
+mv args = Git.runGitRaw ("mv" : args)
 
-branch :: [String] -> Rgit ExitCode
-branch args = gitRaw ("branch" : args)
+branch :: [String] -> IO ExitCode
+branch args = Git.runGitRaw ("branch" : args)
 
-merge :: [String] -> Rgit ExitCode
-merge args = gitRaw ("merge" : args)
+merge :: [String] -> IO ExitCode
+merge args = Git.runGitRaw ("merge" : args)
 
 -- ============================================================================
 -- Plain IO functions (no env needed)
@@ -392,7 +391,7 @@ getRemoteTarget = do
 
 status :: [String] -> RgitM ()
 status args = do
-    lift $ void $ gitRaw ("status" : args)
+    liftIO $ void $ Git.runGitRaw ("status" : args)
 
 restore :: [String] -> RgitM ()
 restore = doRestore
@@ -407,44 +406,44 @@ checkout = doCheckout
 push :: RgitM ()
 push = withRemoteUrl $ \url -> do
     force <- asks envForce
-    lift $ tell $ "Inspecting remote: " ++ url
-    state <- lift $ liftIOE $ Transport.classifyRemote url  -- ESCAPE: complex rclone JSON + bracket
+    liftIO $ putStrLn $ "Inspecting remote: " ++ url
+    state <- liftIO $ Transport.classifyRemote url
 
     case state of
         Transport.StateEmpty -> do
-            lift $ tell "Remote is empty. Initializing..."
+            liftIO $ putStrLn "Remote is empty. Initializing..."
             syncRemoteFiles
-            lift $ liftIOE $ pushBundle url  -- ESCAPE: complex rclone bundle + bracket
+            liftIO $ pushBundle url
             updateLocalBundleAfterPush
 
         Transport.StateValidRgit -> do
-            lift $ tell "Remote is an rgit repo. Checking history..."
-            fetchResult <- lift $ liftIOE $ Transport.fetchBundle url  -- ESCAPE: complex rclone + bracket
+            liftIO $ putStrLn "Remote is an rgit repo. Checking history..."
+            fetchResult <- liftIO $ Transport.fetchBundle url
             case fetchResult of
                 Transport.BundleFound bPath -> do
-                    lift $ copyFileE bPath fetchedBundlePath
+                    liftIO $ copyFile bPath fetchedBundlePath
                     processExistingRemote bPath
-                _ -> lift $ tellErr "Error: Remote .rgit found but metadata is missing."
+                _ -> liftIO $ hPutStrLn stderr "Error: Remote .rgit found but metadata is missing."
 
         Transport.StateNonRgitOccupied samples -> do
             if force
                 then do
-                    lift $ tellErr "Warning: --force used. Overwriting non-rgit remote..."
+                    liftIO $ hPutStrLn stderr "Warning: --force used. Overwriting non-rgit remote..."
                     syncRemoteFiles
-                    lift $ liftIOE $ pushBundle url  -- ESCAPE: complex rclone bundle + bracket
+                    liftIO $ pushBundle url
                     updateLocalBundleAfterPush
                 else do
-                    lift $ tellErr "-------------------------------------------------------"
-                    lift $ tellErr "[!] STOP: Remote is NOT an rgit repository!"
-                    lift $ tellErr $ "Found existing files: " ++ List.intercalate ", " samples
-                    lift $ tellErr "To initialize anyway (destructive): rgit init --force"
-                    lift $ tellErr "-------------------------------------------------------"
+                    liftIO $ hPutStrLn stderr "-------------------------------------------------------"
+                    liftIO $ hPutStrLn stderr "[!] STOP: Remote is NOT an rgit repository!"
+                    liftIO $ hPutStrLn stderr $ "Found existing files: " ++ List.intercalate ", " samples
+                    liftIO $ hPutStrLn stderr "To initialize anyway (destructive): rgit init --force"
+                    liftIO $ hPutStrLn stderr "-------------------------------------------------------"
 
         Transport.StateNetworkError err ->
-            lift $ tellErr $ "Aborting: Network error -> " ++ err
+            liftIO $ hPutStrLn stderr $ "Aborting: Network error -> " ++ err
 
         Transport.StateCorruptedRgit msg ->
-            lift $ tellErr $ "Aborting: [X] Corrupted remote -> " ++ msg
+            liftIO $ hPutStrLn stderr $ "Aborting: [X] Corrupted remote -> " ++ msg
 
 pull :: PullOptions -> RgitM ()
 pull opts = withRemoteUrl $ \url ->
@@ -456,83 +455,83 @@ pull opts = withRemoteUrl $ \url ->
 
 fetch :: RgitM ()
 fetch = withRemoteUrl $ \url -> do
-    mb <- lift $ liftIOE $ fetchRemoteBundle url  -- ESCAPE: Rclone.classifyRemote + fetchBundle
-    lift $ liftIOE $ saveFetchedBundle url mb
+    mb <- liftIO $ fetchRemoteBundle url
+    liftIO $ saveFetchedBundle url mb
 
 verify :: Bool -> RgitM ()
 verify isRemote
   | isRemote = withRemoteUrl $ \url -> do
       cwd <- asks envCwd
-      lift $ tell "Fetching remote metadata... done."
-      lift $ tell "Scanning remote files... done."
-      lift $ tell "Comparing..."
-      (fileCount, issues) <- lift $ liftIOE $ Verify.verifyRemote cwd url  -- ESCAPE: complex filesystem traversal
-      lift $ tell $ "Verifying " ++ show fileCount ++ " files..."
+      liftIO $ putStrLn "Fetching remote metadata... done."
+      liftIO $ putStrLn "Scanning remote files... done."
+      liftIO $ putStrLn "Comparing..."
+      (fileCount, issues) <- liftIO $ Verify.verifyRemote cwd url
+      liftIO $ putStrLn $ "Verifying " ++ show fileCount ++ " files..."
       if null issues
-        then lift $ tell "[OK] All files match metadata."
+        then liftIO $ putStrLn "[OK] All files match metadata."
         else do
-          lift $ liftIOE $ mapM_ (printVerifyIssue (\s -> take 16 s ++ if length s > 16 then "..." else "")) issues
-          lift $ tell $ show (length issues) ++ " issues found."
+          liftIO $ mapM_ (printVerifyIssue (\s -> take 16 s ++ if length s > 16 then "..." else "")) issues
+          liftIO $ putStrLn $ show (length issues) ++ " issues found."
   | otherwise = do
       cwd <- asks envCwd
-      (fileCount, issues) <- lift $ liftIOE $ Verify.verifyLocal cwd  -- ESCAPE: complex filesystem traversal
-      lift $ tell $ "Verifying " ++ show fileCount ++ " files..."
+      (fileCount, issues) <- liftIO $ Verify.verifyLocal cwd
+      liftIO $ putStrLn $ "Verifying " ++ show fileCount ++ " files..."
       if null issues
-        then lift $ tell "[OK] All files match metadata."
+        then liftIO $ putStrLn "[OK] All files match metadata."
         else do
-          lift $ liftIOE $ mapM_ (printVerifyIssue (\s -> take 16 s ++ if length s > 16 then "..." else "")) issues
-          lift $ tell $ show (length issues) ++ " issues found. Run 'rgit status' for details."
+          liftIO $ mapM_ (printVerifyIssue (\s -> take 16 s ++ if length s > 16 then "..." else "")) issues
+          liftIO $ putStrLn $ show (length issues) ++ " issues found. Run 'rgit status' for details."
 
 remoteShow :: Maybe String -> RgitM ()
 remoteShow mRemoteName = do
     cwd <- asks envCwd
     name <- case mRemoteName of
         Just n -> return n
-        Nothing -> lift $ liftIOE Git.getTrackedRemoteName
-    mTarget <- lift $ liftIOE $ Device.readRemoteFile cwd name
-    mResolvedUrl <- lift $ liftIOE $ case mTarget of
+        Nothing -> liftIO Git.getTrackedRemoteName
+    mTarget <- liftIO $ Device.readRemoteFile cwd name
+    mResolvedUrl <- liftIO $ case mTarget of
         Just t -> do
             r <- Device.resolveRemoteTarget cwd t
             case r of
                 Device.Resolved u -> return (Just u)
                 _ -> return Nothing
         Nothing -> Git.getRemoteUrl name
-    display <- lift $ liftIOE $ case mTarget of
+    display <- liftIO $ case mTarget of
         Just _ -> formatRemoteDisplay cwd name mTarget
         Nothing -> return (name ++ " Γזע " ++ fromMaybe "(not configured)" mResolvedUrl)
     case (mResolvedUrl, mTarget) of
-        (Nothing, Nothing) -> lift $ tell "No remote configured. (Use 'rgit remote add <name> <url>')"
+        (Nothing, Nothing) -> liftIO $ putStrLn "No remote configured. (Use 'rgit remote add <name> <url>')"
         (Nothing, Just _) -> do
-            lift $ tell display
-            lift $ tellErr "hint: Connect the device and try again."
+            liftIO $ putStrLn display
+            liftIO $ hPutStrLn stderr "hint: Connect the device and try again."
         (Just url, _) -> do
-            lift $ tell display
-            lift $ tell ""
-            hasBundle <- lift $ fileExistsE fetchedBundlePath
+            liftIO $ putStrLn display
+            liftIO $ putStrLn ""
+            hasBundle <- liftIO $ Dir.doesFileExist fetchedBundlePath
             if hasBundle
-                then lift $ liftIOE $ showRemoteStatusFromBundle name (Just url)  -- ESCAPE: Git + putStrLn
+                then liftIO $ showRemoteStatusFromBundle name (Just url)
                 else do
-                    maybeBundlePath <- lift $ liftIOE $ fetchRemoteBundle url
+                    maybeBundlePath <- liftIO $ fetchRemoteBundle url
                     case maybeBundlePath of
                         Just bPath -> do
-                            lift $ liftIOE $ saveFetchedBundle url (Just bPath)
-                            lift $ liftIOE $ showRemoteStatusFromBundle name (Just url)
-                        Nothing -> lift $ do
-                            tell $ "  Fetch URL: " ++ url
-                            tell $ "  Push  URL: " ++ url
-                            tell ""
-                            tell "  HEAD branch: (unknown)"
-                            tell ""
-                            tell "  Local branch configured for 'rgit pull':"
-                            tell "    main merges with remote (unknown)"
-                            tell ""
-                            tell "  Local refs configured for 'rgit push':"
-                            tell "    main pushes to main (unknown)"
+                            liftIO $ saveFetchedBundle url (Just bPath)
+                            liftIO $ showRemoteStatusFromBundle name (Just url)
+                        Nothing -> liftIO $ do
+                            putStrLn $ "  Fetch URL: " ++ url
+                            putStrLn $ "  Push  URL: " ++ url
+                            putStrLn ""
+                            putStrLn "  HEAD branch: (unknown)"
+                            putStrLn ""
+                            putStrLn "  Local branch configured for 'rgit pull':"
+                            putStrLn "    main merges with remote (unknown)"
+                            putStrLn ""
+                            putStrLn "  Local refs configured for 'rgit push':"
+                            putStrLn "    main pushes to main (unknown)"
 
 remoteCheck :: Maybe String -> RgitM ()
 remoteCheck mName = do
     cwd <- asks envCwd
-    (mUrl, remoteName) <- lift $ liftIOE $ case mName of  -- ESCAPE: resolveRemoteByName + Git.getTrackedRemoteName/getRemoteUrl
+    (mUrl, remoteName) <- liftIO $ case mName of
         Nothing -> do
             name <- Git.getTrackedRemoteName
             mU <- resolveRemoteByName cwd name
@@ -542,25 +541,25 @@ remoteCheck mName = do
             maybe (Git.getRemoteUrl name >>= \u -> return (u, name)) (\u -> return (Just u, name)) mU
     case mUrl of
         Nothing -> do
-            lift $ if maybe True (const False) mName
-                then tellErr "fatal: No remote configured."
-                else tellErr $ "fatal: '" ++ fromMaybe "" mName ++ "' does not appear to be a git remote."
-            lift $ tellErr "hint: Set remote with 'rgit remote add <name> <url>'"
-            lift $ exitWithE (ExitFailure 1)
+            liftIO $ if maybe True (const False) mName
+                then hPutStrLn stderr "fatal: No remote configured."
+                else hPutStrLn stderr $ "fatal: '" ++ fromMaybe "" mName ++ "' does not appear to be a git remote."
+            liftIO $ hPutStrLn stderr "hint: Set remote with 'rgit remote add <name> <url>'"
+            liftIO $ exitWith (ExitFailure 1)
         Just url -> do
             let remoteUrl = ensureRemoteRoot url
-            lift $ tell $ "Checking local against remote '" ++ remoteName ++ "' (" ++ url ++ ")..."
-            lift $ tell ""
-            lift $ tell "Using: rclone check --combined"
-            res <- lift $ liftIOE $ try @IOException (Transport.checkRemote cwd remoteUrl)  -- ESCAPE: rclone check + bracket
+            liftIO $ putStrLn $ "Checking local against remote '" ++ remoteName ++ "' (" ++ url ++ ")..."
+            liftIO $ putStrLn ""
+            liftIO $ putStrLn "Using: rclone check --combined"
+            res <- liftIO $ try @IOException (Transport.checkRemote cwd remoteUrl)
             case res of
                 Left _ -> do
-                    lift $ tellErr "fatal: rclone not found. Install rclone: https://rclone.org/install/"
-                    lift $ exitWithE (ExitFailure 1)
+                    liftIO $ hPutStrLn stderr "fatal: rclone not found. Install rclone: https://rclone.org/install/"
+                    liftIO $ exitWith (ExitFailure 1)
                 Right cr -> do
                     let reportPath = cwd </> rgitDir </> "last-check.txt"
-                    lift $ createDirE (cwd </> rgitDir)
-                    lift $ writeFileAtomicE reportPath (Transport.checkRawOutput cr)
+                    liftIO $ createDirectoryIfMissing True (cwd </> rgitDir)
+                    liftIO $ writeFile reportPath (Transport.checkRawOutput cr)
                     let matches = Transport.checkMatches cr
                         differs = Transport.checkDiffers cr
                         missingDest = Transport.checkMissingDest cr
@@ -570,141 +569,222 @@ remoteCheck mName = do
                         hasDiff = not (null differs && null missingDest && null missingSrc && null errs)
                     if not hasDiff && Transport.checkExitCode cr == ExitSuccess
                         then do
-                            lift $ tell $ show nMatch ++ " files match between local and remote."
-                            lift $ exitWithE ExitSuccess
+                            liftIO $ putStrLn $ show nMatch ++ " files match between local and remote."
+                            liftIO $ exitWith ExitSuccess
                         else if Transport.checkExitCode cr /= ExitSuccess && Transport.checkExitCode cr /= ExitFailure 1
                         then do
-                            lift $ tellErr "fatal: Could not read from remote."
-                            lift $ tellErr ""
-                            lift $ tellErr "Please make sure you have the correct access rights"
-                            lift $ tellErr "and the remote exists."
-                            unless (null (Transport.checkStderr cr)) $ lift $ tellErr (Transport.checkStderr cr)
-                            lift $ exitWithE (ExitFailure 1)
+                            liftIO $ hPutStrLn stderr "fatal: Could not read from remote."
+                            liftIO $ hPutStrLn stderr ""
+                            liftIO $ hPutStrLn stderr "Please make sure you have the correct access rights"
+                            liftIO $ hPutStrLn stderr "and the remote exists."
+                            unless (null (Transport.checkStderr cr)) $ liftIO $ hPutStrLn stderr (Transport.checkStderr cr)
+                            liftIO $ exitWith (ExitFailure 1)
                         else do
-                            lift $ tell ""
-                            when (not (null differs)) $ forM_ ("  content differs:" : formatPathList differs) $ \s -> lift $ tell s
-                            when (not (null missingDest)) $ forM_ ("  local only (not on remote):" : formatPathList missingDest) $ \s -> lift $ tell s
-                            when (not (null missingSrc)) $ forM_ ("  remote only (not in local):" : formatPathList missingSrc) $ \s -> lift $ tell s
-                            when (not (null errs)) $ forM_ ("  errors:" : formatPathList errs) $ \s -> lift $ tell s
+                            liftIO $ putStrLn ""
+                            when (not (null differs)) $ forM_ ("  content differs:" : formatPathList differs) $ \s -> liftIO $ putStrLn s
+                            when (not (null missingDest)) $ forM_ ("  local only (not on remote):" : formatPathList missingDest) $ \s -> liftIO $ putStrLn s
+                            when (not (null missingSrc)) $ forM_ ("  remote only (not in local):" : formatPathList missingSrc) $ \s -> liftIO $ putStrLn s
+                            when (not (null errs)) $ forM_ ("  errors:" : formatPathList errs) $ \s -> liftIO $ putStrLn s
                             let errWord = if length errs == 1 then "1 error" else show (length errs) ++ " errors"
-                            lift $ tell $ show (length differs + length missingDest + length missingSrc) ++ " differences, "
+                            liftIO $ putStrLn $ show (length differs + length missingDest + length missingSrc) ++ " differences, "
                                 ++ errWord ++ ". " ++ show nMatch ++ " files matched."
-                            lift $ tell ""
-                            lift $ tellErr "hint: Content differences may indicate an incomplete push or pull."
-                            lift $ tellErr "hint: Run 'rgit verify' and 'rgit verify --remote' to check metadata consistency."
-                            lift $ tellErr "hint: Full report saved to .rgit/last-check.txt"
-                            lift $ exitWithE (ExitFailure 1)
+                            liftIO $ putStrLn ""
+                            liftIO $ hPutStrLn stderr "hint: Content differences may indicate an incomplete push or pull."
+                            liftIO $ hPutStrLn stderr "hint: Run 'rgit verify' and 'rgit verify --remote' to check metadata consistency."
+                            liftIO $ hPutStrLn stderr "hint: Full report saved to .rgit/last-check.txt"
+                            liftIO $ exitWith (ExitFailure 1)
 
 mergeContinue :: RgitM ()
 mergeContinue = do
     cwd <- asks envCwd
     mUrl <- asks envRemoteUrl
     let conflictsDir = cwd </> ".rgit" </> "conflicts"
-    conflictsExist <- lift $ dirExistsE conflictsDir
+    conflictsExist <- liftIO $ Dir.doesDirectoryExist conflictsDir
 
-    gitConflicts <- lift Conflict.getConflictedFilesE
+    gitConflicts <- liftIO Conflict.getConflictedFilesE
 
     if not (null gitConflicts)
-        then lift $ tellErr "error: you have not resolved your conflicts yet."
+        then liftIO $ hPutStrLn stderr "error: you have not resolved your conflicts yet."
         else if not conflictsExist
             then do
-                (code, _, _) <- lift $ gitQuery ["rev-parse", "--verify", "MERGE_HEAD"]
+                (code, _, _) <- liftIO $ Git.runGitWithOutput ["rev-parse", "--verify", "MERGE_HEAD"]
                 if code == ExitSuccess
                     then do
-                        lift $ void $ gitRaw ["commit", "-m", "Merge remote"]
-                        lift $ tell "Merge complete."
+                        liftIO $ void $ Git.runGitRaw ["commit", "-m", "Merge remote"]
+                        liftIO $ putStrLn "Merge complete."
                         maybe (return ()) (\_ -> do
-                            lift $ tell "Syncing binaries... done."
+                            liftIO $ putStrLn "Syncing binaries... done."
                             syncRemoteFilesToLocal
-                            lift $ liftIOE $ updateMetadataAfterSync cwd
-                            lift $ void $ liftIOE Git.updateRemoteTrackingBranchToHead) mUrl
-                    else lift $ tellErr "error: no merge in progress."
+                            liftIO $ updateMetadataAfterSync cwd
+                            liftIO $ void Git.updateRemoteTrackingBranchToHead) mUrl
+                    else liftIO $ hPutStrLn stderr "error: no merge in progress."
             else do
-                invalid <- lift $ liftIOE $ Metadata.validateMetadataDir (cwd </> rgitIndexPath)
+                invalid <- liftIO $ Metadata.validateMetadataDir (cwd </> rgitIndexPath)
                 unless (null invalid) $ do
-                    lift $ tellErr "fatal: Metadata files contain conflict markers. Merge aborted."
-                    lift $ liftIOE $ throwIO (userError "Invalid metadata")
+                    liftIO $ hPutStrLn stderr "fatal: Metadata files contain conflict markers. Merge aborted."
+                    liftIO $ throwIO (userError "Invalid metadata")
 
-                (code, _, _) <- lift $ gitQuery ["rev-parse", "--verify", "MERGE_HEAD"]
+                (code, _, _) <- liftIO $ Git.runGitWithOutput ["rev-parse", "--verify", "MERGE_HEAD"]
                 when (code /= ExitSuccess) $ do
-                    (mergeCode, _, _) <- lift $ gitQuery ["merge", "--no-commit", "--no-ff", "refs/remotes/origin/main"]
+                    (mergeCode, _, _) <- liftIO $ Git.runGitWithOutput ["merge", "--no-commit", "--no-ff", "refs/remotes/origin/main"]
                     when (mergeCode /= ExitSuccess) $
-                        lift $ tellErr "warning: Could not start merge. Proceeding anyway."
+                        liftIO $ hPutStrLn stderr "warning: Could not start merge. Proceeding anyway."
 
-                lift $ void $ gitRaw ["commit", "-m", "Merge remote (manual merge resolved)"]
-                lift $ tell "Merge complete."
+                liftIO $ void $ Git.runGitRaw ["commit", "-m", "Merge remote (manual merge resolved)"]
+                liftIO $ putStrLn "Merge complete."
 
-                lift $ removeDirRecursiveE conflictsDir
-                lift $ tell "Conflict directories cleaned up."
+                liftIO $ removeDirectoryRecursive conflictsDir
+                liftIO $ putStrLn "Conflict directories cleaned up."
 
                 maybe (return ()) (\_ -> do
-                    lift $ tell "Syncing binaries... done."
+                    liftIO $ putStrLn "Syncing binaries... done."
                     syncRemoteFilesToLocal
-                    lift $ liftIOE $ updateMetadataAfterSync cwd
-                    lift $ void $ liftIOE Git.updateRemoteTrackingBranchToHead) mUrl
+                    liftIO $ updateMetadataAfterSync cwd
+                    liftIO $ void Git.updateRemoteTrackingBranchToHead) mUrl
 
 -- ============================================================================
 -- Internal helpers (not exported, moved from Commands.hs)
 -- ============================================================================
 
 -- Git helpers via effect layer
-getLocalHeadE :: Rgit (Maybe String)
+getLocalHeadE :: IO (Maybe String)
 getLocalHeadE = do
-    (code, out, _) <- gitQuery ["rev-parse", "HEAD"]
+    (code, out, _) <- Git.runGitWithOutput ["rev-parse", "HEAD"]
     return $ if code == ExitSuccess then Just (filter (not . isSpace) out) else Nothing
 
-getHashFromBundleE :: FilePath -> Rgit (Maybe String)
+getHashFromBundleE :: FilePath -> IO (Maybe String)
 getHashFromBundleE path = do
-    (code, out, _) <- gitQuery ["bundle", "list-heads", path]
+    (code, out, _) <- Git.runGitWithOutput ["bundle", "list-heads", path]
     return $ if code == ExitSuccess && not (null out) then listToMaybe (words out) else Nothing
 
-checkIsAheadE :: String -> String -> Rgit Bool
+checkIsAheadE :: String -> String -> IO Bool
 checkIsAheadE rHash lHash = do
-    (code, _, _) <- gitQuery ["merge-base", "--is-ancestor", rHash, lHash]
+    (code, _, _) <- Git.runGitWithOutput ["merge-base", "--is-ancestor", rHash, lHash]
     return (code == ExitSuccess)
 
-hasStagedChangesE :: Rgit Bool
+hasStagedChangesE :: IO Bool
 hasStagedChangesE = do
-    (code, _, _) <- gitQuery ["diff", "--cached", "--quiet"]
+    (code, _, _) <- Git.runGitWithOutput ["diff", "--cached", "--quiet"]
     return (code == ExitFailure 1)
 
 -- | True if the path is a text file in the index (content stored in metadata, not hash/size).
 -- Used during pull to avoid re-downloading from rclone when content is already in the bundle.
-isTextFileInIndex :: FilePath -> FilePath -> Rgit Bool
+isTextFileInIndex :: FilePath -> FilePath -> IO Bool
 isTextFileInIndex localRoot path = do
     let metaPath = localRoot </> rgitIndexPath </> path
-    exists <- fileExistsE metaPath
+    exists <- Dir.doesFileExist metaPath
     if not exists then return False
     else do
-        mcontent <- readFileE metaPath
+        mcontent <- readFileMaybe metaPath
         return $ case mcontent of
             Nothing -> False
             Just content -> not (any ("hash: " `isPrefixOf`) (lines content))
 
 -- | Copy a file from the index to the working tree. Call only when the path
 -- is a text file (content in index). Creates parent dirs as needed.
-copyFromIndexToWorkTree :: FilePath -> FilePath -> Rgit ()
+copyFromIndexToWorkTree :: FilePath -> FilePath -> IO ()
 copyFromIndexToWorkTree localRoot path = do
     let metaPath = localRoot </> rgitIndexPath </> path
         workPath = localRoot </> path
-    createDirE (takeDirectory workPath)
-    copyFileE metaPath workPath
+    createDirectoryIfMissing True (takeDirectory workPath)
+    copyFile metaPath workPath
+
+-- | Helper to read a file safely (returns Nothing on error)
+readFileMaybe :: FilePath -> IO (Maybe String)
+readFileMaybe path = do
+    exists <- Dir.doesFileExist path
+    if exists
+        then Just <$> readFile path
+        else return Nothing
+
+-- ============================================================================
+-- Compatibility helpers (effect system removal, Step 2)
+-- ============================================================================
+
+-- These are dumb IO wrappers to keep the refactor mechanical. They replace the
+-- former Free-monad effect constructors.
+
+tell :: String -> IO ()
+tell = putStrLn
+
+tellErr :: String -> IO ()
+tellErr = hPutStrLn stderr
+
+askUser :: String -> IO String
+askUser prompt = do
+    putStr prompt
+    hFlush stdout
+    getLine
+
+gitRaw :: [String] -> IO ExitCode
+gitRaw = Git.runGitRaw
+
+gitQuery :: [String] -> IO (ExitCode, String, String)
+gitQuery = Git.runGitWithOutput
+
+rcloneExec :: String -> [String] -> IO ExitCode
+rcloneExec = rcloneExecIO
+
+readFileE :: FilePath -> IO (Maybe String)
+readFileE = readFileMaybe
+
+writeFileAtomicE :: FilePath -> String -> IO ()
+writeFileAtomicE = writeFile
+
+copyFileE :: FilePath -> FilePath -> IO ()
+copyFileE = copyFile
+
+fileExistsE :: FilePath -> IO Bool
+fileExistsE = Dir.doesFileExist
+
+dirExistsE :: FilePath -> IO Bool
+dirExistsE = Dir.doesDirectoryExist
+
+createDirE :: FilePath -> IO ()
+createDirE = createDirectoryIfMissing True
+
+removeFileE :: FilePath -> IO ()
+removeFileE = Dir.removeFile
+
+removeDirRecursiveE :: FilePath -> IO ()
+removeDirRecursiveE = Dir.removeDirectoryRecursive
+
+getCurrentDirE :: IO FilePath
+getCurrentDirE = Dir.getCurrentDirectory
+
+exitWithE :: ExitCode -> IO ()
+exitWithE = exitWith
+
+-- Previously an "escape hatch" from the effect system. Now it's just identity.
+liftIOE :: IO a -> IO a
+liftIOE = id
+
+safeRemoveE :: FilePath -> IO ()
+safeRemoveE = safeRemove
 
 -- | Run an action with the remote URL, or print error if not configured.
 withRemoteUrl :: (String -> RgitM ()) -> RgitM ()
 withRemoteUrl action = do
   mUrl <- asks envRemoteUrl
-  maybe (lift $ tellErr "Error: No remote URL configured.") action mUrl
+  maybe (liftIO $ hPutStrLn stderr "Error: No remote URL configured.") action mUrl
+
+-- TEMPORARY: will be replaced by Transport calls in Step 3
+rcloneExecIO :: String -> [String] -> IO ExitCode
+rcloneExecIO cmd args = do
+    (code, out, err) <- System.Process.readProcessWithExitCode "rclone" (cmd : args) ""
+    putStr out
+    hPutStrLn stderr err
+    return code
 
 -- | Executes/Prints the command to be run in the shell (push: local -> remote).
 -- remoteRoot is the configured remote URL with trailing slash (e.g. from .rgit/target).
-executeCommand :: FilePath -> String -> RcloneAction -> Rgit ()
+executeCommand :: FilePath -> String -> RcloneAction -> IO ()
 executeCommand localRoot remoteRoot action = case action of
         Copy src dest ->
             let localPath = toPosix (localRoot </> src)
                 remotePath = remoteRoot ++ toPosix dest
             in do
-                tell $ "[DEBUG] executeCommand Copy: src=" ++ src ++ " dest=" ++ dest
+                putStrLn $ "[DEBUG] executeCommand Copy: src=" ++ src ++ " dest=" ++ dest
                 run "copyto" [localPath, remotePath]
 
         Move src dest ->
@@ -716,27 +796,27 @@ executeCommand localRoot remoteRoot action = case action of
         Swap _ _ _ -> return ()  -- not produced by planAction; future-proofing
   where
     run cmd args = do
-        tell $ "Executing: rclone " ++ cmd ++ " " ++ unwords args
-        void $ rcloneExec cmd args
+        putStrLn $ "Executing: rclone " ++ cmd ++ " " ++ unwords args
+        void $ rcloneExecIO cmd args
 
 -- | Execute a single pull action: copy from remote to local or delete local file.
 -- Text files are already in the git bundle (index); copy from index to work dir instead of rclone.
-executePullCommand :: FilePath -> String -> RcloneAction -> Rgit ()
+executePullCommand :: FilePath -> String -> RcloneAction -> IO ()
 executePullCommand localRoot remoteRoot action = case action of
         Copy src dest -> do
-            tell $ "[DEBUG] executePullCommand Copy: src=" ++ src ++ " dest=" ++ dest
+            putStrLn $ "[DEBUG] executePullCommand Copy: src=" ++ src ++ " dest=" ++ dest
             fromIndex <- isTextFileInIndex localRoot dest
-            tell $ "[DEBUG] isTextFileInIndex returned: " ++ show fromIndex
+            putStrLn $ "[DEBUG] isTextFileInIndex returned: " ++ show fromIndex
             if fromIndex
             then do
-                tell $ "[DEBUG] Taking optimization path: copyFromIndexToWorkTree"
+                putStrLn $ "[DEBUG] Taking optimization path: copyFromIndexToWorkTree"
                 copyFromIndexToWorkTree localRoot dest
             else do
                 let remotePath = remoteRoot ++ toPosix dest
                     localPath = toPosix (localRoot </> dest)
-                createDirE (takeDirectory (localRoot </> dest))
-                tell $ "Executing: rclone copyto " ++ remotePath ++ " " ++ localPath
-                void $ rcloneExec "copyto" [remotePath, localPath]
+                createDirectoryIfMissing True (takeDirectory (localRoot </> dest))
+                putStrLn $ "Executing: rclone copyto " ++ remotePath ++ " " ++ localPath
+                void $ rcloneExecIO "copyto" [remotePath, localPath]
         Move src dest -> do
             fromIndex <- isTextFileInIndex localRoot src
             if fromIndex
@@ -744,16 +824,16 @@ executePullCommand localRoot remoteRoot action = case action of
             else do
                 let remoteSrcPath = remoteRoot ++ toPosix src
                     localSrcPath = localRoot </> src
-                createDirE (takeDirectory localSrcPath)
-                tell $ "Executing: rclone copyto " ++ remoteSrcPath ++ " " ++ toPosix localSrcPath
-                void $ rcloneExec "copyto" [remoteSrcPath, toPosix localSrcPath]
+                createDirectoryIfMissing True (takeDirectory localSrcPath)
+                putStrLn $ "Executing: rclone copyto " ++ remoteSrcPath ++ " " ++ toPosix localSrcPath
+                void $ rcloneExecIO "copyto" [remoteSrcPath, toPosix localSrcPath]
             let localDestPath = localRoot </> dest
-            exists <- fileExistsE localDestPath
-            when exists $ removeFileE localDestPath
+            exists <- Dir.doesFileExist localDestPath
+            when exists $ Dir.removeFile localDestPath
         Delete path -> do
             let localPath = localRoot </> path
-            exists <- fileExistsE localPath
-            when exists $ removeFileE localPath
+            exists <- Dir.doesFileExist localPath
+            when exists $ Dir.removeFile localPath
         Swap _ _ _ -> return ()
 
 -- Helper to ensure we don't crash if cleanup fails (IO version for use outside RgitM)
@@ -762,11 +842,6 @@ safeRemove path = do
     exists <- Dir.doesFileExist path
     when exists (Dir.removeFile path)
 
--- Effect-layer version for use inside RgitM
-safeRemoveE :: FilePath -> Rgit ()
-safeRemoveE path = do
-    exists <- fileExistsE path
-    when exists $ removeFileE path
 
 -- | Show up to 10 paths; if more than 20, show first 10 then "... and N more".
 formatPathList :: [FilePath] -> [String]
@@ -830,31 +905,31 @@ cleanupTemp path = do
 pushToRemote :: String -> RgitM ()
 pushToRemote url = do
   syncRemoteFiles
-  lift $ liftIOE $ pushBundle url  -- ESCAPE: complex rclone bundle + bracket
+  liftIO $ pushBundle url
   updateLocalBundleAfterPush
 
 -- | After a successful push, update the local fetched_remote.bundle to current HEAD
 -- so rgit status shows up to date instead of "ahead of remote".
 updateLocalBundleAfterPush :: RgitM ()
 updateLocalBundleAfterPush = do
-    code <- lift $ liftIOE $ Git.createBundle fetchedBundleName
+    code <- liftIO $ Git.createBundle fetchedBundleName
     when (code == ExitSuccess) $ do
-        void $ lift $ liftIOE $ Git.updateRemoteTrackingBranch fetchedBundleName
+        void $ liftIO $ Git.updateRemoteTrackingBranch fetchedBundleName
 
 syncRemoteFiles :: RgitM ()
 syncRemoteFiles = withRemoteUrl $ \url -> do
     cwd <- asks envCwd
     localFiles <- asks envLocalFiles
-    remoteResult <- lift $ liftIOE $ Remote.Scan.fetchRemoteFiles url  -- ESCAPE: rclone JSON parsing
+    remoteResult <- liftIO $ Remote.Scan.fetchRemoteFiles url
     either
-        (\_ -> lift $ tellErr "Error: Failed to fetch remote file list.")
+        (\_ -> liftIO $ hPutStrLn stderr "Error: Failed to fetch remote file list.")
         (\remoteFiles -> do
             let actions = Pipeline.pushSyncFiles localFiles remoteFiles
                 remoteRoot = ensureRemoteRoot url
-            lift $ tell "--- Pushing Changes to Remote ---"
+            liftIO $ putStrLn "--- Pushing Changes to Remote ---"
             if null actions
-                then lift $ tell "Remote is already up to date."
-                else mapM_ (\a -> lift $ executeCommand cwd remoteRoot a) actions)
+                then liftIO $ putStrLn "Remote is already up to date."
+                else mapM_ (\a -> liftIO $ executeCommand cwd remoteRoot a) actions)
         remoteResult
 
 
@@ -1221,7 +1296,7 @@ pullWithCleanup :: String -> RgitM ()
 pullWithCleanup url = do
     env <- asks id
     -- ESCAPE: exception handling with try requires real IO for exception safety
-    result <- lift $ liftIOE $ try @SomeException (runIO (runRgitM env (pullLogic url)))
+    result <- liftIO $ try @SomeException (runRgitM env (pullLogic url))
     case result of
         Left ex -> do
             inProgress <- lift $ liftIOE Git.isMergeInProgress
@@ -2284,7 +2359,6 @@ module Rgit.Commands (run) where
 
 import qualified Bit
 import Rgit.Types (RgitEnv(..), runRgitM)
-import Rgit.Effect.IO (runIO)
 import qualified Rgit.Scan as Scan  -- Only for the pre-scan in runCommand
 import System.Environment (getArgs)
 import System.Exit (ExitCode(..), exitWith)
@@ -2324,25 +2398,25 @@ runCommand args = do
     case cmd of
         ["init"]                        -> Bit.init
         ["remote", "add", name, url]    -> Bit.remoteAdd name url
-        ["remote", "show"]              -> runIO $ runRgitM env $ Bit.remoteShow Nothing
-        ["remote", "show", name]        -> runIO $ runRgitM env $ Bit.remoteShow (Just name)
-        ["remote", "check"]             -> runIO $ runRgitM env $ Bit.remoteCheck Nothing
-        ["remote", "check", name]       -> runIO $ runRgitM env $ Bit.remoteCheck (Just name)
-        ["verify"]                      -> runIO $ runRgitM env $ Bit.verify False
-        ["verify", "--remote"]          -> runIO $ runRgitM env $ Bit.verify True
+        ["remote", "show"]              -> runRgitM env $ Bit.remoteShow Nothing
+        ["remote", "show", name]        -> runRgitM env $ Bit.remoteShow (Just name)
+        ["remote", "check"]             -> runRgitM env $ Bit.remoteCheck Nothing
+        ["remote", "check", name]       -> runRgitM env $ Bit.remoteCheck (Just name)
+        ["verify"]                      -> runRgitM env $ Bit.verify False
+        ["verify", "--remote"]          -> runRgitM env $ Bit.verify True
         ["fsck"]                        -> Bit.fsck cwd
-        ("add":rest)                    -> void $ runIO $ Bit.add rest
-        ("commit":rest)                 -> void $ runIO $ Bit.commit rest
-        ("diff":rest)                   -> void $ runIO $ Bit.diff rest
-        ("restore":rest)                -> runIO $ runRgitM env $ Bit.restore rest
-        ("checkout":rest)               -> runIO $ runRgitM env $ Bit.checkout rest
-        ("status":rest)                 -> runIO $ runRgitM env $ Bit.status rest
-        ["fetch"]                       -> runIO $ runRgitM env Bit.fetch
-        ["pull"]                        -> runIO $ runRgitM env $ Bit.pull Bit.defaultPullOptions
-        ["pull", "--accept-remote"]     -> runIO $ runRgitM env $ Bit.pull Bit.defaultPullOptions { Bit.pullAcceptRemote = True }
-        ["pull", "--manual-merge"]      -> runIO $ runRgitM env $ Bit.pull Bit.defaultPullOptions { Bit.pullManualMerge = True }
-        ["push"]                        -> runIO $ runRgitM env Bit.push
-        ["merge", "--continue"]         -> runIO $ runRgitM env Bit.mergeContinue
+        ("add":rest)                    -> void $ Bit.add rest
+        ("commit":rest)                 -> void $ Bit.commit rest
+        ("diff":rest)                   -> void $ Bit.diff rest
+        ("restore":rest)                -> runRgitM env $ Bit.restore rest
+        ("checkout":rest)               -> runRgitM env $ Bit.checkout rest
+        ("status":rest)                 -> runRgitM env $ Bit.status rest
+        ["fetch"]                       -> runRgitM env Bit.fetch
+        ["pull"]                        -> runRgitM env $ Bit.pull Bit.defaultPullOptions
+        ["pull", "--accept-remote"]     -> runRgitM env $ Bit.pull Bit.defaultPullOptions { Bit.pullAcceptRemote = True }
+        ["pull", "--manual-merge"]      -> runRgitM env $ Bit.pull Bit.defaultPullOptions { Bit.pullManualMerge = True }
+        ["push"]                        -> runRgitM env Bit.push
+        ["merge", "--continue"]         -> runRgitM env Bit.mergeContinue
         ["merge", "--abort"]            -> Bit.mergeAbort
         ["branch", "--unset-upstream"]  -> Bit.unsetUpstream
         _                               -> hPutStrLn stderr "Unknown command."
@@ -2373,7 +2447,8 @@ import Data.List (isPrefixOf)
 import Data.Maybe (mapMaybe)
 import Control.Monad (void, when)
 import System.Exit (ExitCode(..))
-import Rgit.Effect (Rgit, tell, tellErr, askUser, gitRaw, gitQuery)
+import qualified Internal.Git as Git
+import System.IO (hPutStrLn, stderr, hFlush, stdout)
 import Rgit.Internal.Metadata (MetaContent(..), parseMetadata, displayHash)
 
 -- | A conflict resolution choice: keep local or take remote.
@@ -2387,16 +2462,16 @@ data ConflictInfo
   | AddAdd FilePath            -- both added different
   deriving (Show, Eq)
 
--- | Get list of conflicted files via the free monad (no liftIOE).
-getConflictedFilesE :: Rgit [FilePath]
+-- | Get list of conflicted files
+getConflictedFilesE :: IO [FilePath]
 getConflictedFilesE = do
-  (code, out, _) <- gitQuery ["diff", "--name-only", "--diff-filter=U"]
+  (code, out, _) <- Git.runGitWithOutput ["diff", "--name-only", "--diff-filter=U"]
   return $ if code /= ExitSuccess then [] else filter (not . null) (lines out)
 
--- | Detect conflict type via free monad.
-getConflictInfoE :: FilePath -> Rgit ConflictInfo
+-- | Detect conflict type
+getConflictInfoE :: FilePath -> IO ConflictInfo
 getConflictInfoE path = do
-  (_, out, _) <- gitQuery ["ls-files", "-u", "--", path]
+  (_, out, _) <- Git.runGitWithOutput ["ls-files", "-u", "--", path]
   return (parseConflictInfo path out)
 
 -- | Pure parsing of `git ls-files -u` output into ConflictInfo.
@@ -2416,15 +2491,15 @@ parseConflictInfo path out =
      else ContentConflict path
 
 -- | Print a conflict type announcement (git-style message).
-announceConflict :: ConflictInfo -> Rgit ()
+announceConflict :: ConflictInfo -> IO ()
 announceConflict (ContentConflict path) =
-  tell $ "CONFLICT (content): Merge conflict in " ++ path
+  putStrLn $ "CONFLICT (content): Merge conflict in " ++ path
 announceConflict (ModifyDelete path True) =
-  tell $ "CONFLICT (modify/delete): " ++ path ++ " deleted in HEAD and modified in origin/main"
+  putStrLn $ "CONFLICT (modify/delete): " ++ path ++ " deleted in HEAD and modified in origin/main"
 announceConflict (ModifyDelete path False) =
-  tell $ "CONFLICT (modify/delete): " ++ path ++ " deleted in origin/main and modified in HEAD"
+  putStrLn $ "CONFLICT (modify/delete): " ++ path ++ " deleted in origin/main and modified in HEAD"
 announceConflict (AddAdd path) =
-  tell $ "CONFLICT (add/add): Merge conflict in " ++ path
+  putStrLn $ "CONFLICT (add/add): Merge conflict in " ++ path
 
 -- | Format side info (hash + size) from metadata content retrieved via `git show :N:path`.
 formatSideInfo :: ExitCode -> String -> (String, String)
@@ -2434,8 +2509,7 @@ formatSideInfo code content = case parseMetadata content of
           | otherwise -> ("(text file)", "-")
 
 -- | Resolve a single conflict: announce type, display info, ask user, apply choice.
--- Operates in the Rgit free monad Γאפ fully testable with the pure interpreter.
-resolveConflict :: Int -> Int -> FilePath -> Rgit Resolution
+resolveConflict :: Int -> Int -> FilePath -> IO Resolution
 resolveConflict idx total path = do
   -- 1. Detect and announce conflict type
   cinfo <- getConflictInfoE path
@@ -2443,18 +2517,20 @@ resolveConflict idx total path = do
 
   -- 2. Display path with progress counter
   let displayPath = if "index/" `isPrefixOf` path then drop 6 path else path
-  tell $ "Conflict [" ++ show idx ++ "/" ++ show total ++ "]: " ++ displayPath
+  putStrLn $ "Conflict [" ++ show idx ++ "/" ++ show total ++ "]: " ++ displayPath
 
   -- 3. Show local (ours, stage 2) and remote (theirs, stage 3) metadata
-  (codeO, oursOut, _)   <- gitQuery ["show", ":2:" ++ path]
-  (codeR, theirsOut, _) <- gitQuery ["show", ":3:" ++ path]
+  (codeO, oursOut, _)   <- Git.runGitWithOutput ["show", ":2:" ++ path]
+  (codeR, theirsOut, _) <- Git.runGitWithOutput ["show", ":3:" ++ path]
   let (hashO, sizeO) = formatSideInfo codeO oursOut
   let (hashR, sizeR) = formatSideInfo codeR theirsOut
-  tell $ "  Local:  " ++ hashO ++ " (" ++ sizeO ++ " bytes)"
-  tell $ "  Remote: " ++ hashR ++ " (" ++ sizeR ++ " bytes)"
+  putStrLn $ "  Local:  " ++ hashO ++ " (" ++ sizeO ++ " bytes)"
+  putStrLn $ "  Remote: " ++ hashR ++ " (" ++ sizeR ++ " bytes)"
 
   -- 4. Ask user for choice
-  choice <- askUser "  Use (l)ocal or (r)emote version? "
+  putStr "  Use (l)ocal or (r)emote version? "
+  hFlush stdout
+  choice <- getLine
   let res = if normalize choice `elem` ["r", "remote"] then TakeRemote else KeepLocal
 
   -- 5. Apply resolution
@@ -2462,14 +2538,14 @@ resolveConflict idx total path = do
   pure res
 
 -- | Apply a resolution to one file: git checkout ours/theirs + git add.
-applyResolution :: FilePath -> Resolution -> Rgit ()
+applyResolution :: FilePath -> Resolution -> IO ()
 applyResolution path res = do
   let checkoutFlag = case res of
         KeepLocal  -> "--ours"
         TakeRemote -> "--theirs"
-  code <- gitRaw ["checkout", checkoutFlag, "--", path]
-  when (code /= ExitSuccess) $ tellErr "Warning: checkout failed."
-  void $ gitRaw ["add", path]
+  code <- Git.runGitRaw ["checkout", checkoutFlag, "--", path]
+  when (code /= ExitSuccess) $ hPutStrLn stderr "Warning: checkout failed."
+  void $ Git.runGitRaw ["add", path]
 
 -- | Normalize user input: trim whitespace, lowercase.
 normalize :: String -> String
@@ -2480,9 +2556,9 @@ normalize = map toLower . trim
 -- | Resolve all conflicts as a structured traversal.
 -- Each conflict is visited exactly once, in order, with correct numbering.
 -- Returns the list of resolutions applied.
-resolveAll :: [FilePath] -> Rgit [Resolution]
+resolveAll :: [FilePath] -> IO [Resolution]
 resolveAll conflicts = do
-  when (null conflicts) $ tell "No unmerged paths."
+  when (null conflicts) $ putStrLn "No unmerged paths."
   let total = length conflicts
   mapM (\(i, p) -> resolveConflict i total p) (zip [1..] conflicts)
 ```
@@ -3215,430 +3291,6 @@ formatDiff (Added f)      = "[+] Added:    " ++ f.filePath
 formatDiff (Deleted f)    = "[-] Deleted:  " ++ f.filePath
 formatDiff (Modified f)   = "[*] Modified: " ++ f.filePath
 formatDiff (Renamed o n)  = "[M] Moved:    " ++ o.filePath ++ " -> " ++ n.filePath
-```
-
----
-
-## Rgit/Effect.hs
-
-**Path:** `Rgit/Effect.hs`
-
-*Source file.*
-
-```haskell
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE DataKinds #-}
-
-module Rgit.Effect
-  ( -- * The effect type
-    RgitF(..)
-  , Rgit
-    -- * Git smart constructors
-  , gitRaw
-  , gitQuery
-    -- * Rclone smart constructors
-  , rcloneExec
-  , rcloneQuery
-    -- * Process smart constructors
-  , runProcess
-    -- * Filesystem smart constructors
-  , readFileE
-  , writeFileAtomicE
-  , copyFileE
-  , fileExistsE
-  , dirExistsE
-  , listDirE
-  , createDirE
-  , removeFileE
-  , removeDirRecursiveE
-  , getFileSizeE
-  , readFileBytesE
-    -- * User interaction smart constructors
-  , tell
-  , tellErr
-  , askUser
-    -- * System smart constructors
-  , getCurrentDirE
-  , exitWithE
-  , liftIOE
-  ) where
-
-import Control.Monad.Free (Free, liftF)
-import System.Exit (ExitCode)
-import qualified Data.ByteString as BS
-
--- | The functor describing all effects rgit can perform.
--- Each constructor is one "instruction" the business logic can emit.
--- The final field in each constructor is the continuation (what to do with the result).
-data RgitF next where
-  -- Git operations (delegate to Internal.Git at interpretation time)
-  GitRaw      :: [String] -> (ExitCode -> next) -> RgitF next
-  GitQuery    :: [String] -> ((ExitCode, String, String) -> next) -> RgitF next
-
-  -- Rclone operations
-  RcloneExec  :: String -> [String] -> (ExitCode -> next) -> RgitF next
-  RcloneQuery :: [String] -> ((ExitCode, String, String) -> next) -> RgitF next
-
-  -- General process execution (for cases that don't fit git/rclone)
-  RunProcess  :: String -> [String] -> String -> ((ExitCode, String, String) -> next) -> RgitF next
-
-  -- Filesystem
-  ReadFileE         :: FilePath -> (Maybe String -> next) -> RgitF next
-  WriteFileAtomicE  :: FilePath -> String -> next -> RgitF next
-  CopyFileE         :: FilePath -> FilePath -> next -> RgitF next
-  FileExistsE       :: FilePath -> (Bool -> next) -> RgitF next
-  DirExistsE        :: FilePath -> (Bool -> next) -> RgitF next
-  ListDirE          :: FilePath -> ([FilePath] -> next) -> RgitF next
-  CreateDirE        :: FilePath -> next -> RgitF next
-  RemoveFileE       :: FilePath -> next -> RgitF next
-  RemoveDirRecursiveE :: FilePath -> next -> RgitF next
-  GetFileSizeE      :: FilePath -> (Integer -> next) -> RgitF next
-  ReadFileBytesE    :: FilePath -> (BS.ByteString -> next) -> RgitF next
-
-  -- User interaction
-  Tell        :: String -> next -> RgitF next
-  TellErr     :: String -> next -> RgitF next
-  AskUser     :: String -> (String -> next) -> RgitF next
-
-  -- System
-  GetCurrentDirE :: (FilePath -> next) -> RgitF next
-  ExitWithE      :: ExitCode -> next -> RgitF next
-
-  -- Escape hatch for genuinely un-abstractable IO (use sparingly!)
-  LiftIOE     :: IO a -> (a -> next) -> RgitF next
-
-instance Functor RgitF where
-  fmap f (GitRaw args k) = GitRaw args (f . k)
-  fmap f (GitQuery args k) = GitQuery args (f . k)
-  fmap f (RcloneExec cmd args k) = RcloneExec cmd args (f . k)
-  fmap f (RcloneQuery args k) = RcloneQuery args (f . k)
-  fmap f (RunProcess exe args stdin k) = RunProcess exe args stdin (f . k)
-  fmap f (ReadFileE path k) = ReadFileE path (f . k)
-  fmap f (WriteFileAtomicE path content next) = WriteFileAtomicE path content (f next)
-  fmap f (CopyFileE src dest next) = CopyFileE src dest (f next)
-  fmap f (FileExistsE path k) = FileExistsE path (f . k)
-  fmap f (DirExistsE path k) = DirExistsE path (f . k)
-  fmap f (ListDirE path k) = ListDirE path (f . k)
-  fmap f (CreateDirE path next) = CreateDirE path (f next)
-  fmap f (RemoveFileE path next) = RemoveFileE path (f next)
-  fmap f (RemoveDirRecursiveE path next) = RemoveDirRecursiveE path (f next)
-  fmap f (GetFileSizeE path k) = GetFileSizeE path (f . k)
-  fmap f (ReadFileBytesE path k) = ReadFileBytesE path (f . k)
-  fmap f (Tell msg next) = Tell msg (f next)
-  fmap f (TellErr msg next) = TellErr msg (f next)
-  fmap f (AskUser prompt k) = AskUser prompt (f . k)
-  fmap f (GetCurrentDirE k) = GetCurrentDirE (f . k)
-  fmap f (ExitWithE code next) = ExitWithE code (f next)
-  fmap f (LiftIOE action k) = LiftIOE action (f . k)
-
--- | The free monad over RgitF. This is the "pure description of effects" type.
-type Rgit = Free RgitF
-
--- Smart constructors: each wraps one constructor via liftF.
-
-gitRaw :: [String] -> Rgit ExitCode
-gitRaw args = liftF (GitRaw args id)
-
-gitQuery :: [String] -> Rgit (ExitCode, String, String)
-gitQuery args = liftF (GitQuery args id)
-
-rcloneExec :: String -> [String] -> Rgit ExitCode
-rcloneExec cmd args = liftF (RcloneExec cmd args id)
-
-rcloneQuery :: [String] -> Rgit (ExitCode, String, String)
-rcloneQuery args = liftF (RcloneQuery args id)
-
-runProcess :: String -> [String] -> String -> Rgit (ExitCode, String, String)
-runProcess exe args stdin = liftF (RunProcess exe args stdin id)
-
-readFileE :: FilePath -> Rgit (Maybe String)
-readFileE path = liftF (ReadFileE path id)
-
-writeFileAtomicE :: FilePath -> String -> Rgit ()
-writeFileAtomicE path content = liftF (WriteFileAtomicE path content ())
-
-copyFileE :: FilePath -> FilePath -> Rgit ()
-copyFileE src dest = liftF (CopyFileE src dest ())
-
-fileExistsE :: FilePath -> Rgit Bool
-fileExistsE path = liftF (FileExistsE path id)
-
-dirExistsE :: FilePath -> Rgit Bool
-dirExistsE path = liftF (DirExistsE path id)
-
-listDirE :: FilePath -> Rgit [FilePath]
-listDirE path = liftF (ListDirE path id)
-
-createDirE :: FilePath -> Rgit ()
-createDirE path = liftF (CreateDirE path ())
-
-removeFileE :: FilePath -> Rgit ()
-removeFileE path = liftF (RemoveFileE path ())
-
-removeDirRecursiveE :: FilePath -> Rgit ()
-removeDirRecursiveE path = liftF (RemoveDirRecursiveE path ())
-
-getFileSizeE :: FilePath -> Rgit Integer
-getFileSizeE path = liftF (GetFileSizeE path id)
-
-readFileBytesE :: FilePath -> Rgit BS.ByteString
-readFileBytesE path = liftF (ReadFileBytesE path id)
-
-tell :: String -> Rgit ()
-tell msg = liftF (Tell msg ())
-
-tellErr :: String -> Rgit ()
-tellErr msg = liftF (TellErr msg ())
-
-askUser :: String -> Rgit String
-askUser prompt = liftF (AskUser prompt id)
-
-getCurrentDirE :: Rgit FilePath
-getCurrentDirE = liftF (GetCurrentDirE id)
-
-exitWithE :: ExitCode -> Rgit ()
-exitWithE code = liftF (ExitWithE code ())
-
--- | Escape hatch. Use ONLY for operations that truly cannot be decomposed
--- into the above constructors (e.g., complex bracket patterns, exception handling
--- that must happen atomically). Every use should have a comment explaining why.
-liftIOE :: IO a -> Rgit a
-liftIOE action = liftF (LiftIOE action id)
-```
-
----
-
-## Rgit/Effect/DryRun.hs
-
-**Path:** `Rgit/Effect/DryRun.hs`
-
-*Source file.*
-
-```haskell
-{-# LANGUAGE GADTs #-}
-
-module Rgit.Effect.DryRun (runDryRun) where
-
-import Control.Monad.Free (foldFree)
-import qualified Data.ByteString as BS
-import Rgit.Effect
-import System.Directory (doesFileExist, doesDirectoryExist, listDirectory,
-                         createDirectoryIfMissing, getFileSize, getCurrentDirectory)
-import System.Exit (ExitCode(..))
-import System.IO (hFlush, stdout, stderr, hPutStrLn)
-
--- | Dry-run interpreter: reads are real, writes/execs are logged but not performed.
-runDryRun :: Rgit a -> IO a
-runDryRun = foldFree interpret
-  where
-    interpret :: RgitF a -> IO a
-
-    -- Git/Rclone: print what would happen, return success
-    interpret (GitRaw args k) = do
-      putStrLn $ "[DRY RUN] git " ++ unwords args
-      pure (k ExitSuccess)
-    interpret (GitQuery args k) = do
-      putStrLn $ "[DRY RUN] git " ++ unwords args
-      pure (k (ExitSuccess, "", ""))
-    interpret (RcloneExec cmd args k) = do
-      putStrLn $ "[DRY RUN] rclone " ++ cmd ++ " " ++ unwords args
-      pure (k ExitSuccess)
-    interpret (RcloneQuery args k) = do
-      putStrLn $ "[DRY RUN] rclone " ++ unwords args
-      pure (k (ExitSuccess, "", ""))
-    interpret (RunProcess exe args _ k) = do
-      putStrLn $ "[DRY RUN] " ++ exe ++ " " ++ unwords args
-      pure (k (ExitSuccess, "", ""))
-
-    -- Filesystem reads: perform normally
-    interpret (ReadFileE path k) = do
-      exists <- doesFileExist path
-      if exists then k . Just <$> readFile path else pure (k Nothing)
-    interpret (FileExistsE path k) = k <$> doesFileExist path
-    interpret (DirExistsE path k) = k <$> doesDirectoryExist path
-    interpret (ListDirE path k) = k <$> listDirectory path
-    interpret (GetFileSizeE path k) = k . fromIntegral <$> getFileSize path
-    interpret (ReadFileBytesE path k) = k <$> BS.readFile path
-
-    -- Filesystem writes: log but don't perform
-    interpret (WriteFileAtomicE path _ next) = do
-      putStrLn $ "[DRY RUN] write " ++ path
-      pure next
-    interpret (CopyFileE src dest next) = do
-      putStrLn $ "[DRY RUN] copy " ++ src ++ " -> " ++ dest
-      pure next
-    interpret (RemoveFileE path next) = do
-      putStrLn $ "[DRY RUN] remove " ++ path
-      pure next
-    interpret (RemoveDirRecursiveE path next) = do
-      putStrLn $ "[DRY RUN] rmdir " ++ path
-      pure next
-    interpret (CreateDirE path next) = do
-      putStrLn $ "[DRY RUN] mkdir " ++ path
-      pure next
-
-    -- User interaction: real
-    interpret (Tell msg next) = putStrLn msg >> pure next
-    interpret (TellErr msg next) = hPutStrLn stderr msg >> pure next
-    interpret (AskUser prompt k) = putStr prompt >> hFlush stdout >> k <$> getLine
-
-    -- System
-    interpret (GetCurrentDirE k) = k <$> getCurrentDirectory
-    interpret (ExitWithE code next) = putStrLn ("[DRY RUN] exit " ++ show code) >> pure next
-
-    -- Escape hatch: run it (but warn)
-    interpret (LiftIOE action k) = do
-      putStrLn "[DRY RUN WARNING] liftIOE executed (non-interceptable IO)"
-      k <$> action
-```
-
----
-
-## Rgit/Effect/IO.hs
-
-**Path:** `Rgit/Effect/IO.hs`
-
-*Source file.*
-
-```haskell
-{-# LANGUAGE GADTs #-}
-
-module Rgit.Effect.IO
-  ( runIO
-  ) where
-
-import Control.Monad.Free (Free(..))
-import qualified Data.ByteString as BS
-import qualified System.Directory as Dir
-import System.FilePath (takeDirectory)
-import System.Exit (ExitCode(..), exitWith)
-import System.IO (hFlush, stdout, stderr, hPutStrLn)
-import System.Process (readProcessWithExitCode)
-import Internal.Config (rgitIndexPath)
-import Rgit.Effect
-
--- | Interpret the Rgit free monad in IO.
-runIO :: Rgit a -> IO a
-runIO (Pure a) = return a
-runIO (Free f) = case f of
-  GitRaw args k -> do
-    code <- runGitRaw args
-    runIO (k code)
-
-  GitQuery args k -> do
-    result <- runGitWithOutput args
-    runIO (k result)
-
-  RcloneExec cmd cmdArgs k -> do
-    (code, out, err) <- readProcessWithExitCode "rclone" (cmd : cmdArgs) ""
-    putStr out
-    hPutStrLn stderr err
-    runIO (k code)
-
-  RcloneQuery cmdArgs k -> do
-    result <- readProcessWithExitCode "rclone" cmdArgs ""
-    runIO (k result)
-
-  RunProcess exe args stdinContent k -> do
-    result <- readProcessWithExitCode exe args stdinContent
-    runIO (k result)
-
-  ReadFileE path k -> do
-    exists <- Dir.doesFileExist path
-    if exists
-      then do
-        content <- readFile path
-        runIO (k (Just content))
-      else runIO (k Nothing)
-
-  WriteFileAtomicE path content next -> do
-    Dir.createDirectoryIfMissing True (takeDirectory path)
-    writeFile path content
-    runIO next
-
-  CopyFileE src dest next -> do
-    Dir.createDirectoryIfMissing True (takeDirectory dest)
-    Dir.copyFile src dest
-    runIO next
-
-  FileExistsE path k -> do
-    exists <- Dir.doesFileExist path
-    runIO (k exists)
-
-  DirExistsE path k -> do
-    exists <- Dir.doesDirectoryExist path
-    runIO (k exists)
-
-  ListDirE path k -> do
-    entries <- Dir.listDirectory path
-    runIO (k entries)
-
-  CreateDirE path next -> do
-    Dir.createDirectoryIfMissing True path
-    runIO next
-
-  RemoveFileE path next -> do
-    exists <- Dir.doesFileExist path
-    if exists then Dir.removeFile path else return ()
-    runIO next
-
-  RemoveDirRecursiveE path next -> do
-    exists <- Dir.doesDirectoryExist path
-    if exists then Dir.removeDirectoryRecursive path else return ()
-    runIO next
-
-  GetFileSizeE path k -> do
-    size <- Dir.getFileSize path
-    runIO (k size)
-
-  ReadFileBytesE path k -> do
-    bs <- BS.readFile path
-    runIO (k bs)
-
-  Tell msg next -> do
-    putStrLn msg
-    runIO next
-
-  TellErr msg next -> do
-    hPutStrLn stderr msg
-    runIO next
-
-  AskUser prompt k -> do
-    putStr prompt
-    hFlush stdout
-    response <- getLine
-    runIO (k response)
-
-  GetCurrentDirE k -> do
-    cwd <- Dir.getCurrentDirectory
-    runIO (k cwd)
-
-  ExitWithE code next -> do
-    exitWith code
-    runIO next
-
-  LiftIOE action k -> do
-    result <- action
-    runIO (k result)
-
--- | Git base flags
-baseFlags :: [String]
-baseFlags = ["-C", rgitIndexPath]
-
--- | Run git with baseFlags and print output
-runGitRaw :: [String] -> IO ExitCode
-runGitRaw args = do
-  let fullArgs = baseFlags ++ ["-c", "color.ui=always"] ++ args
-  (code, out, err) <- readProcessWithExitCode "git" fullArgs ""
-  putStr out
-  hPutStrLn stderr err
-  return code
-
--- | Run git with baseFlags and return output
-runGitWithOutput :: [String] -> IO (ExitCode, String, String)
-runGitWithOutput args = do
-  let fullArgs = baseFlags ++ ["-c", "color.ui=never"] ++ args
-  readProcessWithExitCode "git" fullArgs ""
 ```
 
 ---
@@ -4424,13 +4076,11 @@ module Rgit.Types
   , RgitEnv(..)
   , RgitM
   , runRgitM
-  , Rgit
   ) where
 
 import Control.Monad.Trans.Reader (ReaderT, runReaderT)
 import Data.Text (Text, unpack)
 import GHC.Generics (Generic)
-import Rgit.Effect (Rgit)
 
 type Path = String
 
@@ -4467,9 +4117,9 @@ data RgitEnv = RgitEnv
     , envForceWithLease :: Bool
     }
 
-type RgitM = ReaderT RgitEnv Rgit
+type RgitM = ReaderT RgitEnv IO
 
-runRgitM :: RgitEnv -> RgitM a -> Rgit a
+runRgitM :: RgitEnv -> RgitM a -> IO a
 runRgitM env action = runReaderT action env
 ```
 
@@ -4819,10 +4469,6 @@ executable rgit
                       Rgit.Device,
                       Rgit.DevicePrompt,
                       Rgit.Diff,
-                      Rgit.Effect,
-                      Rgit.Effect.IO,
-                      Rgit.Effect.Pure,
-                      Rgit.Effect.DryRun,
                       Rgit.Utils,
                       Rgit.Plan,
                       Rgit.Pipeline,
@@ -4890,7 +4536,6 @@ test-suite pipeline
                          Rgit.Plan,
                          Rgit.Pipeline,
                          Rgit.Utils,
-                         Rgit.Effect,
                          Rgit.Internal.Metadata,
                          Internal.Config,
                          Internal.ConfigFile
@@ -4915,8 +4560,6 @@ test-suite conflict
     main-is:             ConflictSpec.hs
     hs-source-dirs:      test, .
     other-modules:       Rgit.Conflict,
-                         Rgit.Effect,
-                         Rgit.Effect.Pure,
                          Rgit.Internal.Metadata,
                          Rgit.Types,
                          Internal.Config,
@@ -4940,8 +4583,6 @@ test-suite merge
     main-is:             MergeSpec.hs
     hs-source-dirs:      test, .
     other-modules:       Rgit.Conflict,
-                         Rgit.Effect,
-                         Rgit.Effect.Pure,
                          Rgit.Internal.Metadata,
                          Rgit.Types,
                          Internal.Config,
