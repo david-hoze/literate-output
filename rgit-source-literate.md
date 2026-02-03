@@ -97,11 +97,11 @@ import System.IO (hFlush, stdout, stderr, hPutStrLn, hIsTerminalDevice, stdin)
 import Data.Maybe (fromMaybe, listToMaybe, maybe, maybeToList)
 import Data.Either (either)
 import Data.Text (unpack)
-import Rgit.Utils (ensureRemoteRoot, toPosix, filterOutRgitPaths)
+import Rgit.Utils (toPosix, filterOutRgitPaths)
 import qualified Rgit.Device as Device
 import qualified Rgit.DevicePrompt as DevicePrompt
 import qualified Rgit.Conflict as Conflict
-import Rgit.Remote (Remote(..), remoteUrl, resolveRemote)
+import Rgit.Remote (Remote, remoteName, displayRemote, resolveRemote, remoteUrl)
 import Prelude hiding (init)
 import Control.Exception (bracket)
 
@@ -399,7 +399,7 @@ checkout = doCheckout
 push :: RgitM ()
 push = withRemote $ \remote -> do
     force <- asks envForce
-    liftIO $ putStrLn $ "Inspecting remote '" ++ remoteName remote ++ "' (" ++ remoteUrl remote ++ ")"
+    liftIO $ putStrLn $ "Inspecting remote: " ++ displayRemote remote
     state <- liftIO $ classifyRemoteState remote
 
     case state of
@@ -458,7 +458,7 @@ verify isRemote
       liftIO $ putStrLn "Fetching remote metadata... done."
       liftIO $ putStrLn "Scanning remote files... done."
       liftIO $ putStrLn "Comparing..."
-      (fileCount, issues) <- liftIO $ Verify.verifyRemote cwd (remoteUrl remote)
+      (fileCount, issues) <- liftIO $ Verify.verifyRemote cwd remote
       liftIO $ putStrLn $ "Verifying " ++ show fileCount ++ " files..."
       if null issues
         then liftIO $ putStrLn "[OK] All files match metadata."
@@ -481,38 +481,29 @@ remoteShow mRemoteName = do
     name <- case mRemoteName of
         Just n -> return n
         Nothing -> liftIO Git.getTrackedRemoteName
+    mRemote <- liftIO $ resolveRemote cwd name
     mTarget <- liftIO $ Device.readRemoteFile cwd name
-    mResolvedUrl <- liftIO $ case mTarget of
-        Just t -> do
-            r <- Device.resolveRemoteTarget cwd t
-            case r of
-                Device.Resolved u -> return (Just u)
-                _ -> return Nothing
-        Nothing -> Git.getRemoteUrl name
     display <- liftIO $ case mTarget of
         Just _ -> formatRemoteDisplay cwd name mTarget
-        Nothing -> return (name ++ " Γזע " ++ fromMaybe "(not configured)" mResolvedUrl)
-    case (mResolvedUrl, mTarget) of
-        (Nothing, Nothing) -> liftIO $ putStrLn "No remote configured. (Use 'rgit remote add <name> <url>')"
-        (Nothing, Just _) -> do
-            liftIO $ putStrLn display
-            liftIO $ hPutStrLn stderr "hint: Connect the device and try again."
-        (Just url, _) -> do
+        Nothing -> return (name ++ " Γזע " ++ maybe "(not configured)" displayRemote mRemote)
+    case mRemote of
+        Nothing -> do
+            liftIO $ putStrLn "No remote configured. (Use 'rgit remote add <name> <url>')"
+        Just remote -> do
             liftIO $ putStrLn display
             liftIO $ putStrLn ""
-            let remote = Remote name url
             hasBundle <- liftIO $ Dir.doesFileExist fetchedBundlePath
             if hasBundle
-                then liftIO $ showRemoteStatusFromBundle name (Just url)
+                then liftIO $ showRemoteStatusFromBundle name (Just (remoteUrl remote))
                 else do
                     maybeBundlePath <- liftIO $ fetchRemoteBundle remote
                     case maybeBundlePath of
                         Just bPath -> do
                             liftIO $ saveFetchedBundle remote (Just bPath)
-                            liftIO $ showRemoteStatusFromBundle name (Just url)
+                            liftIO $ showRemoteStatusFromBundle name (Just (remoteUrl remote))
                         Nothing -> liftIO $ do
-                            putStrLn $ "  Fetch URL: " ++ url
-                            putStrLn $ "  Push  URL: " ++ url
+                            putStrLn $ "  Fetch URL: " ++ remoteUrl remote
+                            putStrLn $ "  Push  URL: " ++ remoteUrl remote
                             putStrLn ""
                             putStrLn "  HEAD branch: (unknown)"
                             putStrLn ""
@@ -525,31 +516,26 @@ remoteShow mRemoteName = do
 remoteCheck :: Maybe String -> RgitM ()
 remoteCheck mName = do
     cwd <- asks envCwd
-    (mUrl, remoteName) <- liftIO $ case mName of
+    (mRemote, name) <- liftIO $ case mName of
         Nothing -> do
             name <- Git.getTrackedRemoteName
             mRemote <- resolveRemote cwd name
-            case mRemote of
-                Just r -> return (Just (remoteUrl r), name)
-                Nothing -> Git.getRemoteUrl name >>= \u -> return (u, name)
+            return (mRemote, name)
         Just name -> do
             mRemote <- resolveRemote cwd name
-            case mRemote of
-                Just r -> return (Just (remoteUrl r), name)
-                Nothing -> Git.getRemoteUrl name >>= \u -> return (u, name)
-    case mUrl of
+            return (mRemote, name)
+    case mRemote of
         Nothing -> do
             liftIO $ if maybe True (const False) mName
                 then hPutStrLn stderr "fatal: No remote configured."
                 else hPutStrLn stderr $ "fatal: '" ++ fromMaybe "" mName ++ "' does not appear to be a git remote."
             liftIO $ hPutStrLn stderr "hint: Set remote with 'rgit remote add <name> <url>'"
             liftIO $ exitWith (ExitFailure 1)
-        Just url -> do
-            let remoteUrl = ensureRemoteRoot url
-            liftIO $ putStrLn $ "Checking local against remote '" ++ remoteName ++ "' (" ++ url ++ ")..."
+        Just remote -> do
+            liftIO $ putStrLn $ "Checking local against remote: " ++ displayRemote remote
             liftIO $ putStrLn ""
             liftIO $ putStrLn "Using: rclone check --combined"
-            res <- liftIO $ try @IOException (Transport.checkRemote cwd remoteUrl)
+            res <- liftIO $ try @IOException (Transport.checkRemote cwd remote)
             case res of
                 Left _ -> do
                     liftIO $ hPutStrLn stderr "fatal: rclone not found. Install rclone: https://rclone.org/install/"
@@ -596,7 +582,6 @@ mergeContinue :: RgitM ()
 mergeContinue = do
     cwd <- asks envCwd
     mRemote <- asks envRemote
-    let mUrl = fmap remoteUrl mRemote
     let conflictsDir = cwd </> ".rgit" </> "conflicts"
     conflictsExist <- liftIO $ Dir.doesDirectoryExist conflictsDir
 
@@ -615,7 +600,7 @@ mergeContinue = do
                             liftIO $ putStrLn "Syncing binaries... done."
                             syncRemoteFilesToLocal
                             liftIO $ updateMetadataAfterSync cwd
-                            liftIO $ void Git.updateRemoteTrackingBranchToHead) mUrl
+                            liftIO $ void Git.updateRemoteTrackingBranchToHead) mRemote
                     else liftIO $ hPutStrLn stderr "error: no merge in progress."
             else do
                 invalid <- liftIO $ Metadata.validateMetadataDir (cwd </> rgitIndexPath)
@@ -639,7 +624,7 @@ mergeContinue = do
                     liftIO $ putStrLn "Syncing binaries... done."
                     syncRemoteFilesToLocal
                     liftIO $ updateMetadataAfterSync cwd
-                    liftIO $ void Git.updateRemoteTrackingBranchToHead) mUrl
+                    liftIO $ void Git.updateRemoteTrackingBranchToHead) mRemote
 
 -- ============================================================================
 -- Internal helpers (not exported, moved from Commands.hs)
@@ -768,44 +753,40 @@ withRemote action = do
     Just remote -> action remote
 
 -- | Executes/Prints the command to be run in the shell (push: local -> remote).
--- remoteRoot is the configured remote URL with trailing slash (e.g. from .rgit/target).
-executeCommand :: FilePath -> String -> RcloneAction -> IO ()
-executeCommand localRoot remoteRoot action = case action of
+executeCommand :: FilePath -> Remote -> RcloneAction -> IO ()
+executeCommand localRoot remote action = case action of
         Copy src dest -> do
             let localPath = toPosix (localRoot </> src)
-                remotePath = remoteRoot ++ toPosix dest
-            void $ Transport.copyToRemote localPath remotePath
+            void $ Transport.copyToRemote localPath remote (toPosix dest)
 
         Move src dest ->
-            void $ Transport.moveRemote (remoteRoot ++ toPosix src) (remoteRoot ++ toPosix dest)
+            void $ Transport.moveRemote remote (toPosix src) (toPosix dest)
 
         Delete path ->
-            void $ Transport.deleteRemote (remoteRoot ++ toPosix path)
+            void $ Transport.deleteRemote remote (toPosix path)
 
         Swap _ _ _ -> return ()  -- not produced by planAction; future-proofing
 
 -- | Execute a single pull action: copy from remote to local or delete local file.
 -- Text files are already in the git bundle (index); copy from index to work dir instead of rclone.
-executePullCommand :: FilePath -> String -> RcloneAction -> IO ()
-executePullCommand localRoot remoteRoot action = case action of
+executePullCommand :: FilePath -> Remote -> RcloneAction -> IO ()
+executePullCommand localRoot remote action = case action of
         Copy src dest -> do
             fromIndex <- isTextFileInIndex localRoot dest
             if fromIndex
             then copyFromIndexToWorkTree localRoot dest
             else do
-                let remotePath = remoteRoot ++ toPosix dest
-                    localPath = toPosix (localRoot </> dest)
+                let localPath = toPosix (localRoot </> dest)
                 createDirectoryIfMissing True (takeDirectory (localRoot </> dest))
-                void $ Transport.copyFromRemote remotePath localPath
+                void $ Transport.copyFromRemote remote (toPosix dest) localPath
         Move src dest -> do
             fromIndex <- isTextFileInIndex localRoot src
             if fromIndex
             then copyFromIndexToWorkTree localRoot src
             else do
-                let remoteSrcPath = remoteRoot ++ toPosix src
-                    localSrcPath = localRoot </> src
+                let localSrcPath = localRoot </> src
                 createDirectoryIfMissing True (takeDirectory localSrcPath)
-                void $ Transport.copyFromRemote remoteSrcPath (toPosix localSrcPath)
+                void $ Transport.copyFromRemote remote (toPosix src) (toPosix localSrcPath)
             let localDestPath = localRoot </> dest
             exists <- Dir.doesFileExist localDestPath
             when exists $ Dir.removeFile localDestPath
@@ -837,7 +818,7 @@ formatPathList paths
 -- This is domain logic: it knows what .rgit/ means and interprets remote contents
 classifyRemoteState :: Remote -> IO RemoteState
 classifyRemoteState remote = do
-    result <- Transport.listRemoteItems (remoteUrl remote) 1
+    result <- Transport.listRemoteItems remote 1
     case result of
         Left err -> return (StateNetworkError err)
         Right items -> return (interpretRemoteItems items)
@@ -853,10 +834,9 @@ interpretRemoteItems items
 -- This is domain logic: it knows about .rgit/ layout and bundle files
 fetchBundle :: Remote -> IO FetchResult
 fetchBundle remote = do
-    let remotePath = remoteUrl remote ++ "/.rgit/rgit.bundle"
     let localDest = ".rgit/temp_remote.bundle"
     
-    result <- Transport.copyFromRemoteDetailed remotePath localDest
+    result <- Transport.copyFromRemoteDetailed remote ".rgit/rgit.bundle" localDest
     case result of
         Transport.CopySuccess -> return (BundleFound localDest)
         Transport.CopyNotFound -> return RemoteEmpty
@@ -872,7 +852,6 @@ fetchBundle remote = do
 pushBundle :: Remote -> IO ()
 pushBundle remote = do
     let tempBundle = "rgit.bundle"
-    let remotePath = remoteUrl remote ++ "/.rgit/rgit.bundle"
 
     -- bracket <setup> <cleanup> <action>
     bracket
@@ -881,14 +860,14 @@ pushBundle remote = do
         (\gCode -> do                 -- 3. Work
             if gCode /= ExitSuccess
                 then hPutStrLn stderr "Error creating bundle"
-                else uploadToRemote (Git.bundlePath tempBundle) remotePath
+                else uploadToRemote (Git.bundlePath tempBundle) remote
         )
 
 -- Helper for the upload logic to keep the bracket clean
-uploadToRemote :: FilePath -> String -> IO ()
-uploadToRemote src dest = do
+uploadToRemote :: FilePath -> Remote -> IO ()
+uploadToRemote src remote = do
     putStrLn "Uploading bundle to remote..."
-    rCode <- Transport.copyToRemote src dest
+    rCode <- Transport.copyToRemote src remote ".rgit/rgit.bundle"
     if rCode == ExitSuccess
         then putStrLn "Metadata push complete."
         else hPutStrLn stderr "Error uploading bundle."
@@ -921,16 +900,15 @@ syncRemoteFiles :: RgitM ()
 syncRemoteFiles = withRemote $ \remote -> do
     cwd <- asks envCwd
     localFiles <- asks envLocalFiles
-    remoteResult <- liftIO $ Remote.Scan.fetchRemoteFiles (remoteUrl remote)
+    remoteResult <- liftIO $ Remote.Scan.fetchRemoteFiles remote
     either
         (\_ -> liftIO $ hPutStrLn stderr "Error: Failed to fetch remote file list.")
         (\remoteFiles -> do
             let actions = Pipeline.pushSyncFiles localFiles remoteFiles
-                remoteRoot = ensureRemoteRoot (remoteUrl remote)
             liftIO $ putStrLn "--- Pushing Changes to Remote ---"
             if null actions
                 then liftIO $ putStrLn "Remote is already up to date."
-                else mapM_ (\a -> liftIO $ executeCommand cwd remoteRoot a) actions)
+                else mapM_ (\a -> liftIO $ executeCommand cwd remote a) actions)
         remoteResult
 
 
@@ -1013,20 +991,19 @@ syncRemoteFilesToLocal = withRemote $ \remote -> do
     lift $ tell $ "[DEBUG] syncRemoteFilesToLocal: cwd=" ++ cwd
     lift $ tell $ "[DEBUG] syncRemoteFilesToLocal: localFiles count=" ++ show (length localFiles)
     lift $ tell $ "[DEBUG] syncRemoteFilesToLocal: localFiles paths=" ++ show (map path localFiles)
-    remoteResult <- lift $ liftIOE $ Remote.Scan.fetchRemoteFiles (remoteUrl remote)  -- ESCAPE: rclone JSON parsing
+    remoteResult <- lift $ liftIOE $ Remote.Scan.fetchRemoteFiles remote  -- ESCAPE: rclone JSON parsing
     either
         (\_ -> lift $ tellErr "Error: Failed to fetch remote file list.")
         (\remoteFiles -> do
             lift $ tell $ "[DEBUG] syncRemoteFilesToLocal: remoteFiles count=" ++ show (length remoteFiles)
             lift $ tell $ "[DEBUG] syncRemoteFilesToLocal: remoteFiles paths=" ++ show (map path remoteFiles)
             let actions = Pipeline.pullSyncFiles localFiles remoteFiles
-                remoteRoot = ensureRemoteRoot (remoteUrl remote)
             lift $ tell $ "[DEBUG] syncRemoteFilesToLocal: actions count=" ++ show (length actions)
             lift $ tell $ "[DEBUG] syncRemoteFilesToLocal: actions=" ++ show actions
             lift $ tell "--- Pulling changes from remote ---"
             if null actions
                 then lift $ tell "Working tree already up to date with remote."
-                else mapM_ (\a -> lift $ executePullCommand cwd remoteRoot a) actions)
+                else mapM_ (\a -> lift $ executePullCommand cwd remote a) actions)
         remoteResult
 
 -- | Update metadata files after syncing binaries from remote.
@@ -1148,7 +1125,7 @@ pullAcceptRemoteImpl remote = do
     lift $ tell "Accepting remote file state as truth..."
     lift $ tell "Scanning remote files..."
 
-    result <- lift $ liftIOE $ Remote.Scan.fetchRemoteFiles (remoteUrl remote)  -- ESCAPE: rclone JSON parsing
+    result <- lift $ liftIOE $ Remote.Scan.fetchRemoteFiles remote  -- ESCAPE: rclone JSON parsing
     case result of
         Left _ -> lift $ tellErr "Error: Failed to fetch remote file list."
         Right remoteFiles -> do
@@ -1178,7 +1155,7 @@ pullManualMergeImpl remote = do
 
             remoteMeta <- lift $ liftIOE $ Verify.loadMetadataFromBundle fetchedBundleName
             lift $ tell "Scanning remote files... done."
-            result <- lift $ liftIOE $ Remote.Scan.fetchRemoteFiles (remoteUrl remote)
+            result <- lift $ liftIOE $ Remote.Scan.fetchRemoteFiles remote
             case result of
                 Left _ -> lift $ tellErr "Error: Could not fetch remote file list."
                 Right remoteFiles -> do
@@ -1210,7 +1187,7 @@ pullManualMergeImpl remote = do
                                 then do tell "Merging unrelated histories (e.g. first pull)..."; gitQuery ["merge", "--no-commit", "--no-ff", "--allow-unrelated-histories", "refs/remotes/origin/main"]
                                 else return (mergeCode, mergeOut, mergeErr)
 
-                            createConflictDirectories (remoteUrl remote) divergentFiles remoteFileMap remoteMetaMap localMetaMap
+                            createConflictDirectories remote divergentFiles remoteFileMap remoteMetaMap localMetaMap
 
                             lift $ liftIOE $ printConflictList divergentFiles remoteFileMap remoteMetaMap localMetaMap
                             lift $ do
@@ -1239,8 +1216,8 @@ findDivergentFiles remoteFileMap remoteMetaMap localMetaMap =
         ) [] remoteMetaMap
 
 -- | Create conflict directories for divergent files.
-createConflictDirectories :: String -> [(FilePath, Hash 'MD5, Hash 'MD5, Integer, Integer)] -> Map.Map FilePath (Hash 'MD5, EntryKind) -> Map.Map FilePath (Hash 'MD5, Integer) -> Map.Map FilePath (Hash 'MD5, Integer) -> RgitM ()
-createConflictDirectories url divergentFiles remoteFileMap remoteMetaMap localMetaMap = do
+createConflictDirectories :: Remote -> [(FilePath, Hash 'MD5, Hash 'MD5, Integer, Integer)] -> Map.Map FilePath (Hash 'MD5, EntryKind) -> Map.Map FilePath (Hash 'MD5, Integer) -> Map.Map FilePath (Hash 'MD5, Integer) -> RgitM ()
+createConflictDirectories remote divergentFiles remoteFileMap remoteMetaMap localMetaMap = do
     cwd <- asks envCwd
     let conflictsDir = cwd </> ".rgit" </> "conflicts"
     lift $ createDirE conflictsDir
@@ -1253,8 +1230,7 @@ createConflictDirectories url divergentFiles remoteFileMap remoteMetaMap localMe
         localExists <- lift $ fileExistsE localPath
         when localExists $ lift $ copyFileE localPath (conflictDir </> "LOCAL")
 
-        let remotePath = url ++ "/" ++ toPosix path
-        code <- liftIO $ Transport.copyFromRemote remotePath (conflictDir </> "REMOTE")
+        code <- liftIO $ Transport.copyFromRemote remote (toPosix path) (conflictDir </> "REMOTE")
         when (code /= ExitSuccess) $ lift $ tellErr $ "Warning: Could not download remote file: " ++ path
 
         lift $ case Map.lookup (normalise path) localMetaMap of
@@ -4180,7 +4156,6 @@ runRgitM env action = runReaderT action env
 module Rgit.Utils
   ( toPosix
   , isRgitPath
-  , ensureRemoteRoot
   , filterOutRgitPaths
   , atomicWriteFile
   , atomicWriteFileStr
@@ -4205,13 +4180,6 @@ toPosix = map (\c -> if c == '\\' then '/' else c)
 -- | True if the path is or is under .rgit (rgit metadata, not user content).
 isRgitPath :: FilePath -> Bool
 isRgitPath p = p == ".rgit" || ".rgit" `isPrefixOf` p || "/.rgit" `isInfixOf` p || "\\.rgit" `isInfixOf` p
-
--- | Ensure remote URL has a trailing slash for path concatenation.
-ensureRemoteRoot :: String -> String
-ensureRemoteRoot url
-  | null url   = url
-  | last url == '/' = url
-  | otherwise  = url ++ "/"
 
 -- | Remove .rgit paths from a list of file entries (e.g. remote file list).
 filterOutRgitPaths :: [FileEntry] -> [FileEntry]
@@ -4291,6 +4259,7 @@ import qualified Data.Text as T
 import qualified Internal.Git as Git
 import Rgit.Internal.Metadata (MetaContent(..), parseMetadata, readMetadataOrComputeHash, hashFile)
 import qualified Rgit.Remote.Scan as Remote.Scan
+import qualified Rgit.Remote
 import qualified Internal.Transport as Transport
 import Internal.Config (fetchedBundlePath, rgitIndexPath)
 import System.Process (readProcessWithExitCode)
@@ -4421,14 +4390,13 @@ loadMetadataFromBundle bundleName = do
 
 -- | Verify remote files match remote metadata.
 -- Returns (number of files checked, list of issues).
-verifyRemote :: FilePath -> String -> IO (Int, [VerifyIssue])
-verifyRemote cwd remoteUrl = do
+verifyRemote :: FilePath -> Rgit.Remote.Remote -> IO (Int, [VerifyIssue])
+verifyRemote cwd remote = do
   -- 1. Fetch the remote bundle if needed
   bundleExists <- doesFileExist fetchedBundlePath
   when (not bundleExists) $ do
-    let remotePath = remoteUrl ++ "/.rgit/rgit.bundle"
     let localDest = ".rgit/temp_remote.bundle"
-    fetchResult <- Transport.copyFromRemoteDetailed remotePath localDest
+    fetchResult <- Transport.copyFromRemoteDetailed remote ".rgit/rgit.bundle" localDest
     case fetchResult of
       Transport.CopySuccess -> do
         -- Copy to fetchedBundlePath for consistency
@@ -4447,7 +4415,7 @@ verifyRemote cwd remoteUrl = do
       remoteMeta <- loadMetadataFromBundle fetchedBundlePath
       
       -- 3. Fetch actual remote files
-      Remote.Scan.fetchRemoteFiles remoteUrl >>= either
+      Remote.Scan.fetchRemoteFiles remote >>= either
         (\_ -> hPutStrLn stderr "Error: Could not fetch remote file list." >> return (0, []))
         (\remoteFiles -> do
           let filteredRemoteFiles = filterOutRgitPaths remoteFiles
@@ -4583,6 +4551,9 @@ test-suite pipeline
                          Rgit.Pipeline,
                          Rgit.Utils,
                          Rgit.Internal.Metadata,
+                         Rgit.Device,
+                         Rgit.Remote,
+                         Internal.Git,
                          Internal.Config,
                          Internal.ConfigFile
     build-depends:       base,
@@ -4598,7 +4569,10 @@ test-suite pipeline
                          base16-bytestring ^>=1.0.2.0,
                          cryptohash-md5,
                          directory,
-                         filepath
+                         filepath,
+                         process,
+                         time,
+                         uuid ^>=1.3.13
     default-language:    Haskell2010
 
 test-suite merge
@@ -4608,6 +4582,8 @@ test-suite merge
     other-modules:       Rgit.Conflict,
                          Rgit.Internal.Metadata,
                          Rgit.Types,
+                         Rgit.Device,
+                         Rgit.Remote,
                          Internal.Git,
                          Internal.Config,
                          Internal.ConfigFile
@@ -4625,7 +4601,9 @@ test-suite merge
                          tasty,
                          tasty-hunit,
                          tasty-quickcheck,
-                         QuickCheck
+                         QuickCheck,
+                         time,
+                         uuid ^>=1.3.13
     default-language:    Haskell2010
 test-suite generate-literate-docs
     type:                exitcode-stdio-1.0
