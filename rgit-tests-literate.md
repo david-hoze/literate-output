@@ -1024,7 +1024,7 @@ cd test\cli\work_b & rgit push
 
 cd test\cli\work_a & rgit fetch & rgit pull
 <<<
->>>
+>>> //
 >>>= 0
 
 # ---- A: modify text.txt to A's version and push ----
@@ -1071,7 +1071,7 @@ cd test\cli\work_b & rgit push
 
 cd test\cli\work_a & rgit fetch & rgit pull
 <<<
->>>
+>>> //
 >>>= 0
 
 # ---- A: modify text.txt to "remote wins" and push ----
@@ -1118,11 +1118,11 @@ cd test\cli\work_b & rgit push
 
 cd test\cli\work_a & rgit fetch & rgit pull
 <<<
->>>
+>>> //
 >>>= 0
 
 # ---- A: modify both files and push ----
-cd test\cli\work_a & echo A multi 1> file1.txt & echo A multi 2> file2.txt & rgit add file1.txt file2.txt & rgit commit -m "A: modify two files"
+cd test\cli\work_a & (echo A multi 1)> file1.txt & (echo A multi 2)> file2.txt & rgit add file1.txt file2.txt & rgit commit -m "A: modify two files"
 <<<
 >>> /\[main|master|file changed/
 >>>= 0
@@ -1133,7 +1133,7 @@ cd test\cli\work_a & rgit push
 >>>= 0
 
 # ---- B: modify SAME two files differently and commit ----
-cd test\cli\work_b & echo B multi 1> file1.txt & echo B multi 2> file2.txt & rgit add file1.txt file2.txt & rgit commit -m "B: modify two files"
+cd test\cli\work_b & (echo B multi 1)> file1.txt & (echo B multi 2)> file2.txt & rgit add file1.txt file2.txt & rgit commit -m "B: modify two files"
 <<<
 >>> /\[main|master|file changed/
 >>>= 0
@@ -1170,7 +1170,7 @@ cd test\cli\work_b & rgit push
 
 cd test\cli\work_a & rgit fetch & rgit pull
 <<<
->>>
+>>> //
 >>>= 0
 
 # ---- A: create brand-new file "shared_new.txt" and push ----
@@ -1245,7 +1245,7 @@ cd test\cli\work_b & rgit push
 
 cd test\cli\work_a & rgit fetch & rgit pull
 <<<
->>>
+>>> //
 >>>= 0
 
 # ---- A: modify text.txt and push ----

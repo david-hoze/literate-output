@@ -337,7 +337,9 @@ doMergeAbort = do
     -- Abort git merge
     code <- Git.mergeAbort
     if code /= ExitSuccess
-        then hPutStrLn stderr "error: no merge in progress."
+        then do
+            hPutStrLn stderr "error: no merge in progress."
+            exitWith (ExitFailure 1)
         else do
             putStrLn "Merge aborted. Your working tree is unchanged."
             
@@ -590,7 +592,9 @@ mergeContinue = do
                             case maybeRemoteHash of
                                 Just rHash -> liftIO $ void $ Git.updateRemoteTrackingBranchToHash rHash
                                 Nothing    -> return ()) mRemote
-                    else liftIO $ hPutStrLn stderr "error: no merge in progress."
+                    else do
+                        liftIO $ hPutStrLn stderr "error: no merge in progress."
+                        liftIO $ exitWith (ExitFailure 1)
             else do
                 invalid <- liftIO $ Metadata.validateMetadataDir (cwd </> rgitIndexPath)
                 unless (null invalid) $ do
