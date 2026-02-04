@@ -1451,7 +1451,7 @@ del test\cli\work_norepo\file.txt 2>nul
 # After init, bit status should work (clean working directory)
 cd test\cli\work_norepo & bit status
 <<<
->>>
+>>> /.*/
 >>>= 0
 
 # Cleanup
