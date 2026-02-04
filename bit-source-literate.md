@@ -36,6 +36,7 @@ import qualified Bit.Scan as Scan  -- Only for the pre-scan in runCommand
 import Bit.Remote (getDefaultRemote, resolveRemote)
 import System.Environment (getArgs)
 import System.Exit (ExitCode(..), exitWith)
+import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
 import Control.Monad (when, unless, void)
 import qualified System.Directory as Dir
@@ -44,7 +45,7 @@ run :: IO ()
 run = do
     args <- getArgs
     case args of
-        [] -> hPutStrLn stderr "Usage: bit [init|status|add|commit|restore|checkout|fetch|pull|push|verify|verify --remote|fsck|branch --unset-upstream|remote add <name> <url>|remote show [<name>]|remote check [<name>]]"
+        [] -> hPutStrLn stderr "Usage: bit [init|status|add|commit|log|restore|checkout|fetch|pull|push|verify|verify --remote|fsck|branch --unset-upstream|remote add <name> <url>|remote show [<name>]|remote check [<name>]]"
         _  -> runCommand args
 
 runCommand :: [String] -> IO ()
@@ -63,11 +64,20 @@ runCommand args = do
     let skipScan = cmd == ["init"]
                 || cmd `elem` [["verify"], ["verify", "--remote"], ["fsck"], ["remote", "check"]]
                 || (length cmd == 3 && take 2 cmd == ["remote", "check"])
-    localFiles <- if skipScan then return [] else Scan.scanWorkingDir cwd
-    unless skipScan $ Scan.writeMetadataFiles cwd localFiles
+    
+    -- Only scan and write metadata if .bit directory exists (repo is initialized)
+    bitExists <- Dir.doesDirectoryExist (cwd </> ".bit")
+    localFiles <- if skipScan || not bitExists then return [] else Scan.scanWorkingDir cwd
+    unless (skipScan || not bitExists) $ Scan.writeMetadataFiles cwd localFiles
     mRemote <- getDefaultRemote cwd
 
     let env = BitEnv cwd localFiles mRemote isForce isForceWithLease
+
+    -- Check if repository is initialized for commands that need it
+    let needsRepo = cmd /= ["init"]
+    when (needsRepo && not bitExists) $ do
+        hPutStrLn stderr "fatal: not a bit repository (or any of the parent directories): .bit"
+        exitWith (ExitFailure 1)
 
     case cmd of
         ["init"]                        -> Bit.init
@@ -88,6 +98,7 @@ runCommand args = do
         ("add":rest)                    -> void $ Bit.add rest
         ("commit":rest)                 -> void $ Bit.commit rest
         ("diff":rest)                   -> void $ Bit.diff rest
+        ("log":rest)                    -> void $ Bit.log rest
         ("restore":rest)                -> runBitM env $ Bit.restore rest
         ("checkout":rest)               -> runBitM env $ Bit.checkout rest
         ("status":rest)                 -> runBitM env $ Bit.status rest
@@ -268,6 +279,7 @@ module Bit.Core
     , add
     , commit
     , diff
+    , log
     , restore
     , checkout
     , status
@@ -340,7 +352,7 @@ import qualified Bit.Device as Device
 import qualified Bit.DevicePrompt as DevicePrompt
 import qualified Bit.Conflict as Conflict
 import Bit.Remote (Remote, remoteName, displayRemote, resolveRemote, remoteUrl, RemoteState(..), FetchResult(..))
-import Prelude hiding (init)
+import Prelude hiding (init, log)
 import Control.Exception (bracket)
 
 -- ============================================================================
@@ -367,6 +379,9 @@ commit args = Git.runGitRaw ("commit" : args)
 
 diff :: [String] -> IO ExitCode
 diff args = Git.runGitRaw ("diff" : args)
+
+log :: [String] -> IO ExitCode
+log args = Git.runGitRaw ("log" : args)
 
 reset :: [String] -> IO ExitCode
 reset args = Git.runGitRaw ("reset" : args)

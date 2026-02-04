@@ -1313,6 +1313,150 @@ cleanup done
 
 ---
 
+## test/cli/no-repo.test
+
+**Path:** `test/cli/no-repo.test`
+
+*Source file.*
+
+```text
+# Test: bit commands outside of a bit repository
+# These tests verify that commands fail gracefully when run outside a bit repo
+# and that they do NOT create a .bit directory
+
+# Setup: clean directory with no .bit folder
+rmdir /s /q test\cli\work_norepo 2>nul & mkdir test\cli\work_norepo
+<<<
+>>>
+>>>= 0
+
+# bit status - should fail with proper error message
+cd test\cli\work_norepo & bit status 2>&1
+<<<
+>>> /fatal: not a bit repository/
+>>>= 1
+
+# Verify .bit was NOT created by status
+if exist "test\cli\work_norepo\.bit\" (echo exists) else (echo not created)
+<<<
+>>>
+not created
+>>>= 0
+
+# bit add - should fail with proper error message
+cd test\cli\work_norepo & echo test> file.txt & bit add file.txt 2>&1
+<<<
+>>> /fatal: not a bit repository/
+>>>= 1
+
+# Verify .bit was NOT created by add
+if exist "test\cli\work_norepo\.bit\" (echo exists) else (echo not created)
+<<<
+>>>
+not created
+>>>= 0
+
+# bit commit - should fail with proper error message
+cd test\cli\work_norepo & bit commit -m "test" 2>&1
+<<<
+>>> /fatal: not a bit repository/
+>>>= 1
+
+# bit log - should fail with proper error message
+cd test\cli\work_norepo & bit log 2>&1
+<<<
+>>> /fatal: not a bit repository/
+>>>= 1
+
+# bit diff - should fail with proper error message
+cd test\cli\work_norepo & bit diff 2>&1
+<<<
+>>> /fatal: not a bit repository/
+>>>= 1
+
+# bit push - should fail with proper error message
+cd test\cli\work_norepo & bit push 2>&1
+<<<
+>>> /fatal: not a bit repository/
+>>>= 1
+
+# bit pull - should fail with proper error message
+cd test\cli\work_norepo & bit pull 2>&1
+<<<
+>>> /fatal: not a bit repository/
+>>>= 1
+
+# bit fetch - should fail with proper error message
+cd test\cli\work_norepo & bit fetch 2>&1
+<<<
+>>> /fatal: not a bit repository/
+>>>= 1
+
+# bit restore - should fail with proper error message
+cd test\cli\work_norepo & bit restore file.txt 2>&1
+<<<
+>>> /fatal: not a bit repository/
+>>>= 1
+
+# bit checkout - should fail with proper error message
+cd test\cli\work_norepo & bit checkout file.txt 2>&1
+<<<
+>>> /fatal: not a bit repository/
+>>>= 1
+
+# bit remote show - should fail with proper error message
+cd test\cli\work_norepo & bit remote show 2>&1
+<<<
+>>> /fatal: not a bit repository/
+>>>= 1
+
+# bit remote add - should fail with proper error message
+cd test\cli\work_norepo & bit remote add origin /tmp/remote 2>&1
+<<<
+>>> /fatal: not a bit repository/
+>>>= 1
+
+# bit verify - should fail with proper error message
+cd test\cli\work_norepo & bit verify 2>&1
+<<<
+>>> /fatal: not a bit repository/
+>>>= 1
+
+# Final check: .bit should still not exist after all commands
+if exist "test\cli\work_norepo\.bit\" (echo exists) else (echo not created)
+<<<
+>>>
+not created
+>>>= 0
+
+# bit init - should succeed (doesn't need existing repo)
+cd test\cli\work_norepo & bit init
+<<<
+>>> /Initialized/
+>>>= 0
+
+# After init, .bit should exist
+if exist "test\cli\work_norepo\.bit\" (echo exists) else (echo missing)
+<<<
+>>>
+exists
+>>>= 0
+
+# After init, bit status should work
+cd test\cli\work_norepo & bit status
+<<<
+>>>
+>>>= 0
+
+# Cleanup
+rmdir /s /q test\cli\work_norepo 2>nul
+<<<
+>>>
+>>>= 0
+```
+
+---
+
 ## test/cli/one-repo.test
 
 **Path:** `test/cli/one-repo.test`
@@ -1456,6 +1600,18 @@ cd test\cli\work & bit commit -m "Update test.txt"
 cd test\cli\work & bit status
 <<<
 >>> /nothing to commit|working tree clean/
+>>>= 0
+
+# Test bit log - should show commit history
+cd test\cli\work & bit log --oneline
+<<<
+>>> /Update test\.txt/
+>>>= 0
+
+# Test bit log with formatting - should work like git log
+cd test\cli\work & bit log --pretty=format:"%s" -n 1
+<<<
+>>> /Update test\.txt/
 >>>= 0
 ```
 
