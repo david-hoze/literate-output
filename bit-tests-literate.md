@@ -538,6 +538,254 @@ subst Z: /D 2>nul & rmdir /s /q test\cli\work 2>nul & rmdir /s /q test\cli\devic
 
 ---
 
+## test/cli/filesystem-remote-direct.test
+
+**Path:** `test/cli/filesystem-remote-direct.test`
+
+*Source file.*
+
+```text
+# Filesystem Remote Direct Tests
+# Tests running bit commands directly at the filesystem remote location
+
+# Setup: Clean workspace
+rmdir /s /q test\cli\work_direct 2>nul & rmdir /s /q test\cli\fs_remote_direct 2>nul & mkdir test\cli\work_direct & mkdir test\cli\fs_remote_direct
+<<<
+>>>
+>>>= 0
+
+# Initialize local repo
+cd test\cli\work_direct & bit init
+<<<
+>>> /Initialized/
+>>>= 0
+
+# Add filesystem remote
+cd test\cli\work_direct & bit remote add origin ..\fs_remote_direct
+<<<
+>>> /Remote 'origin' added/
+>>>= 0
+
+# Create and push a file
+cd test\cli\work_direct & echo test content> file.txt & bit add file.txt & bit commit -m "Initial"
+<<<
+>>> /\[main|files? changed/
+>>>= 0
+
+cd test\cli\work_direct & bit push
+<<<
+>>> /Push complete/
+>>>= 0
+
+# Run bit status at the remote (should work since it's a full repo)
+cd test\cli\fs_remote_direct & bit status
+<<<
+>>> /nothing to commit|working tree clean|On branch/
+>>>= 0
+
+# Run bit log at the remote
+cd test\cli\fs_remote_direct & bit log --oneline
+<<<
+>>> /Initial/
+>>>= 0
+
+# Modify file directly at remote
+cd test\cli\fs_remote_direct & echo remote change> file.txt & bit add file.txt & bit commit -m "Remote edit"
+<<<
+>>> /\[main|files? changed/
+>>>= 0
+
+# Local push should now fail (remote has diverged)
+cd test\cli\work_direct & echo local change> other.txt & bit add other.txt & bit commit -m "Local edit"
+<<<
+>>> /\[main|files? changed/
+>>>= 0
+
+cd test\cli\work_direct & bit push
+<<<
+>>> /error.*Remote has local commits/
+>>>= 1
+
+# Local pull should work (merges remote changes)
+cd test\cli\work_direct & bit pull
+<<<
+>>> /Pull|Merging|Updating/
+>>>= 0
+
+# Now push should succeed
+cd test\cli\work_direct & bit push
+<<<
+>>> /Push complete/
+>>>= 0
+
+# Verify remote has both files
+if exist "test\cli\fs_remote_direct\file.txt" (echo file exists) else (echo missing)
+<<<
+>>>
+file exists
+>>>= 0
+
+if exist "test\cli\fs_remote_direct\other.txt" (echo other exists) else (echo missing)
+<<<
+>>>
+other exists
+>>>= 0
+```
+
+---
+
+## test/cli/filesystem-remote.test
+
+**Path:** `test/cli/filesystem-remote.test`
+
+*Source file.*
+
+```text
+# Filesystem Remote Tests
+# Tests that filesystem remotes create full bit repos (not bundles)
+
+# Setup: Clean workspace and create two repos + shared filesystem remote
+rmdir /s /q test\cli\work_a 2>nul & rmdir /s /q test\cli\work_b 2>nul & rmdir /s /q test\cli\fs_remote 2>nul & mkdir test\cli\work_a & mkdir test\cli\work_b & mkdir test\cli\fs_remote
+<<<
+>>>
+>>>= 0
+
+# Initialize repo A
+cd test\cli\work_a & bit init
+<<<
+>>> /Initialized/
+>>>= 0
+
+# Add remote pointing to filesystem path
+cd test\cli\work_a & bit remote add origin ..\fs_remote
+<<<
+>>> /Remote 'origin' added/
+>>>= 0
+
+# Create and commit a file in repo A
+cd test\cli\work_a & echo hello world> test.txt & bit add test.txt & bit commit -m "Initial commit"
+<<<
+>>> /\[main|files? changed/
+>>>= 0
+
+# Push to filesystem remote (should create .bit/ at remote)
+cd test\cli\work_a & bit push
+<<<
+>>> /Push complete|Pushing to filesystem remote/
+>>>= 0
+
+# Verify remote has .bit/index/.git directory (not just .bit/bit.bundle)
+if exist "test\cli\fs_remote\.bit\index\.git" (echo remote has git repo) else (echo missing git repo)
+<<<
+>>>
+remote has git repo
+>>>= 0
+
+# Verify remote does NOT use bundles (no .bit/bit.bundle)
+if exist "test\cli\fs_remote\.bit\bit.bundle" (echo has bundle) else (echo no bundle)
+<<<
+>>>
+no bundle
+>>>= 0
+
+# Verify remote has the actual file
+if exist "test\cli\fs_remote\test.txt" (echo file exists) else (echo missing)
+<<<
+>>>
+file exists
+>>>= 0
+
+# Initialize repo B with same remote
+cd test\cli\work_b & bit init
+<<<
+>>> /Initialized/
+>>>= 0
+
+cd test\cli\work_b & bit remote add origin ..\fs_remote
+<<<
+>>> /Remote 'origin' added/
+>>>= 0
+
+# Pull from filesystem remote into repo B
+cd test\cli\work_b & bit pull
+<<<
+>>> /Pull|Pulling from filesystem remote/
+>>>= 0
+
+# Verify repo B has the file
+if exist "test\cli\work_b\test.txt" (echo file exists) else (echo missing)
+<<<
+>>>
+file exists
+>>>= 0
+
+# Verify content matches
+findstr /C:"hello world" test\cli\work_b\test.txt >nul
+<<<
+>>>
+>>>= 0
+
+# Repo B modifies file, commits, pushes
+cd test\cli\work_b & echo updated content> test.txt & bit add test.txt & bit commit -m "Update from B"
+<<<
+>>> /\[main|files? changed/
+>>>= 0
+
+cd test\cli\work_b & bit push
+<<<
+>>> /Push complete|Pushing to filesystem remote/
+>>>= 0
+
+# Verify remote has updated content
+findstr /C:"updated content" test\cli\fs_remote\test.txt >nul
+<<<
+>>>
+>>>= 0
+
+# Repo A pulls the changes
+cd test\cli\work_a & bit pull
+<<<
+>>> /Pull|Merging|Updating/
+>>>= 0
+
+# Verify repo A has updated content
+findstr /C:"updated content" test\cli\work_a\test.txt >nul
+<<<
+>>>
+>>>= 0
+
+# Test conflict detection: both modify same file
+cd test\cli\work_a & echo version A> conflict.txt & bit add conflict.txt & bit commit -m "Add conflict from A"
+<<<
+>>> /\[main|files? changed/
+>>>= 0
+
+cd test\cli\work_b & echo version B> conflict.txt & bit add conflict.txt & bit commit -m "Add conflict from B"
+<<<
+>>> /\[main|files? changed/
+>>>= 0
+
+# Repo A pushes first
+cd test\cli\work_a & bit push
+<<<
+>>> /Push complete|Pushing to filesystem remote/
+>>>= 0
+
+# Repo B push should fail (remote diverged)
+cd test\cli\work_b & bit push
+<<<
+>>> /error.*Remote has local commits/
+>>>= 1
+
+# Repo B pulls to resolve
+cd test\cli\work_b & bit pull
+<<<
+>>> /Automatic merge|conflict/
+>>>= 0
+```
+
+---
+
 ## test/cli/fsck.test
 
 **Path:** `test/cli/fsck.test`

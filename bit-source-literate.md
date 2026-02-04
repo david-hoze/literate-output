@@ -275,6 +275,7 @@ resolveAll conflicts = do
 module Bit.Core
     ( -- Repo initialization
       init
+    , initializeRepoAt
 
       -- Git passthrough (these take args from the CLI)
     , add
@@ -346,7 +347,7 @@ import Control.Monad.Trans.Class (lift)
 import Control.Exception (try, throwIO, SomeException, IOException)
 import System.IO (hFlush, stdout, stderr, hPutStrLn, hIsTerminalDevice)
 import System.Process (readProcessWithExitCode)
-import Data.Maybe (fromMaybe, listToMaybe, maybe, maybeToList)
+import Data.Maybe (fromMaybe, listToMaybe, maybe, maybeToList, mapMaybe)
 import Data.Either (either)
 import Bit.Utils (toPosix, filterOutBitPaths)
 import qualified Bit.Device as Device
@@ -428,50 +429,58 @@ remoteAdd = addRemote
 initializeRepo :: IO ()
 initializeRepo = do
     cwd <- Dir.getCurrentDirectory
-
     putStrLn $ "Initializing bit in: " ++ cwd
+    initializeRepoAt cwd
+    putStrLn "bit initialized successfully!"
+
+-- | Initialize a bit repository at the specified target directory.
+-- This is used both for local `bit init` and for creating filesystem remotes.
+initializeRepoAt :: FilePath -> IO ()
+initializeRepoAt targetDir = do
+    let targetBitDir = targetDir </> ".bit"
+    let targetBitIndexPath = targetBitDir </> "index"
+    let targetBitGitDir = targetBitIndexPath </> ".git"
+    let targetBitDevicesDir = targetBitDir </> "devices"
+    let targetBitRemotesDir = targetBitDir </> "remotes"
 
     -- 1. Create .bit directory
-    Dir.createDirectoryIfMissing True bitDir
+    Dir.createDirectoryIfMissing True targetBitDir
 
     -- 2. Create .bit/index directory (needed before git init)
-    Dir.createDirectoryIfMissing True (bitDir </> "index")
+    Dir.createDirectoryIfMissing True targetBitIndexPath
 
     -- 3. Init Git in the index directory
-    hasGit <- Dir.doesDirectoryExist bitGitDir
-    if hasGit
-        then putStrLn "Git repository already exists in .bit/index/.git"
-        else do
-            putStrLn "Running: git init in .bit/index"
-            -- Initialize git in .bit/index, which will create .bit/index/.git
-            void $ Git.init bitGitDir
-            
-            -- Fix for Windows external/USB drives: add to safe.directory
-            -- git 2.35.2+ rejects directories with different ownership
-            absIndex <- Dir.makeAbsolute bitIndexPath
-            let safePath = map (\c -> if c == '\\' then '/' else c) absIndex
-            void $ readProcessWithExitCode "git" ["config", "--global", "--add", "safe.directory", safePath] ""
+    hasGit <- Dir.doesDirectoryExist targetBitGitDir
+    unless hasGit $ do
+        -- Initialize git in .bit/index, which will create .bit/index/.git
+        void $ Git.runGitAt targetBitIndexPath ["init"]
+        
+        -- Fix for Windows external/USB drives: add to safe.directory
+        -- git 2.35.2+ rejects directories with different ownership
+        absIndex <- Dir.makeAbsolute targetBitIndexPath
+        let safePath = map (\c -> if c == '\\' then '/' else c) absIndex
+        void $ readProcessWithExitCode "git" ["config", "--global", "--add", "safe.directory", safePath] ""
 
     -- 3a. Create .git/bundles directory for storing bundle files
-    Dir.createDirectoryIfMissing True (bitGitDir </> "bundles")
+    Dir.createDirectoryIfMissing True (targetBitGitDir </> "bundles")
 
     -- 4. Configure default branch name to "main" (for the repo we just created)
     -- This affects future branch operations in this repo
-    Git.config "init.defaultBranch" "main"
+    void $ Git.runGitAt targetBitIndexPath ["config", "init.defaultBranch", "main"]
     
     -- 5. Rename the initial branch to "main" if it's "master"
     -- Git init creates "master" by default, so we rename it
-    (code, _, _) <- Git.runGitWithOutput ["branch", "-m", "master", "main"]
+    (code, _, _) <- Git.runGitAt targetBitIndexPath ["branch", "-m", "master", "main"]
     when (code /= ExitSuccess) $
         -- If rename failed (e.g., no commits yet), that's okay - first commit will use "main"
         return ()
 
     -- 6. Create other .bit subdirectories (index already created above)
-    Dir.createDirectoryIfMissing True bitDevicesDir
-    Dir.createDirectoryIfMissing True bitRemotesDir
+    Dir.createDirectoryIfMissing True targetBitDevicesDir
+    Dir.createDirectoryIfMissing True targetBitRemotesDir
 
     -- 5a. Create config file with default values
-    let configPath = bitDir </> "config"
+    let configPath = targetBitDir </> "config"
     configExists <- Dir.doesFileExist configPath
     unless configExists $ do
         let defaultConfig = unlines
@@ -485,16 +494,14 @@ initializeRepo = do
     -- Use .bit/index/.git/info/attributes instead of .gitattributes in the working tree
     -- This way it doesn't conflict with files from the remote on first pull
     -- Also disable text/CRLF conversion (-text) to prevent spurious "modified" status
-    void $ Git.config "merge.bit-metadata.name" "bit metadata"
-    void $ Git.config "merge.bit-metadata.driver" "false"
-    Dir.createDirectoryIfMissing True (bitGitDir </> "info")
-    writeFile (bitGitDir </> "info" </> "attributes") "* merge=bit-metadata -text\n"
+    void $ Git.runGitAt targetBitIndexPath ["config", "merge.bit-metadata.name", "bit metadata"]
+    void $ Git.runGitAt targetBitIndexPath ["config", "merge.bit-metadata.driver", "false"]
+    Dir.createDirectoryIfMissing True (targetBitGitDir </> "info")
+    writeFile (targetBitGitDir </> "info" </> "attributes") "* merge=bit-metadata -text\n"
 
     -- Note: We do NOT create an initial commit here.
     -- This keeps the repo empty until first real commit or pull.
     -- On first pull, we simply checkout the remote's history (no merge needed).
-
-    putStrLn "bit initialized successfully!"
 
 addRemote :: String -> String -> IO ()
 addRemote name pathOrUrl = do
@@ -629,6 +636,19 @@ checkout = doCheckout
 
 push :: BitM ()
 push = withRemote $ \remote -> do
+    cwd <- asks envCwd
+    force <- asks envForce
+    
+    -- Determine if this is a filesystem or cloud remote
+    mTarget <- liftIO $ getRemoteTargetType cwd (remoteName remote)
+    case mTarget of
+        Just (Device.TargetDevice _ _) -> liftIO $ filesystemPush cwd remote
+        Just (Device.TargetLocalPath _) -> liftIO $ filesystemPush cwd remote
+        _ -> cloudPush remote  -- Cloud remote or no target info (use cloud flow)
+
+-- | Push to a cloud remote (original flow, unchanged).
+cloudPush :: Remote -> BitM ()
+cloudPush remote = do
     force <- asks envForce
     liftIO $ putStrLn $ "Inspecting remote: " ++ displayRemote remote
     state <- liftIO $ classifyRemoteState remote
@@ -672,7 +692,19 @@ push = withRemote $ \remote -> do
             liftIO $ hPutStrLn stderr $ "Aborting: [X] Corrupted remote -> " ++ msg
 
 pull :: PullOptions -> BitM ()
-pull opts = withRemote $ \remote ->
+pull opts = withRemote $ \remote -> do
+    cwd <- asks envCwd
+    
+    -- Determine if this is a filesystem or cloud remote
+    mTarget <- liftIO $ getRemoteTargetType cwd (remoteName remote)
+    case mTarget of
+        Just (Device.TargetDevice _ _) -> liftIO $ filesystemPull cwd remote opts
+        Just (Device.TargetLocalPath _) -> liftIO $ filesystemPull cwd remote opts
+        _ -> cloudPull remote opts  -- Cloud remote or no target info (use cloud flow)
+
+-- | Pull from a cloud remote (original flow, unchanged).
+cloudPull :: Remote -> PullOptions -> BitM ()
+cloudPull remote opts =
     if pullAcceptRemote opts
         then pullAcceptRemoteImpl remote
         else if pullManualMerge opts
@@ -876,6 +908,11 @@ mergeContinue = do
 -- Internal helpers (not exported, moved from Commands.hs)
 -- ============================================================================
 
+-- | Determine the remote target type from a remote name.
+-- Returns the RemoteTarget if the remote is configured, Nothing otherwise.
+getRemoteTargetType :: FilePath -> String -> IO (Maybe Device.RemoteTarget)
+getRemoteTargetType cwd remoteName = Device.readRemoteFile cwd remoteName
+
 -- Git helpers via effect layer
 getLocalHeadE :: IO (Maybe String)
 getLocalHeadE = do
@@ -988,6 +1025,368 @@ withRemote action = do
   case mRemote of
     Nothing -> liftIO $ hPutStrLn stderr "Error: No remote configured."
     Just remote -> action remote
+
+-- ============================================================================
+-- Filesystem remote operations (new for filesystem remote feature)
+-- ============================================================================
+
+-- | Push to a filesystem remote. Creates a full bit repo at the remote location.
+filesystemPush :: FilePath -> Remote -> IO ()
+filesystemPush cwd remote = do
+    let remotePath = remoteUrl remote
+    putStrLn $ "Pushing to filesystem remote: " ++ remotePath
+    
+    -- 1. Check if remote has .bit/ directory (first push vs subsequent)
+    let remoteBitDir = remotePath </> ".bit"
+    remoteHasBit <- Dir.doesDirectoryExist remoteBitDir
+    
+    unless remoteHasBit $ do
+        putStrLn "First push: initializing bit repo at remote..."
+        initializeRepoAt remotePath
+    
+    -- 2. Fetch local into remote
+    let localIndexGit = cwd </> ".bit" </> "index" </> ".git"
+    let remoteIndex = remotePath </> ".bit" </> "index"
+    
+    putStrLn "Fetching local commits into remote..."
+    (fetchCode, fetchOut, fetchErr) <- Git.runGitAt remoteIndex 
+        ["fetch", localIndexGit, "main:refs/remotes/origin/main"]
+    
+    when (fetchCode /= ExitSuccess) $ do
+        hPutStrLn stderr $ "Error fetching into remote: " ++ fetchErr
+        exitWith fetchCode
+    
+    -- 3. Capture remote HEAD before merge
+    (oldHeadCode, oldHeadOut, _) <- Git.runGitAt remoteIndex ["rev-parse", "HEAD"]
+    let mOldHead = if oldHeadCode == ExitSuccess 
+                   then Just (filter (not . isSpace) oldHeadOut)
+                   else Nothing
+    
+    -- 4. Merge at remote (ff-only)
+    putStrLn "Merging at remote (fast-forward only)..."
+    (mergeCode, mergeOut, mergeErr) <- Git.runGitAt remoteIndex 
+        ["merge", "--ff-only", "refs/remotes/origin/main"]
+    
+    if mergeCode /= ExitSuccess
+        then do
+            hPutStrLn stderr "error: Remote has local commits that you don't have."
+            hPutStrLn stderr "hint: Run 'bit pull' to merge remote changes first, then push again."
+            exitWith (ExitFailure 1)
+        else do
+            -- 5. Get new HEAD at remote
+            (newHeadCode, newHeadOut, _) <- Git.runGitAt remoteIndex ["rev-parse", "HEAD"]
+            when (newHeadCode /= ExitSuccess) $ do
+                hPutStrLn stderr "Error: Could not get remote HEAD after merge"
+                exitWith (ExitFailure 1)
+            
+            let newHead = filter (not . isSpace) newHeadOut
+            
+            -- 6. Sync actual files based on what changed
+            case mOldHead of
+                Nothing -> do
+                    -- First push: sync all files from new HEAD
+                    putStrLn "First push: syncing all files to remote..."
+                    filesystemSyncAllFiles cwd remotePath newHead
+                Just oldHead -> do
+                    -- Subsequent push: sync only changed files
+                    putStrLn "Syncing changed files to remote..."
+                    filesystemSyncChangedFiles cwd remotePath oldHead newHead
+            
+            -- 7. Update local tracking ref
+            putStrLn "Updating local tracking ref..."
+            void $ Git.updateRemoteTrackingBranchToHead
+            
+            putStrLn "Push complete."
+
+-- | Sync all files from a commit to the filesystem remote (first push).
+filesystemSyncAllFiles :: FilePath -> FilePath -> String -> IO ()
+filesystemSyncAllFiles localRoot remotePath commitHash = do
+    let remoteIndex = remotePath </> ".bit" </> "index"
+    files <- Git.runGitAt remoteIndex ["ls-tree", "-r", "--name-only", commitHash]
+    case files of
+        (ExitSuccess, out, _) -> do
+            let paths = filter (not . null) (lines out)
+            forM_ paths $ \path -> do
+                -- Check if it's a text file (content in index) or binary (needs copy from local)
+                let metaPath = remoteIndex </> path
+                exists <- Dir.doesFileExist metaPath
+                if exists
+                    then do
+                        -- Text file: copy from remote index to remote working tree
+                        let workPath = remotePath </> path
+                        createDirectoryIfMissing True (takeDirectory workPath)
+                        copyFile metaPath workPath
+                    else do
+                        -- Binary file: copy from local working tree to remote working tree
+                        let srcPath = localRoot </> path
+                        let destPath = remotePath </> path
+                        srcExists <- Dir.doesFileExist srcPath
+                        when srcExists $ do
+                            createDirectoryIfMissing True (takeDirectory destPath)
+                            copyFile srcPath destPath
+        _ -> return ()
+
+-- | Sync only changed files between two commits.
+filesystemSyncChangedFiles :: FilePath -> FilePath -> String -> String -> IO ()
+filesystemSyncChangedFiles localRoot remotePath oldHead newHead = do
+    let remoteIndex = remotePath </> ".bit" </> "index"
+    changes <- Git.runGitAt remoteIndex ["diff", "--name-status", oldHead, newHead]
+    case changes of
+        (ExitSuccess, out, _) -> do
+            let parsedChanges = parseFilesystemDiffOutput out
+            forM_ parsedChanges $ \(status, path, mNewPath) -> case status of
+                'A' -> filesystemCopyFileToRemote localRoot remotePath remoteIndex path
+                'M' -> filesystemCopyFileToRemote localRoot remotePath remoteIndex path
+                'D' -> filesystemDeleteFileAtRemote remotePath path
+                'R' -> case mNewPath of
+                    Just newPath -> do
+                        filesystemDeleteFileAtRemote remotePath path
+                        filesystemCopyFileToRemote localRoot remotePath remoteIndex newPath
+                    Nothing -> return ()
+                _ -> return ()
+        _ -> return ()
+
+-- | Copy a file from local to remote (handles both text and binary).
+filesystemCopyFileToRemote :: FilePath -> FilePath -> FilePath -> FilePath -> IO ()
+filesystemCopyFileToRemote localRoot remotePath remoteIndex path = do
+    -- Check if it's a text file (content in index)
+    let metaPath = remoteIndex </> path
+    exists <- Dir.doesFileExist metaPath
+    if exists
+        then do
+            -- Text file: copy from remote index to remote working tree
+            let workPath = remotePath </> path
+            createDirectoryIfMissing True (takeDirectory workPath)
+            copyFile metaPath workPath
+        else do
+            -- Binary file: copy from local working tree to remote working tree
+            let srcPath = localRoot </> path
+            let destPath = remotePath </> path
+            srcExists <- Dir.doesFileExist srcPath
+            when srcExists $ do
+                createDirectoryIfMissing True (takeDirectory destPath)
+                copyFile srcPath destPath
+
+-- | Delete a file at the remote working tree.
+filesystemDeleteFileAtRemote :: FilePath -> FilePath -> IO ()
+filesystemDeleteFileAtRemote remotePath path = do
+    let fullPath = remotePath </> path
+    exists <- Dir.doesFileExist fullPath
+    when exists $ Dir.removeFile fullPath
+
+-- | Parse git diff --name-status output for filesystem operations.
+parseFilesystemDiffOutput :: String -> [(Char, FilePath, Maybe FilePath)]
+parseFilesystemDiffOutput = mapMaybe parseLine . lines
+  where
+    parseLine line = case line of
+        (status:rest)
+            | status == 'R' || status == 'C' ->
+                case words (dropWhile (\c -> c /= '\t' && c /= ' ') rest) of
+                    (old:new:_) -> Just (status, old, Just new)
+                    _ -> Nothing
+            | status `elem` ("ADM" :: String) ->
+                case words rest of
+                    (path:_) -> Just (status, path, Nothing)
+                    _ -> Nothing
+            | otherwise -> Nothing
+        _ -> Nothing
+
+-- | Pull from a filesystem remote. Fetches directly from the remote's .bit/index/.git.
+filesystemPull :: FilePath -> Remote -> PullOptions -> IO ()
+filesystemPull cwd remote opts = do
+    let remotePath = remoteUrl remote
+    putStrLn $ "Pulling from filesystem remote: " ++ remotePath
+    
+    -- Check if remote has .bit/ directory
+    let remoteBitDir = remotePath </> ".bit"
+    remoteHasBit <- Dir.doesDirectoryExist remoteBitDir
+    unless remoteHasBit $ do
+        hPutStrLn stderr "error: Remote is not a bit repository."
+        exitWith (ExitFailure 1)
+    
+    -- 1. Fetch remote into local
+    let remoteIndexGit = remotePath </> ".bit" </> "index" </> ".git"
+    let localIndex = cwd </> ".bit" </> "index"
+    
+    putStrLn "Fetching remote commits..."
+    (fetchCode, fetchOut, fetchErr) <- Git.runGitWithOutput 
+        ["fetch", remoteIndexGit, "main:refs/remotes/origin/main"]
+    
+    when (fetchCode /= ExitSuccess) $ do
+        hPutStrLn stderr $ "Error fetching from remote: " ++ fetchErr
+        exitWith fetchCode
+    
+    -- Output fetch results similar to cloud pull
+    hPutStrLn stderr $ "From " ++ remoteName remote
+    hPutStrLn stderr $ " * [new branch]      main       -> origin/main"
+    
+    -- 2. Set up tracking (if not already)
+    void $ Git.runGitWithOutput ["config", "branch.main.remote", "origin"]
+    void $ Git.runGitWithOutput ["config", "branch.main.merge", "refs/heads/main"]
+    
+    -- 3. Get remote HEAD hash
+    (remoteHeadCode, remoteHeadOut, _) <- Git.runGitWithOutput ["rev-parse", "refs/remotes/origin/main"]
+    when (remoteHeadCode /= ExitSuccess) $ do
+        hPutStrLn stderr "Error: Could not get remote HEAD"
+        exitWith (ExitFailure 1)
+    
+    let remoteHash = filter (not . isSpace) remoteHeadOut
+    
+    -- 4. Merge locally using existing logic
+    if pullAcceptRemote opts
+        then filesystemPullAcceptRemote cwd remotePath remoteHash
+        else filesystemPullNormal cwd remotePath remoteHash
+
+-- | Pull with --accept-remote for filesystem remotes.
+filesystemPullAcceptRemote :: FilePath -> FilePath -> String -> IO ()
+filesystemPullAcceptRemote cwd remotePath remoteHash = do
+    putStrLn "Accepting remote file state as truth..."
+    
+    -- Record current HEAD before checkout
+    oldHead <- getLocalHeadE
+    
+    -- Force-checkout the remote branch
+    checkoutCode <- Git.checkoutRemoteAsMain
+    if checkoutCode /= ExitSuccess
+        then do
+            hPutStrLn stderr "Error: Failed to checkout remote state."
+            exitWith (ExitFailure 1)
+        else do
+            -- Sync actual files based on what changed
+            case oldHead of
+                Just oh -> filesystemApplyMergeToWorkingDir cwd remotePath oh remoteHash
+                Nothing -> filesystemSyncRemoteFilesToLocal cwd remotePath remoteHash
+            
+            -- Update tracking ref
+            void $ Git.updateRemoteTrackingBranchToHash remoteHash
+            putStrLn "Pull with --accept-remote completed."
+
+-- | Normal pull for filesystem remotes (with merge).
+filesystemPullNormal :: FilePath -> FilePath -> String -> IO ()
+filesystemPullNormal cwd remotePath remoteHash = do
+    oldHash <- getLocalHeadE
+    
+    case oldHash of
+        Nothing -> do
+            -- First pull: just checkout remote
+            putStrLn $ "Checking out " ++ take 7 remoteHash ++ " (first pull)"
+            checkoutCode <- Git.checkoutRemoteAsMain
+            if checkoutCode == ExitSuccess
+                then do
+                    filesystemSyncRemoteFilesToLocal cwd remotePath remoteHash
+                    putStrLn "Syncing binaries... done."
+                else do
+                    hPutStrLn stderr "Error: Failed to checkout remote branch."
+                    exitWith (ExitFailure 1)
+        
+        Just localHash -> do
+            -- Subsequent pull: merge
+            (mergeCode, mergeOut, mergeErr) <- Git.runGitWithOutput 
+                ["merge", "--no-commit", "--no-ff", "refs/remotes/origin/main"]
+            
+            (finalMergeCode, finalMergeOut, finalMergeErr) <-
+                if mergeCode /= ExitSuccess && "refusing to merge unrelated histories" `List.isInfixOf` (mergeOut ++ mergeErr)
+                then do
+                    putStrLn "Merging unrelated histories..."
+                    Git.runGitWithOutput ["merge", "--no-commit", "--no-ff", "--allow-unrelated-histories", "refs/remotes/origin/main"]
+                else return (mergeCode, mergeOut, mergeErr)
+            
+            if finalMergeCode == ExitSuccess
+                then do
+                    putStrLn $ "Updating " ++ take 7 localHash ++ ".." ++ take 7 remoteHash
+                    putStrLn "Merge made by the 'recursive' strategy."
+                    hasChanges <- hasStagedChangesE
+                    when hasChanges $ void $ Git.runGitRaw ["commit", "-m", "Merge remote"]
+                    filesystemApplyMergeToWorkingDir cwd remotePath localHash remoteHash
+                    putStrLn "Syncing binaries... done."
+                    void $ Git.updateRemoteTrackingBranchToHash remoteHash
+                else do
+                    putStrLn finalMergeOut
+                    hPutStrLn stderr finalMergeErr
+                    putStrLn "Automatic merge failed."
+                    putStrLn "bit requires you to pick a version for each conflict."
+                    putStrLn ""
+                    putStrLn "Resolving conflicts..."
+                    
+                    conflicts <- Conflict.getConflictedFilesE
+                    resolutions <- Conflict.resolveAll conflicts
+                    let total = length resolutions
+                    
+                    invalid <- Metadata.validateMetadataDir (cwd </> bitIndexPath)
+                    unless (null invalid) $ do
+                        void $ Git.runGitRaw ["merge", "--abort"]
+                        hPutStrLn stderr "fatal: Metadata files contain conflict markers. Merge aborted."
+                        throwIO (userError "Invalid metadata")
+                    
+                    conflictsNow <- Conflict.getConflictedFilesE
+                    if null conflictsNow
+                        then do
+                            void $ Git.runGitRaw ["commit", "-m", "Merge remote (resolved " ++ show total ++ " conflict(s))"]
+                            putStrLn $ "Merge complete. " ++ show total ++ " conflict(s) resolved."
+                            filesystemApplyMergeToWorkingDir cwd remotePath localHash remoteHash
+                            putStrLn "Syncing binaries... done."
+                            void $ Git.updateRemoteTrackingBranchToHash remoteHash
+                        else return ()
+
+-- | Sync all files from remote to local based on commit hash (first pull).
+filesystemSyncRemoteFilesToLocal :: FilePath -> FilePath -> String -> IO ()
+filesystemSyncRemoteFilesToLocal localRoot remotePath commitHash = do
+    let localIndex = localRoot </> ".bit" </> "index"
+    (code, out, _) <- Git.runGitWithOutput ["ls-tree", "-r", "--name-only", commitHash]
+    when (code == ExitSuccess) $ do
+        let paths = filter (not . null) (lines out)
+        forM_ paths $ \path -> do
+            -- Check if it's a text file (content in index) or binary
+            let metaPath = localIndex </> path
+            exists <- Dir.doesFileExist metaPath
+            if exists
+                then do
+                    -- Text file: copy from local index to local working tree
+                    let workPath = localRoot </> path
+                    createDirectoryIfMissing True (takeDirectory workPath)
+                    copyFile metaPath workPath
+                else do
+                    -- Binary file: copy from remote working tree to local working tree
+                    let srcPath = remotePath </> path
+                    let destPath = localRoot </> path
+                    srcExists <- Dir.doesFileExist srcPath
+                    when srcExists $ do
+                        createDirectoryIfMissing True (takeDirectory destPath)
+                        copyFile srcPath destPath
+
+-- | Apply merge changes to working directory for filesystem pull.
+filesystemApplyMergeToWorkingDir :: FilePath -> FilePath -> String -> String -> IO ()
+filesystemApplyMergeToWorkingDir localRoot remotePath oldHead newHead = do
+    changes <- Git.getDiffNameStatus oldHead newHead
+    putStrLn "--- Pulling changes from remote ---"
+    if null changes
+        then putStrLn "Working tree already up to date with remote."
+        else do
+            forM_ changes $ \(status, path, mNewPath) -> case status of
+                'A' -> filesystemDownloadOrCopyFromIndex localRoot remotePath path
+                'M' -> filesystemDownloadOrCopyFromIndex localRoot remotePath path
+                'D' -> safeDeleteWorkFile localRoot path
+                'R' -> case mNewPath of
+                    Just newPath -> do
+                        safeDeleteWorkFile localRoot path
+                        filesystemDownloadOrCopyFromIndex localRoot remotePath newPath
+                    Nothing -> return ()
+                _ -> return ()
+
+-- | Download a file from remote or copy from index for filesystem pull.
+filesystemDownloadOrCopyFromIndex :: FilePath -> FilePath -> FilePath -> IO ()
+filesystemDownloadOrCopyFromIndex localRoot remotePath path = do
+    fromIndex <- isTextFileInIndex localRoot path
+    if fromIndex
+        then copyFromIndexToWorkTree localRoot path
+        else do
+            -- Binary file: copy from remote working tree
+            let srcPath = remotePath </> path
+            let destPath = localRoot </> path
+            srcExists <- Dir.doesFileExist srcPath
+            when srcExists $ do
+                createDirectoryIfMissing True (takeDirectory destPath)
+                copyFile srcPath destPath
 
 -- | Executes/Prints the command to be run in the shell (push: local -> remote).
 executeCommand :: FilePath -> Remote -> RcloneAction -> IO ()
@@ -3958,6 +4357,7 @@ module Internal.Git
     , checkoutTheirs
     , runGitRaw
     , runGitWithOutput
+    , runGitAt
     , ConflictType(..)
     , readFileFromRef
     , listFilesInRef
@@ -4372,6 +4772,12 @@ getFilesAtCommit ref = do
     (code, out, _) <- runGitWithOutput ["ls-tree", "-r", "--name-only", ref]
     if code /= ExitSuccess then return []
     else return (filter (not . null) (lines out))
+
+-- | Run a git command targeting a specific index path (for filesystem remotes).
+-- This is used when operating on a remote filesystem repo directly.
+-- The indexPath should be the path to the .bit/index directory (NOT the .git subdirectory).
+runGitAt :: FilePath -> [String] -> IO (ExitCode, String, String)
+runGitAt indexPath args = readProcessWithExitCode "git" (["-C", indexPath] ++ args) ""
 
 ```
 
