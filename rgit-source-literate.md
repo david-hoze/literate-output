@@ -582,12 +582,14 @@ mergeContinue = do
                 (code, _, _) <- liftIO $ Git.runGitWithOutput ["rev-parse", "--verify", "MERGE_HEAD"]
                 if code == ExitSuccess
                     then do
+                        oldHead <- liftIO getLocalHeadE
                         liftIO $ void $ Git.runGitRaw ["commit", "-m", "Merge remote"]
                         liftIO $ putStrLn "Merge complete."
-                        maybe (return ()) (\_ -> do
+                        maybe (return ()) (\remote -> do
                             liftIO $ putStrLn "Syncing binaries... done."
-                            syncRemoteFilesToLocal
-                            liftIO $ updateMetadataAfterSync cwd
+                            case oldHead of
+                                Just oh -> applyMergeToWorkingDir remote oh
+                                Nothing -> syncRemoteFilesToLocal  -- fallback
                             maybeRemoteHash <- liftIO $ Git.getHashFromBundle fetchedBundle
                             case maybeRemoteHash of
                                 Just rHash -> liftIO $ void $ Git.updateRemoteTrackingBranchToHash rHash
@@ -601,6 +603,7 @@ mergeContinue = do
                     liftIO $ hPutStrLn stderr "fatal: Metadata files contain conflict markers. Merge aborted."
                     liftIO $ throwIO (userError "Invalid metadata")
 
+                oldHead <- liftIO getLocalHeadE
                 (code, _, _) <- liftIO $ Git.runGitWithOutput ["rev-parse", "--verify", "MERGE_HEAD"]
                 when (code /= ExitSuccess) $ do
                     (mergeCode, _, _) <- liftIO $ Git.runGitWithOutput ["merge", "--no-commit", "--no-ff", "refs/remotes/origin/main"]
@@ -613,10 +616,11 @@ mergeContinue = do
                 liftIO $ removeDirectoryRecursive conflictsDir
                 liftIO $ putStrLn "Conflict directories cleaned up."
 
-                maybe (return ()) (\_ -> do
+                maybe (return ()) (\remote -> do
                     liftIO $ putStrLn "Syncing binaries... done."
-                    syncRemoteFilesToLocal
-                    liftIO $ updateMetadataAfterSync cwd
+                    case oldHead of
+                        Just oh -> applyMergeToWorkingDir remote oh
+                        Nothing -> syncRemoteFilesToLocal  -- fallback
                     maybeRemoteHash <- liftIO $ Git.getHashFromBundle fetchedBundle
                     case maybeRemoteHash of
                         Just rHash -> liftIO $ void $ Git.updateRemoteTrackingBranchToHash rHash
@@ -972,19 +976,50 @@ syncRemoteFilesToLocal = withRemote $ \remote -> do
                 else mapM_ (\a -> lift $ executePullCommand cwd remote a) actions)
         remoteResult
 
--- | Update metadata files after syncing binaries from remote.
--- Rescans working directory and commits the updated metadata.
-updateMetadataAfterSync :: FilePath -> IO ()
-updateMetadataAfterSync cwd = do
-    -- Rescan working directory to get updated file hashes after binary sync
-    updatedFiles <- Scan.scanWorkingDir cwd
-    -- Write updated metadata files to .rgit/index
-    Scan.writeMetadataFiles cwd updatedFiles
-    -- Add and commit the updated metadata (if there are changes)
-    Git.add ["."]
-    -- Only commit if there are staged changes to avoid "nothing to commit" error
-    hasChanges <- Git.hasStagedChanges
-    when hasChanges $ void $ Git.commit ["-m", "Update metadata after syncing binaries"]
+-- | After a merge, mirror git's metadata changes onto the actual working directory.
+-- Uses `git diff --name-status oldHead newHead` to determine what changed,
+-- then downloads/deletes/moves actual files accordingly.
+-- This replaces syncRemoteFilesToLocal for merge pulls.
+applyMergeToWorkingDir :: Remote -> String -> RgitM ()
+applyMergeToWorkingDir remote oldHead = do
+    cwd <- asks envCwd
+    newHead <- liftIO getLocalHeadE
+    case newHead of
+        Nothing -> return ()  -- shouldn't happen after merge commit
+        Just newH -> do
+            changes <- liftIO $ Git.getDiffNameStatus oldHead newH
+            liftIO $ putStrLn "--- Pulling changes from remote ---"
+            if null changes
+                then liftIO $ putStrLn "Working tree already up to date with remote."
+                else do
+                    forM_ changes $ \(status, path, mNewPath) -> case status of
+                        'A' -> liftIO $ downloadOrCopyFromIndex cwd remote path
+                        'M' -> liftIO $ downloadOrCopyFromIndex cwd remote path
+                        'D' -> liftIO $ safeDeleteWorkFile cwd path
+                        'R' -> case mNewPath of
+                            Just newPath -> do
+                                liftIO $ safeDeleteWorkFile cwd path
+                                liftIO $ downloadOrCopyFromIndex cwd remote newPath
+                            Nothing -> return ()
+                        _ -> return ()  -- ignore unknown statuses
+
+-- | Download a file from remote, or copy from index if it's a text file.
+downloadOrCopyFromIndex :: FilePath -> Remote -> FilePath -> IO ()
+downloadOrCopyFromIndex cwd remote path = do
+    fromIndex <- isTextFileInIndex cwd path
+    if fromIndex
+        then copyFromIndexToWorkTree cwd path
+        else do
+            let localPath = cwd </> path
+            createDirectoryIfMissing True (takeDirectory localPath)
+            void $ Transport.copyFromRemote remote (toPosix path) (toPosix localPath)
+
+-- | Safely delete a file from the working directory.
+safeDeleteWorkFile :: FilePath -> FilePath -> IO ()
+safeDeleteWorkFile cwd path = do
+    let fullPath = cwd </> path
+    exists <- Dir.doesFileExist fullPath
+    when exists $ Dir.removeFile fullPath
 
 -- | Old showRemoteStatus logic: classify remote, fetch bundle if valid rgit.
 -- Returns the temp bundle path on success, Nothing otherwise.
@@ -1101,7 +1136,6 @@ pullAcceptRemoteImpl remote = do
             when hasChanges $ lift $ void $ gitRaw ["commit", "-m", "Accept remote file state as truth"]
             lift $ tell "Syncing files from remote..."
             syncRemoteFilesToLocal
-            lift $ updateMetadataAfterSync cwd
             maybeRemoteHash <- lift $ Git.getHashFromBundle fetchedBundle
             case maybeRemoteHash of
                 Just rHash -> lift $ void $ Git.updateRemoteTrackingBranchToHash rHash
@@ -1290,9 +1324,8 @@ pullLogic remote = do
                         lift $ tell "Merge made by the 'recursive' strategy."
                         hasChanges <- lift hasStagedChangesE
                         when hasChanges $ lift $ void $ gitRaw ["commit", "-m", "Merge remote"]
-                        syncRemoteFilesToLocal
+                        applyMergeToWorkingDir remote localHead
                         lift $ tell "Syncing binaries... done."
-                        lift $ updateMetadataAfterSync cwd
                         maybeRemoteHash <- lift $ Git.getHashFromBundle fetchedBundle
                         case maybeRemoteHash of
                             Just rHash -> lift $ void $ Git.updateRemoteTrackingBranchToHash rHash
@@ -1316,19 +1349,21 @@ pullLogic remote = do
                             lift $ throwIO (userError "Invalid metadata")
 
                         conflictsNow <- lift Conflict.getConflictedFilesE
-                        when (null conflictsNow) $ do
+                        if null conflictsNow
+                        then do
                             hasChanges <- lift hasStagedChangesE
                             when hasChanges $ lift $ do
                                 void $ gitRaw ["commit", "-m", "Merge remote (resolved " ++ show total ++ " conflict(s))"]
                                 tell $ "Merge complete. " ++ show total ++ " conflict(s) resolved."
-                        syncRemoteFilesToLocal
-                        lift $ tell "Syncing binaries... done."
-                        lift $ updateMetadataAfterSync cwd
-                        when (null conflictsNow) $ do
+                            -- After auto-resolution, files are already in correct state (we chose local/remote versions)
+                            -- Still need to sync any files that changed on remote but weren't in conflict
+                            applyMergeToWorkingDir remote localHead
+                            lift $ tell "Syncing binaries... done."
                             maybeRemoteHash <- lift $ Git.getHashFromBundle fetchedBundle
                             case maybeRemoteHash of
                                 Just rHash -> lift $ void $ Git.updateRemoteTrackingBranchToHash rHash
                                 Nothing    -> return ()
+                        else return ()  -- Still have unresolved conflicts, don't sync files yet
 
 printVerifyIssue :: (String -> String) -> Verify.VerifyIssue -> IO ()
 printVerifyIssue fmtHash = \case
@@ -1742,6 +1777,8 @@ module Internal.Git
     , listFilesInRef
     , fsck
     , hasStagedChanges
+    , getDiffNameStatus
+    , getFilesAtCommit
     ) where
 
 import Data.List (lines)
@@ -2116,6 +2153,39 @@ hasStagedChanges :: IO Bool
 hasStagedChanges = do
   (code, _, _) <- runGitWithOutput ["diff", "--cached", "--quiet"]
   return (code == ExitFailure 1)  -- git diff --cached --quiet exits with 1 if there are changes
+
+-- | Get the list of file changes between two commits.
+-- Returns list of (status, path, maybe-new-path-for-renames).
+-- Status: 'A' = added, 'D' = deleted, 'M' = modified, 'R' = renamed.
+getDiffNameStatus :: String -> String -> IO [(Char, FilePath, Maybe FilePath)]
+getDiffNameStatus oldHead newHead = do
+    (code, out, _) <- runGitWithOutput ["diff", "--name-status", oldHead, newHead]
+    if code /= ExitSuccess then return []
+    else return (parseNameStatus out)
+
+parseNameStatus :: String -> [(Char, FilePath, Maybe FilePath)]
+parseNameStatus = mapMaybe parseLine . lines
+  where
+    parseLine line = case line of
+        (status:rest)
+            | status == 'R' || status == 'C' ->
+                -- R100\told\tnew or Rnnn old new (tab-separated)
+                case words (dropWhile (\c -> c /= '\t' && c /= ' ') rest) of
+                    (old:new:_) -> Just (status, old, Just new)
+                    _ -> Nothing
+            | status `elem` "ADM" ->
+                case words rest of
+                    (path:_) -> Just (status, path, Nothing)
+                    _ -> Nothing
+            | otherwise -> Nothing
+        _ -> Nothing
+
+-- | Get all file paths at a given commit. Used when there's no old HEAD to diff against.
+getFilesAtCommit :: String -> IO [FilePath]
+getFilesAtCommit ref = do
+    (code, out, _) <- runGitWithOutput ["ls-tree", "-r", "--name-only", ref]
+    if code /= ExitSuccess then return []
+    else return (filter (not . null) (lines out))
 
 ```
 
