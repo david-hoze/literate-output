@@ -1118,29 +1118,43 @@ saveFetchedBundle remote (Just bPath) = do
 
 -- | Pull with --accept-remote: accept remote file state as truth.
 -- Scans actual remote files, updates local metadata to match, syncs files, and commits.
+-- | Pull with --accept-remote: force-checkout the remote branch, then sync files.
+-- Git manages .rgit/index/ (the metadata); we only sync actual files to the working tree.
 pullAcceptRemoteImpl :: Remote -> RgitM ()
 pullAcceptRemoteImpl remote = do
     cwd <- asks envCwd
     lift $ tell "Accepting remote file state as truth..."
-    lift $ tell "Scanning remote files..."
 
-    result <- lift $ Remote.Scan.fetchRemoteFiles remote
-    case result of
-        Left _ -> lift $ tellErr "Error: Failed to fetch remote file list."
-        Right remoteFiles -> do
-            let filteredRemoteFiles = filterOutRgitPaths remoteFiles
-            lift $ tell "Updating local metadata to match remote state..."
-            lift $ Scan.writeMetadataFiles cwd filteredRemoteFiles
-            lift $ void $ gitRaw ["add", "."]
-            hasChanges <- lift hasStagedChangesE
-            when hasChanges $ lift $ void $ gitRaw ["commit", "-m", "Accept remote file state as truth"]
-            lift $ tell "Syncing files from remote..."
-            syncRemoteFilesToLocal
-            maybeRemoteHash <- lift $ Git.getHashFromBundle fetchedBundle
-            case maybeRemoteHash of
-                Just rHash -> lift $ void $ Git.updateRemoteTrackingBranchToHash rHash
-                Nothing    -> return ()
-            lift $ tell "Pull with --accept-remote completed."
+    -- 1. Fetch the remote bundle so git has the remote's history
+    maybeBundlePath <- lift $ fetchRemoteBundle remote
+    case maybeBundlePath of
+        Nothing -> lift $ tellErr "Error: Could not fetch remote bundle."
+        Just bPath -> do
+            lift $ saveFetchedBundle remote (Just bPath)
+
+            -- 2. Record current HEAD before checkout (for diff-based sync)
+            oldHead <- lift getLocalHeadE
+
+            -- 3. Force-checkout the remote branch.
+            --    This makes .rgit/index/ match the remote's metadata exactly:
+            --    text files get actual content, binary files get hash/size.
+            lift $ tell "Scanning remote files..."
+            checkoutCode <- lift Git.checkoutRemoteAsMain
+            if checkoutCode /= ExitSuccess
+                then lift $ tellErr "Error: Failed to checkout remote state."
+                else do
+                    -- 4. Sync actual files to working tree based on what changed in git
+                    case oldHead of
+                        Just oh -> applyMergeToWorkingDir remote oh
+                        Nothing -> syncRemoteFilesToLocal  -- First time, no diff available
+
+                    -- 5. Update tracking ref
+                    maybeRemoteHash <- lift $ Git.getHashFromBundle fetchedBundle
+                    case maybeRemoteHash of
+                        Just rHash -> lift $ void $ Git.updateRemoteTrackingBranchToHash rHash
+                        Nothing    -> return ()
+
+                    lift $ tell "Pull with --accept-remote completed."
 
 -- | Pull with --manual-merge: detect remote divergence and create conflict directories.
 pullManualMergeImpl :: Remote -> RgitM ()
@@ -1351,8 +1365,12 @@ pullLogic remote = do
                         conflictsNow <- lift Conflict.getConflictedFilesE
                         if null conflictsNow
                         then do
-                            hasChanges <- lift hasStagedChangesE
-                            when hasChanges $ lift $ do
+                            -- Always commit: MERGE_HEAD exists so git commit succeeds
+                            -- even when the index matches HEAD (e.g. user chose "keep local"
+                            -- and the resolved version is identical to HEAD's tree).
+                            -- Skipping this leaves MERGE_HEAD dangling and makes the next
+                            -- push fail its ancestry check.
+                            lift $ do
                                 void $ gitRaw ["commit", "-m", "Merge remote (resolved " ++ show total ++ " conflict(s))"]
                                 tell $ "Merge complete. " ++ show total ++ " conflict(s) resolved."
                             -- After auto-resolution, files are already in correct state (we chose local/remote versions)
