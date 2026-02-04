@@ -241,8 +241,8 @@ past the merge).
 | `bit remote add <name> <url>` | `git remote add` | Set named remote URL |
 | `bit remote show [name]` | `git remote show` | Show remote status |
 | `bit remote check [name]` | Γאפ | Check remote connectivity and state |
-| `bit push` | `git push` | Push metadata bundle + sync files via rclone |
-| `bit pull` | `git pull` | Pull metadata bundle + sync files via rclone |
+| `bit push` | `git push` | Cloud: push metadata bundle + sync files via rclone. Filesystem: fetch+merge at remote + sync files |
+| `bit pull` | `git pull` | Cloud: fetch metadata bundle + sync files via rclone. Filesystem: fetch from remote + merge + sync files |
 | `bit pull --accept-remote` | Γאפ | Accept remote file state as truth |
 | `bit pull --manual-merge` | Γאפ | Interactive per-file conflict resolution |
 | `bit fetch` | `git fetch` | Fetch metadata bundle only |
@@ -284,8 +284,8 @@ This saves bandwidth. For example: renaming a 1GB file becomes `rclone moveto` i
 
 bit supports two kinds of remotes:
 
-- **Cloud remotes**: rclone-based (e.g., `gdrive:Projects/foo`). Identified by URL.
-- **Filesystem remotes**: Local/network paths. Use device-identity resolution via UUID + hardware serial.
+- **Cloud remotes**: rclone-based (e.g., `gdrive:Projects/foo`). Identified by URL. Uses bundle + rclone sync.
+- **Filesystem remotes**: Local/network paths (USB drives, network shares, local directories). Creates a **full bit repository** at the remote location.
 
 The `bit.Device` module handles filesystem remote resolution:
 - Physical storage: Identified by UUID + hardware serial (survives drive letter changes)
@@ -298,6 +298,97 @@ The `bit.Remote` module provides the `Remote` type which abstracts over both:
 resolveRemote :: FilePath -> String -> IO (Maybe Remote)
 -- Tries .bit/remotes/<name> (device-aware), falls back to git config
 ```
+
+### Transport Strategies
+
+The transport strategy is determined by `RemoteTarget` classification:
+
+```
+Device.classifyRemotePath
+  Γפ£ΓפאΓפא TargetCloud    Γזע Cloud transport (bundle + rclone, existing flow)
+  Γפ£ΓפאΓפא TargetDevice   Γזע Filesystem transport (full repo at remote)
+  ΓפפΓפאΓפא TargetLocalPath Γזע Filesystem transport (full repo at remote)
+```
+
+#### Cloud Transport (Bundle + Rclone)
+
+For cloud remotes (Google Drive, S3, etc.), bit uses **dumb storage**:
+- Metadata is serialized as a Git bundle and uploaded via rclone
+- Files are synced via rclone copy/move/delete operations
+- The remote is just a directory of files Γאפ no Git repo, no bit commands work there
+
+#### Filesystem Transport (Full Repo)
+
+For filesystem remotes, bit creates a **complete bit repository** at the remote:
+- The remote has `.bit/index/.git/` just like a local repo
+- Anyone at the remote location can run `bit status`, `bit log`, `bit commit`, etc.
+- No bundles needed Γאפ Git can talk directly repo-to-repo via `git fetch /path/to/other/.bit/index/.git/`
+
+**Key insight**: Bundles exist to serialize git history over dumb transports that can only copy files. With filesystem access, git speaks its native protocol.
+
+#### Filesystem Push Flow
+
+```
+filesystemPush :: FilePath -> Remote -> IO ()
+```
+
+1. **First push (no `.bit/` at remote)**: Initialize a bit repo at the remote via `initializeRepoAt`
+2. **Fetch local into remote**: `git -C remote/.bit/index fetch local/.bit/index/.git main:refs/remotes/origin/main`
+3. **Fast-forward check**: Verify remote HEAD is ancestor of what we're pushing (`git merge-base --is-ancestor`)
+4. **Merge at remote**: `git -C remote/.bit/index merge --ff-only refs/remotes/origin/main`
+5. **Sync files**: Copy changed files from local working tree to remote working tree
+   - Text files: Copy from remote's updated index (git put the content there)
+   - Binary files: Copy from local working tree (metadata in index, content in working tree)
+6. **Update tracking ref**: Set local `refs/remotes/origin/main` to current HEAD
+
+If the fast-forward check fails, the remote has diverged:
+```
+error: Remote has local commits that you don't have.
+hint: Run 'bit pull' to merge remote changes first, then push again.
+```
+
+#### Filesystem Pull Flow
+
+```
+filesystemPull :: FilePath -> Remote -> PullOptions -> IO ()
+```
+
+1. **Fetch remote into local**: `git -C local/.bit/index fetch remote/.bit/index/.git main:refs/remotes/origin/main`
+2. **Set up tracking**: Configure `branch.main.remote` and `branch.main.merge`
+3. **Merge locally**: Reuse existing merge logic (handles unborn branch, conflicts, `--accept-remote`)
+4. **Sync files**: Copy changed files from remote working tree to local working tree
+   - Text files: Copy from local index (git merged the content there)
+   - Binary files: Copy from remote working tree
+5. **Update tracking ref**: Set `refs/remotes/origin/main` to the remote's HEAD hash
+
+The merge follows the same patterns as cloud pull:
+- First pull (unborn branch): `checkoutRemoteAsMain` then sync all files
+- Normal: `git merge --no-commit --no-ff` then `applyMergeToWorkingDir`
+- Conflicts: Same `Conflict.resolveAll` flow with (l)ocal/(r)emote choices
+- `--accept-remote`: Force-checkout then sync files
+
+#### Text vs Binary File Sync
+
+For filesystem remotes, file sync distinguishes text from binary by examining the metadata file content:
+
+```haskell
+isTextMetadataFile :: FilePath -> IO Bool
+-- Returns True if file exists and does NOT contain "hash: " line
+-- Text files: metadata IS the content (stored directly in index)
+-- Binary files: metadata contains "hash: " and "size: " (pointer to actual file)
+```
+
+- **Text files**: Content lives in `.bit/index/path`. After git merge/checkout, copy from index to working tree.
+- **Binary files**: Content lives in working tree. Copy from source working tree to destination working tree.
+
+#### The `git push` Antipattern
+
+Do NOT use `git push` to a non-bare repo. Git refuses to update the checked-out branch:
+```
+error: refusing to update checked-out branch: refs/heads/main
+```
+
+The correct approach: Have the remote **fetch** from local, then **merge --ff-only**. This is what filesystem push does.
 
 ---
 
@@ -403,6 +494,20 @@ Interactive per-file conflict resolution:
     `mergeContinue`, and `pullAcceptRemoteImpl`. The only exception is first
     pull (`oldHead = Nothing`), which falls back to `syncRemoteFilesToLocal`.
 
+11. **Transport strategy split**: Push and pull dispatch based on `RemoteTarget`
+    classification. Cloud remotes use bundle + rclone (dumb storage). Filesystem
+    remotes use direct git fetch/merge (smart storage Γאפ full bit repo at remote).
+    This split is keyed off `Device.classifyRemotePath` and happens in
+    `Bit.Core.push` and `Bit.Core.pull`. The cloud path is unchanged; filesystem
+    path uses `filesystemPush`/`filesystemPull` which leverage `runGitAt` for
+    running git commands at arbitrary paths.
+
+12. **Filesystem remotes are full repos**: When pushing to a filesystem path,
+    bit creates a complete bit repository at the remote (via `initializeRepoAt`).
+    Anyone at that location can run bit commands directly. This is the natural
+    model for USB drives, network shares, and local collaboration directories.
+    Bundles are skipped entirely Γאפ git talks repo-to-repo via filesystem paths.
+
 ### What We Deliberately Do NOT Do
 
 - **`RemoteState` does not need a typed state machine.** The pattern match in push logic is clear and total.
@@ -445,8 +550,8 @@ Interactive per-file conflict resolution:
 - `bit add` Γאפ scans files, computes MD5 hashes, writes metadata, stages in Git
 - `bit commit`, `diff`, `status`, `log`, `restore`, `checkout`, `reset`, `rm`, `mv`, `branch`, `merge` Γאפ delegate to Git
 - `bit remote add/show/check` Γאפ named remotes with device-aware resolution
-- `bit push` Γאפ diff-based file sync via rclone, then push metadata bundle
-- `bit pull` Γאפ fetch metadata bundle, then diff-based file sync via `applyMergeToWorkingDir`
+- `bit push` Γאפ Cloud: diff-based file sync via rclone, then push metadata bundle. Filesystem: fetch+merge at remote, then sync files
+- `bit pull` Γאפ Cloud: fetch metadata bundle, then diff-based file sync via `applyMergeToWorkingDir`. Filesystem: fetch from remote, merge locally, sync files
 - `bit pull --accept-remote` Γאפ force-checkout remote branch, then mirror changes to working directory
 - `bit pull --manual-merge` Γאפ interactive per-file conflict resolution
 - `bit merge --continue / --abort` Γאפ merge lifecycle management
@@ -456,6 +561,7 @@ Interactive per-file conflict resolution:
 - `bit fsck` Γאפ full integrity check
 - Pipeline: pure diff Γזע plan Γזע action generation with property tests
 - Device-identity system for filesystem remotes (UUID + hardware serial)
+- Filesystem remote transport (full bit repo at remote, direct git fetch/merge)
 - Conflict resolution module with structured fold (always commits when MERGE_HEAD exists)
 - Unified metadata parsing/serialization
 - `oldHead` pattern for diff-based working-tree sync across all pull/merge paths
@@ -466,7 +572,7 @@ Interactive per-file conflict resolution:
 |--------|------|
 | `bit/Commands.hs` | CLI dispatch, env setup |
 | `Bit.hs` | All business logic |
-| `Internal/Git.hs` | Git command wrapper |
+| `Internal/Git.hs` | Git command wrapper (`runGitAt` for arbitrary paths) |
 | `Internal/Transport.hs` | Rclone command wrapper |
 | `Internal/Config.hs` | Path constants |
 | `bit/Types.hs` | Core types: Hash, FileEntry, BitEnv, BitM |
@@ -505,10 +611,13 @@ Interactive per-file conflict resolution:
   unchanged Γאפ e.g., "keep local" resolution)
 - Re-scan the working directory after sync to "fix" metadata (the index is
   already correct after the git operation; rescanning is redundant or harmful)
+- Use `git push` to a filesystem remote (git refuses to update checked-out
+  branches; use fetch+merge at the remote instead)
 
 **ALWAYS:**
 - Prefer `rclone moveto` over delete+upload when hash matches
-- Push files before metadata, pull metadata before files
+- Push files before metadata, pull metadata before files (cloud remotes)
+- For filesystem remotes, use fetch+merge (not `git push` to non-bare repos)
 - Use temp file + rename for atomic writes (aspiration Γאפ not yet everywhere)
 - Match Git's CLI conventions and output format
 - Keep Transport dumb Γאפ no domain knowledge in Transport
@@ -522,6 +631,7 @@ Interactive per-file conflict resolution:
   `--manual-merge`, `mergeContinue`) must update the index via git operations
   (merge, checkout), never by writing files directly
 - Always call `git commit` after conflict resolution when `MERGE_HEAD` exists
+- Update tracking ref after filesystem pull (same invariant as cloud pull)
 ```
 
 ---

@@ -67,6 +67,25 @@ runCommand args = do
     
     -- Only scan and write metadata if .bit directory exists (repo is initialized)
     bitExists <- Dir.doesDirectoryExist (cwd </> ".bit")
+    
+    -- Copy .bitignore to .bit/index/.gitignore before scan (if repo exists)
+    -- Using .gitignore directly since git check-ignore reads it automatically
+    -- Read and re-write to normalize line endings and remove trailing spaces
+    when (bitExists && not skipScan) $ do
+        let bitignoreSrc = cwd </> ".bitignore"
+        let bitignoreDest = cwd </> ".bit" </> "index" </> ".gitignore"
+        bitignoreExists <- Dir.doesFileExist bitignoreSrc
+        if bitignoreExists
+            then do
+                content <- readFile bitignoreSrc
+                -- Normalize: trim each line, remove empty lines, use LF endings
+                let normalizedLines = filter (not . null) $ map (dropWhile (== ' ') . reverse . dropWhile (== ' ') . reverse . filter (/= '\r')) (lines content)
+                writeFile bitignoreDest (unlines normalizedLines)
+            else do
+                -- Remove stale .gitignore if root .bitignore doesn't exist
+                destExists <- Dir.doesFileExist bitignoreDest
+                when destExists $ Dir.removeFile bitignoreDest
+    
     localFiles <- if skipScan || not bitExists then return [] else Scan.scanWorkingDir cwd
     unless (skipScan || not bitExists) $ Scan.writeMetadataFiles cwd localFiles
     mRemote <- getDefaultRemote cwd
@@ -498,6 +517,9 @@ initializeRepoAt targetDir = do
     void $ Git.runGitAt targetBitIndexPath ["config", "merge.bit-metadata.driver", "false"]
     Dir.createDirectoryIfMissing True (targetBitGitDir </> "info")
     writeFile (targetBitGitDir </> "info" </> "attributes") "* merge=bit-metadata -text\n"
+
+    -- 5c. The .git/info/exclude file is created in Commands.hs from .bitignore
+    -- (this happens before each scan, not during init)
 
     -- Note: We do NOT create an initial commit here.
     -- This keeps the repo empty until first real commit or pull.
@@ -1117,17 +1139,18 @@ filesystemSyncAllFiles localRoot remotePath commitHash = do
         (ExitSuccess, out, _) -> do
             let paths = filter (not . null) (lines out)
             forM_ paths $ \path -> do
-                -- Check if it's a text file (content in index) or binary (needs copy from local)
+                -- Check if it's a text file (content in index) or binary (hash/size in index)
+                -- After git merge, ALL metadata files exist - we need to check content
                 let metaPath = remoteIndex </> path
-                exists <- Dir.doesFileExist metaPath
-                if exists
+                isText <- isTextMetadataFile metaPath
+                if isText
                     then do
-                        -- Text file: copy from remote index to remote working tree
+                        -- Text file: metadata IS the content, copy from remote index to working tree
                         let workPath = remotePath </> path
                         createDirectoryIfMissing True (takeDirectory workPath)
                         copyFile metaPath workPath
                     else do
-                        -- Binary file: copy from local working tree to remote working tree
+                        -- Binary file: metadata is hash/size, copy actual file from local working tree
                         let srcPath = localRoot </> path
                         let destPath = remotePath </> path
                         srcExists <- Dir.doesFileExist srcPath
@@ -1135,6 +1158,16 @@ filesystemSyncAllFiles localRoot remotePath commitHash = do
                             createDirectoryIfMissing True (takeDirectory destPath)
                             copyFile srcPath destPath
         _ -> return ()
+
+-- | Check if a metadata file is a text file (content stored directly) or binary (hash/size stored).
+-- Text files don't have "hash:" lines, binary files do.
+isTextMetadataFile :: FilePath -> IO Bool
+isTextMetadataFile metaPath = do
+    exists <- Dir.doesFileExist metaPath
+    if not exists then return False
+    else do
+        content <- readFile metaPath
+        return $ not (any ("hash: " `isPrefixOf`) (lines content))
 
 -- | Sync only changed files between two commits.
 filesystemSyncChangedFiles :: FilePath -> FilePath -> String -> String -> IO ()
@@ -1159,17 +1192,17 @@ filesystemSyncChangedFiles localRoot remotePath oldHead newHead = do
 -- | Copy a file from local to remote (handles both text and binary).
 filesystemCopyFileToRemote :: FilePath -> FilePath -> FilePath -> FilePath -> IO ()
 filesystemCopyFileToRemote localRoot remotePath remoteIndex path = do
-    -- Check if it's a text file (content in index)
+    -- Check if it's a text file (content in index) or binary (hash/size in index)
     let metaPath = remoteIndex </> path
-    exists <- Dir.doesFileExist metaPath
-    if exists
+    isText <- isTextMetadataFile metaPath
+    if isText
         then do
-            -- Text file: copy from remote index to remote working tree
+            -- Text file: metadata IS the content, copy from remote index to working tree
             let workPath = remotePath </> path
             createDirectoryIfMissing True (takeDirectory workPath)
             copyFile metaPath workPath
         else do
-            -- Binary file: copy from local working tree to remote working tree
+            -- Binary file: metadata is hash/size, copy actual file from local working tree
             let srcPath = localRoot </> path
             let destPath = remotePath </> path
             srcExists <- Dir.doesFileExist srcPath
@@ -1285,6 +1318,8 @@ filesystemPullNormal cwd remotePath remoteHash = do
                 then do
                     filesystemSyncRemoteFilesToLocal cwd remotePath remoteHash
                     putStrLn "Syncing binaries... done."
+                    -- Update tracking ref (Tracking Ref Invariant from spec)
+                    void $ Git.updateRemoteTrackingBranchToHash remoteHash
                 else do
                     hPutStrLn stderr "Error: Failed to checkout remote branch."
                     exitWith (ExitFailure 1)
@@ -1346,17 +1381,17 @@ filesystemSyncRemoteFilesToLocal localRoot remotePath commitHash = do
     when (code == ExitSuccess) $ do
         let paths = filter (not . null) (lines out)
         forM_ paths $ \path -> do
-            -- Check if it's a text file (content in index) or binary
+            -- Check if it's a text file (content in index) or binary (hash/size in index)
             let metaPath = localIndex </> path
-            exists <- Dir.doesFileExist metaPath
-            if exists
+            isText <- isTextMetadataFile metaPath
+            if isText
                 then do
-                    -- Text file: copy from local index to local working tree
+                    -- Text file: metadata IS the content, copy from local index to working tree
                     let workPath = localRoot </> path
                     createDirectoryIfMissing True (takeDirectory workPath)
                     copyFile metaPath workPath
                 else do
-                    -- Binary file: copy from remote working tree to local working tree
+                    -- Binary file: metadata is hash/size, copy actual file from remote working tree
                     let srcPath = remotePath </> path
                     let destPath = localRoot </> path
                     srcExists <- Dir.doesFileExist srcPath
@@ -3143,6 +3178,7 @@ doFsck cwd = do
 *Source file.*
 
 ```haskell
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE KindSignatures #-}
 module Bit.Internal.Metadata
@@ -3162,12 +3198,13 @@ module Bit.Internal.Metadata
 import Bit.Types (Hash(..), HashAlgo(..), hashToText)
 import System.Directory (doesFileExist, doesDirectoryExist, listDirectory)
 import System.FilePath ((</>))
+import System.IO (withFile, IOMode(ReadMode), hIsEOF)
 import Data.List (isPrefixOf, isInfixOf)
 import Data.Maybe (listToMaybe)
 import Control.Monad (filterM)
 import qualified Data.ByteString as BS
 import qualified Data.Text as T
-import Data.Text.Encoding (decodeUtf8)
+import Data.Text.Encoding (decodeUtf8, decodeUtf8')
 import qualified Crypto.Hash.MD5 as MD5
 import Data.ByteString.Base16 (encode)
 
@@ -3223,7 +3260,11 @@ parseMetadataFile fp = do
   exists <- doesFileExist fp
   if not exists
     then pure Nothing
-    else parseMetadata <$> readFile fp
+    else do
+      bs <- BS.readFile fp
+      case decodeUtf8' bs of
+        Left _ -> pure Nothing  -- Binary file, not valid metadata
+        Right txt -> pure (parseMetadata (T.unpack txt))
 
 -- | Read a metadata file OR (if it's a text file whose content is stored directly)
 -- compute hash/size from the file bytes. This is the replacement for the fallback
@@ -3234,15 +3275,21 @@ readMetadataOrComputeHash fp = do
   if not exists
     then pure Nothing
     else do
-      content <- readFile fp
-      case parseMetadata content of
-        Just mc -> pure (Just mc)
-        Nothing -> do
-          -- Not a metadata file Γאפ treat as text file content, compute hash from bytes
-          bs <- BS.readFile fp
+      bs <- BS.readFile fp
+      case decodeUtf8' bs of
+        Left _ -> do
+          -- Binary file Γאפ compute hash from bytes
           let h = hashFileBytes bs
               sz = fromIntegral (BS.length bs)
           pure (Just (MetaContent h sz))
+        Right txt ->
+          case parseMetadata (T.unpack txt) of
+            Just mc -> pure (Just mc)
+            Nothing -> do
+              -- Not a metadata file Γאפ treat as text file content, compute hash from bytes
+              let h = hashFileBytes bs
+                  sz = fromIntegral (BS.length bs)
+              pure (Just (MetaContent h sz))
 
 -- | Truncate hash for human-readable display.
 -- Shows first 16 chars + "..." if longer.
@@ -3257,9 +3304,20 @@ hashFileBytes bs =
   let md5hex = decodeUtf8 (encode (MD5.hash bs))
   in Hash (T.pack "md5:" <> md5hex)
 
--- | Compute MD5 hash of a file on disk.
+-- | Compute MD5 hash of a file on disk using streaming (constant memory).
+-- Reads file in 64KB chunks to avoid loading entire file into RAM.
 hashFile :: FilePath -> IO (Hash 'MD5)
-hashFile fp = hashFileBytes <$> BS.readFile fp
+hashFile fp = withFile fp ReadMode $ \handle -> do
+  let loop !ctx = do
+        eof <- hIsEOF handle
+        if eof
+          then do
+            let md5hex = decodeUtf8 (encode (MD5.finalize ctx))
+            return (Hash (T.pack "md5:" <> md5hex))
+          else do
+            chunk <- BS.hGet handle 65536  -- 64KB chunks
+            loop (MD5.update ctx chunk)
+  loop MD5.init
 
 -- Conflict marker utilities (preserved from old Internal.Metadata) --
 
@@ -3268,8 +3326,10 @@ conflictMarkers = ["<<<<<<<", "=======", ">>>>>>>"]
 
 hasConflictMarkers :: FilePath -> IO Bool
 hasConflictMarkers path = do
-  content <- readFile path
-  return $ any (\m -> m `isInfixOf` content) conflictMarkers
+  bs <- BS.readFile path
+  case decodeUtf8' bs of
+    Left _ -> return False  -- Binary file, no conflict markers possible
+    Right txt -> return $ any (\m -> m `isInfixOf` T.unpack txt) conflictMarkers
 
 listAllFiles :: FilePath -> IO [FilePath]
 listAllFiles dir = do
@@ -3577,6 +3637,7 @@ instance FromJSON RcloneFile where
 *Source file.*
 
 ```haskell
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -3599,81 +3660,175 @@ import System.Directory
       listDirectory,
       getFileSize,
       createDirectoryIfMissing,
-      copyFileWithMetadata )
+      copyFileWithMetadata,
+      getCurrentDirectory )
+import System.IO (withFile, IOMode(ReadMode), hIsEOF)
 import Data.List
 import qualified Data.ByteString as BS
 import Data.Text (unpack)
 import Control.Monad
-import Data.Text.Encoding (decodeUtf8')
+import Data.Text.Encoding (decodeUtf8, decodeUtf8')
 import Data.Char (toLower)
 import qualified Internal.ConfigFile as ConfigFile
 import Bit.Utils (atomicWriteFileStr)
 import Bit.Internal.Metadata (MetaContent(..), readMetadataOrComputeHash, hashFile, serializeMetadata)
+import System.Process (readProcessWithExitCode)
+import System.Exit (ExitCode(..))
+import qualified Data.Set as Set
+import qualified Crypto.Hash.MD5 as MD5
+import Data.ByteString.Base16 (encode)
+import qualified Data.Text as T
+import Control.Concurrent.Async (mapConcurrently)
+import Control.Concurrent (getNumCapabilities)
+import Control.Concurrent.QSem (newQSem, waitQSem, signalQSem)
+import Control.Exception (bracket_)
 
 -- Binary file extensions that should never be treated as text (hardcoded, not configurable)
 binaryExtensions :: [String]
 binaryExtensions = [".mp4", ".zip", ".bin", ".exe", ".dll", ".so", ".dylib", ".jpg", ".jpeg", ".png", ".gif", ".pdf", ".gz", ".bz2", ".xz", ".tar", ".rar", ".7z", ".iso", ".img", ".dmg", ".deb", ".rpm", ".msi"]
 
--- | Classify a file as text or binary based on heuristics:
--- 1. Size < configured limit (from .rgit/config)
--- 2. No NULL bytes in first 8KB
--- 3. Valid UTF-8 (or ASCII subset)
--- 4. Not in binary extension list
--- 5. Extension matches configured text extensions (optional hint)
-classifyFile :: FilePath -> Integer -> IO Bool
-classifyFile filePath size = do
-    config <- ConfigFile.readTextConfig
-    -- Check size limit first (fast path)
-    if size >= ConfigFile.textSizeLimit config
-        then return False
+-- | Single-pass file hash and classification. Returns (hash, isText).
+-- For large files or binary extensions: streams hash only, returns isText=False.
+-- For others: reads first 8KB for text classification, then streams remaining chunks for hash.
+hashAndClassifyFile :: FilePath -> Integer -> ConfigFile.TextConfig -> IO (Hash 'MD5, Bool)
+hashAndClassifyFile filePath size config = do
+    let ext = map toLower (takeExtension filePath)
+    
+    -- Fast path: large files or known binary extensions - just stream hash
+    if size >= ConfigFile.textSizeLimit config || ext `elem` binaryExtensions
+        then do
+            h <- streamHash filePath
+            return (h, False)
+        else
+            -- Single-pass: read first 8KB for classification, continue streaming for hash
+            withFile filePath ReadMode $ \handle -> do
+                firstChunk <- BS.hGet handle 8192
+                let isText = not (BS.elem 0 firstChunk) &&
+                             case decodeUtf8' firstChunk of
+                                 Left _ -> False
+                                 Right _ -> True
+                
+                -- Continue streaming hash from where we left off
+                let loop !ctx = do
+                        eof <- hIsEOF handle
+                        if eof
+                            then do
+                                let md5hex = decodeUtf8 (encode (MD5.finalize ctx))
+                                return (Hash (T.pack "md5:" <> md5hex))
+                            else do
+                                chunk <- BS.hGet handle 65536
+                                loop (MD5.update ctx chunk)
+                
+                -- Start with first chunk already included
+                h <- loop (MD5.update MD5.init firstChunk)
+                return (h, isText)
+  where
+    -- Stream hash for files we're not classifying
+    streamHash fp = withFile fp ReadMode $ \h -> do
+        let loop !ctx = do
+                eof <- hIsEOF h
+                if eof
+                    then do
+                        let md5hex = decodeUtf8 (encode (MD5.finalize ctx))
+                        return (Hash (T.pack "md5:" <> md5hex))
+                    else do
+                        chunk <- BS.hGet h 65536
+                        loop (MD5.update ctx chunk)
+        loop MD5.init
+
+-- | Normalize a file path for consistent comparison (forward slashes, trimmed)
+normalizePath :: FilePath -> FilePath
+normalizePath = map (\c -> if c == '\\' then '/' else c) . filter (/= '\r')
+
+-- | Check if a filename matches a gitignore-style pattern.
+-- Supports: *.ext (extension match), filename (exact match)
+matchesPattern :: String -> FilePath -> Bool
+matchesPattern pattern path =
+    let filename = takeFileName path
+        whitespace = ['\r', '\n', ' '] :: [Char]
+        normalizedPattern = filter (`notElem` whitespace) pattern
+    in if "*." `isPrefixOf` normalizedPattern
+       then -- Extension pattern like *.log
+            let ext = drop 1 normalizedPattern  -- Remove the *
+            in ext `isSuffixOf` filename
+       else -- Exact filename match
+            normalizedPattern == filename
+
+-- | Check which files should be ignored based on .bitignore patterns.
+-- Reads patterns from .bit/index/.gitignore and matches against paths.
+checkIgnoredFiles :: FilePath -> [FilePath] -> IO (Set.Set FilePath)
+checkIgnoredFiles root paths = do
+    let gitignorePath = root </> ".bit" </> "index" </> ".gitignore"
+    exists <- doesFileExist gitignorePath
+    if not exists
+        then return Set.empty
         else do
-            -- Check extension
-            let ext = map toLower (takeExtension filePath)
-            -- Binary extensions always win
-            if ext `elem` binaryExtensions
-                then return False
-                else do
-                    -- Read first 8KB and check for NULL bytes and UTF-8 validity
-                    content <- BS.readFile filePath
-                    let sample = BS.take 8192 content
-                    -- Check for NULL bytes
-                    if BS.elem 0 sample
-                        then return False
-                        else do
-                            -- Check UTF-8 validity
-                            case decodeUtf8' sample of
-                                Left _ -> return False  -- Invalid UTF-8
-                                Right _ -> return True   -- Valid text file
+            content <- readFile gitignorePath
+            let whitespace = ['\r', '\n', ' '] :: [Char]
+            let patterns = filter (not . null) $ 
+                           filter (not . ("#" `isPrefixOf`)) $  -- Skip comments
+                           map (filter (`notElem` whitespace)) (lines content)
+            let isIgnored p = any (`matchesPattern` p) patterns
+            return $ Set.fromList $ filter isIgnored paths
+
+-- | Bounded parallel map: runs up to @bound@ actions concurrently.
+mapConcurrentlyBounded :: Int -> (a -> IO b) -> [a] -> IO [b]
+mapConcurrentlyBounded bound f xs = do
+    sem <- newQSem bound
+    mapConcurrently (\x -> bracket_ (waitQSem sem) (signalQSem sem) (f x)) xs
 
 -- Main scan function
 scanWorkingDir :: FilePath -> IO [FileEntry]
-scanWorkingDir root = go root
+scanWorkingDir root = do
+    -- Read config once for all files
+    config <- ConfigFile.readTextConfig
+    
+    -- First pass: collect all paths (without hashing)
+    allPaths <- collectPaths root
+    
+    -- Filter through git check-ignore
+    let filePaths = [p | (p, False) <- allPaths]  -- Only check files, not directories
+    ignoredSet <- checkIgnoredFiles root filePaths
+    
+    -- Separate directories from files to hash
+    let (dirs, files) = partition snd allPaths
+        dirEntries = [FileEntry { path = rel, kind = Directory } | (rel, _) <- dirs]
+        filesToHash = [(rel, root </> rel) | (rel, False) <- allPaths
+                                           , not (Set.member (normalizePath rel) ignoredSet)]
+    
+    -- Hash/classify files in parallel (bounded by numCapabilities * 4)
+    caps <- getNumCapabilities
+    let concurrency = max 4 (caps * 4)
+    fileEntries <- mapConcurrentlyBounded concurrency
+        (\(rel, fullPath) -> do
+            size <- getFileSize fullPath
+            (h, isText) <- hashAndClassifyFile fullPath (fromIntegral size) config
+            return $ FileEntry
+                { path = rel
+                , kind = File { fHash = h, fSize = fromIntegral size, fIsText = isText }
+                }
+        ) filesToHash
+    
+    return $ dirEntries ++ fileEntries
   where
-    go :: FilePath -> IO [FileEntry]
-    go path = do
+    collectPaths :: FilePath -> IO [(FilePath, Bool)]
+    collectPaths path = do
       isDir <- doesDirectoryExist path
       let rel = makeRelative root path
 
-      -- ignore .bit folder and .git (git metadata / pointer)
+      -- ignore .bit folder, .git, .bitignore, and .gitignore (the latter two are config files)
       if rel == ".bit" || (".bit" `isPrefixOf` rel)
           || rel == ".git" || (".git" `isPrefixOf` rel)
+          || rel == ".bitignore"
+          || rel == ".gitignore"
         then pure []
         else if isDir
           then do
             names <- listDirectory path
             let children = map (path </>) names
-            childEntries <- concat <$> mapM go children
-            let dirEntry = FileEntry { path = rel, kind = Directory }
-            pure (dirEntry : childEntries)
-        else do
-          h <- hashFile path
-          size <- getFileSize path
-          isText <- classifyFile path (fromIntegral size)
-          let fEntry = FileEntry
-                { path = rel
-                , kind = File { fHash = h, fSize = fromIntegral size, fIsText = isText }
-                }
-          pure [fEntry]
+            childPaths <- concat <$> mapM collectPaths children
+            pure ((rel, True) : childPaths)
+        else pure [(rel, False)]
 
 writeMetadataFiles :: FilePath -> [FileEntry] -> IO ()
 writeMetadataFiles root entries = do
@@ -5042,6 +5197,7 @@ executable bit
                       Internal.Transport
     build-depends:    base16-bytestring ^>=1.0.2.0,
                       base,
+                      async,
                       directory,
                       uuid ^>=1.3.13,
                       filepath,
