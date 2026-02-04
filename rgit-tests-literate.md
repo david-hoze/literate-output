@@ -849,7 +849,7 @@ cd test\cli\work_a & echo base content> text.txt & rgit add text.txt
 
 cd test\cli\work_a & rgit commit -m "Base: add text.txt"
 <<<
->>> /\[main|master|file changed/
+>>> /\[main|master|files? changed/
 >>>= 0
 
 # ---- Repo A: create base binary file, add, commit ----
@@ -860,7 +860,7 @@ cd test\cli\work_a & echo binarydata> data.bin & rgit add data.bin
 
 cd test\cli\work_a & rgit commit -m "Base: add data.bin"
 <<<
->>> /\[main|master|file changed/
+>>> /\[main|master|files? changed/
 >>>= 0
 
 # ---- Repo A: push base state to shared remote ----
@@ -931,7 +931,7 @@ cd test\cli\work_b & rgit status
 # ---- A: add a new file and push ----
 cd test\cli\work_a & echo new from A> extra.txt & rgit add extra.txt & rgit commit -m "Add extra.txt"
 <<<
->>> /\[main|master|file changed/
+>>> /\[main|master|files? changed/
 >>>= 0
 
 cd test\cli\work_a & rgit push
@@ -970,7 +970,7 @@ cd test\cli\work_b & rgit status
 # ---- A: modify text.txt and push ----
 cd test\cli\work_a & echo updated by A> text.txt & rgit add text.txt & rgit commit -m "A: update text.txt"
 <<<
->>> /\[main|master|file changed/
+>>> /\[main|master|files? changed/
 >>>= 0
 
 cd test\cli\work_a & rgit push
@@ -981,7 +981,7 @@ cd test\cli\work_a & rgit push
 # ---- B: add a NEW file (doesn't overlap with A's changes) and commit ----
 cd test\cli\work_b & echo B only file> bonly.txt & rgit add bonly.txt & rgit commit -m "B: add bonly.txt"
 <<<
->>> /\[main|master|file changed/
+>>> /\[main|master|files? changed/
 >>>= 0
 
 # ---- B: pull Γאפ should merge cleanly since changes don't overlap ----
@@ -1030,7 +1030,7 @@ cd test\cli\work_a & rgit fetch & rgit pull
 # ---- A: modify text.txt to A's version and push ----
 cd test\cli\work_a & echo conflict version A> text.txt & rgit add text.txt & rgit commit -m "A: conflict version"
 <<<
->>> /\[main|master|file changed/
+>>> /\[main|master|files? changed/
 >>>= 0
 
 cd test\cli\work_a & rgit push
@@ -1041,7 +1041,7 @@ cd test\cli\work_a & rgit push
 # ---- B: modify SAME text.txt to B's version and commit locally ----
 cd test\cli\work_b & echo conflict version B> text.txt & rgit add text.txt & rgit commit -m "B: conflict version"
 <<<
->>> /\[main|master|file changed/
+>>> /\[main|master|files? changed/
 >>>= 0
 
 # ---- B: pull Γאפ conflict expected; pipe "l" to keep local ----
@@ -1077,7 +1077,7 @@ cd test\cli\work_a & rgit fetch & rgit pull
 # ---- A: modify text.txt to "remote wins" and push ----
 cd test\cli\work_a & echo remote wins version> text.txt & rgit add text.txt & rgit commit -m "A: remote wins"
 <<<
->>> /\[main|master|file changed/
+>>> /\[main|master|files? changed/
 >>>= 0
 
 cd test\cli\work_a & rgit push
@@ -1088,7 +1088,7 @@ cd test\cli\work_a & rgit push
 # ---- B: modify SAME text.txt differently and commit locally ----
 cd test\cli\work_b & echo local loses version> text.txt & rgit add text.txt & rgit commit -m "B: local loses"
 <<<
->>> /\[main|master|file changed/
+>>> /\[main|master|files? changed/
 >>>= 0
 
 # ---- B: pull Γאפ conflict expected; pipe "r" to take remote ----
@@ -1124,7 +1124,7 @@ cd test\cli\work_a & rgit fetch & rgit pull
 # ---- A: modify both files and push ----
 cd test\cli\work_a & (echo A multi 1)> file1.txt & (echo A multi 2)> file2.txt & rgit add file1.txt file2.txt & rgit commit -m "A: modify two files"
 <<<
->>> /\[main|master|file changed/
+>>> /\[main|master|files? changed/
 >>>= 0
 
 cd test\cli\work_a & rgit push
@@ -1135,7 +1135,7 @@ cd test\cli\work_a & rgit push
 # ---- B: modify SAME two files differently and commit ----
 cd test\cli\work_b & (echo B multi 1)> file1.txt & (echo B multi 2)> file2.txt & rgit add file1.txt file2.txt & rgit commit -m "B: modify two files"
 <<<
->>> /\[main|master|file changed/
+>>> /\[main|master|files? changed/
 >>>= 0
 
 # ---- B: pull Γאפ two conflicts; pipe "l" then "r" ----
@@ -1176,7 +1176,7 @@ cd test\cli\work_a & rgit fetch & rgit pull
 # ---- A: create brand-new file "shared_new.txt" and push ----
 cd test\cli\work_a & echo A created this> shared_new.txt & rgit add shared_new.txt & rgit commit -m "A: add shared_new.txt"
 <<<
->>> /\[main|master|file changed/
+>>> /\[main|master|files? changed/
 >>>= 0
 
 cd test\cli\work_a & rgit push
@@ -1187,7 +1187,7 @@ cd test\cli\work_a & rgit push
 # ---- B: create SAME filename "shared_new.txt" with different content, commit ----
 cd test\cli\work_b & echo B created this> shared_new.txt & rgit add shared_new.txt & rgit commit -m "B: add shared_new.txt"
 <<<
->>> /\[main|master|file changed/
+>>> /\[main|master|files? changed/
 >>>= 0
 
 # ---- B: pull Γאפ add/add conflict; choose "r" (take remote) ----
@@ -1251,7 +1251,7 @@ cd test\cli\work_a & rgit fetch & rgit pull
 # ---- A: modify text.txt and push ----
 cd test\cli\work_a & echo accept remote test> text.txt & rgit add text.txt & rgit commit -m "A: accept-remote test"
 <<<
->>> /\[main|master|file changed/
+>>> /\[main|master|files? changed/
 >>>= 0
 
 cd test\cli\work_a & rgit push
@@ -1353,7 +1353,7 @@ cd test\cli\work & rgit status
 # Commit the staged file
 cd test\cli\work & rgit commit -m "Add test.txt"
 <<<
->>> /\[master|file changed/
+>>> /\[master|main|files? changed/
 >>>= 0
 
 # Status after commit: working tree clean
@@ -1394,7 +1394,7 @@ cd test\cli\work & rgit status
 # Commit binary
 cd test\cli\work & rgit commit -m "Add file.bin"
 <<<
->>> /\[master|file changed/
+>>> /\[master|main|files? changed/
 >>>= 0
 
 # Add multiple files with "add ."
@@ -1425,7 +1425,7 @@ cd test\cli\work & rgit status
 # Commit multiple files
 cd test\cli\work & rgit commit -m "Add data and notes"
 <<<
->>> /\[master|file changed/
+>>> /\[master|main|files? changed/
 >>>= 0
 
 # Modify text file, add it
@@ -1449,7 +1449,7 @@ cd test\cli\work & rgit status
 # Commit modification
 cd test\cli\work & rgit commit -m "Update test.txt"
 <<<
->>> /\[master|file changed/
+>>> /\[master|main|files? changed/
 >>>= 0
 
 # Final status: clean
@@ -1541,7 +1541,7 @@ rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & rgit 
 
 cd test\cli\work & echo original> file.txt & rgit add file.txt & rgit commit -m "Add file"
 <<<
->>> /\[master|file changed/
+>>> /\[master|main|files? changed/
 >>>= 0
 
 # Modify file, then restore (discard working tree changes)
@@ -1622,7 +1622,7 @@ cd test\cli\work & rgit status
 # Test restore . (all files)
 cd test\cli\work & echo a> a.txt & echo b> b.txt & rgit add . & rgit commit -m "Add a and b"
 <<<
->>> /\[master|file changed/
+>>> /\[master|main|files? changed/
 >>>= 0
 
 cd test\cli\work & echo x> a.txt & echo y> b.txt & rgit restore .
