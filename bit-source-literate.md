@@ -4094,7 +4094,7 @@ runGitRaw args = do
   let colorFlag = case noColor of
         Just "1" -> "never"
         Just "true" -> "never"
-        _ -> "always"
+        _ -> "auto"
   let fullArgs =
         baseFlags
         ++ ["-c", "color.ui=" ++ colorFlag]
