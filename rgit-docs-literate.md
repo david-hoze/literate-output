@@ -64,6 +64,24 @@ project/
     ΓפפΓפאΓפא ignore              # Gitignore-style rules
 ```
 
+### The Index Invariant
+
+**Git is the sole authority over `.rgit/index/`.** After any git operation that
+changes HEAD (merge, checkout, commit), `.rgit/index/` is correct by
+definition. The only remaining work is mirroring those changes onto the actual
+working directory (downloading binaries from remote, copying text files from
+the index).
+
+This invariant applies uniformly across all pull/merge paths:
+
+- `git merge` Γזע determines correct metadata Γזע we sync actual files
+- `git checkout` (first pull, `--accept-remote`) Γזע determines correct metadata Γזע we sync actual files
+
+No path should write metadata files to `.rgit/index/` directly and then commit.
+Scanning the remote via rclone and writing the result to the index bypasses git
+and **will** produce wrong metadata (rclone cannot distinguish text from binary,
+so text files get `hash:/size:` metadata instead of their actual content).
+
 ### Metadata File Format
 
 Each metadata file under `.rgit/index/` mirrors the path of its corresponding real file and contains **ONLY**:
@@ -153,9 +171,47 @@ pushSyncFiles :: [FileEntry] -> [FileEntry] -> [RcloneAction]
 pullSyncFiles :: [FileEntry] -> [FileEntry] -> [RcloneAction]
 ```
 
+### Working Tree Sync: The `oldHead` Pattern
+
+After any git operation that changes HEAD (merge, checkout), the working
+directory must be updated to reflect what changed in `.rgit/index/`.
+The mechanism:
+
+```haskell
+oldHead <- getLocalHeadE              -- 1. Capture HEAD *before* the git operation
+-- ... git merge / git checkout ...   -- 2. Git changes HEAD + index
+applyMergeToWorkingDir remote oldHead -- 3. Diff old HEAD vs new HEAD, sync files
+```
+
+`applyMergeToWorkingDir` uses `git diff --name-status oldHead newHead` to
+determine what changed, then:
+- **Added/Modified files**: download binary from remote, or copy text from index
+- **Deleted files**: remove from working directory
+- **Renamed files**: delete old, download/copy new
+
+This is used consistently across:
+- Clean merges (fast-forward and three-way)
+- Conflict resolution merges
+- `--accept-remote` (force-checkout)
+- `mergeContinue`
+
+The only exception is **first pull** (`oldHead = Nothing`): there is no
+previous HEAD to diff against, so `syncRemoteFilesToLocal` (full rclone-based
+diff) is used as fallback.
+
 ### Conflict Resolution
 
 Conflict resolution is structured as a fold over a list of conflicts (`Rgit.Conflict`). Each conflict is resolved identically via `resolveConflict`, and the traversal guarantees every conflict is visited exactly once with correct progress tracking (1/N, 2/N, ...). The decision logic (KeepLocal vs TakeRemote) is cleanly separated from the git checkout/merge mechanics.
+
+**Critical**: After resolving all conflicts, the merge commit must **always** be
+created, regardless of whether the index has staged changes. When the user
+chooses "keep local" (`--ours`), `git checkout --ours` + `git add` restores
+HEAD's version Γאפ the index becomes identical to HEAD. A na├»ve `hasStagedChanges`
+check would skip the commit, leaving `MERGE_HEAD` dangling. Git's `commit`
+command always succeeds when `MERGE_HEAD` exists (it knows it's recording a
+merge), even if the tree is identical to HEAD's tree. Skipping the commit
+breaks the next push (ancestry check fails because HEAD was never advanced
+past the merge).
 
 ---
 
@@ -219,9 +275,10 @@ This saves bandwidth. For example: renaming a 1GB file becomes `rclone moveto` i
 
 **On Pull:**
 1. **First**: Fetch metadata bundle via rclone
-2. **Then**: Sync files via rclone (need metadata to know what to fetch)
+2. **Then**: Git operation (merge or checkout) updates `.rgit/index/`
+3. **Then**: Mirror index changes to working directory (download binaries, copy text from index)
 
-**Rationale**: Push files first so the remote is never in a state where metadata references missing content. Pull metadata first so we know what content to fetch.
+**Rationale**: Push files first so the remote is never in a state where metadata references missing content. Pull metadata first so we know what content to fetch. After the git operation, the index is authoritative Γאפ we only need to bring actual files into alignment.
 
 ### Remote Types and Device Resolution
 
@@ -269,7 +326,22 @@ When remote files don't match remote metadata (detected via `rgit verify --remot
 
 ### Resolution Option 1: Accept Remote Reality (`--accept-remote`)
 
-Scan actual remote files, generate new metadata matching actual state, commit, and download divergent files.
+Force-checkout the remote branch so git puts the correct metadata in
+`.rgit/index/`, then mirror the changes to the working directory. This is
+architecturally identical to a normal pull Γאפ just a force-checkout instead of
+a merge. Git manages the index; we only sync actual files.
+
+The flow:
+1. Fetch remote bundle (git gets remote history)
+2. Record current HEAD (for diff-based sync)
+3. `git checkout -f -B main refs/remotes/origin/main` (force-checkout remote)
+4. `applyMergeToWorkingDir` (diff old HEAD vs new HEAD, sync files)
+5. Update tracking ref
+
+**Important**: `--accept-remote` must NOT scan remote files via rclone and write
+metadata directly. Rclone cannot distinguish text from binary files
+(`fIsText = False` for everything), so text files would get `hash:/size:`
+metadata instead of their actual content.
 
 ### Resolution Option 2: Force Local (`rgit push --force`)
 
@@ -310,6 +382,27 @@ Interactive per-file conflict resolution:
    and silently fail to update the tracking ref, making subsequent merges
    operate against stale history.
 
+8. **Git is the sole authority over `.rgit/index/`**: No code path should write
+   metadata files to the index and commit them directly. The index is always
+   populated by git operations (merge, checkout, commit via `rgit add`). After
+   any git operation that changes HEAD, we only need to mirror those changes
+   onto the actual working directory. This invariant applies to all pull paths
+   including `--accept-remote`.
+
+9. **Always commit when MERGE_HEAD exists**: After conflict resolution,
+   `git commit` must always be called Γאפ never guarded by `hasStagedChanges`.
+   When the user chooses "keep local" (`--ours`), the index becomes identical
+   to HEAD. A `hasStagedChanges` check would skip the commit, leaving
+   `MERGE_HEAD` dangling. Git's `commit` succeeds when `MERGE_HEAD` exists
+   regardless of index state. Skipping the commit breaks the next push
+   (ancestry check fails because HEAD was never advanced).
+
+10. **The `oldHead` capture pattern**: Before any git operation that changes
+    HEAD (merge, checkout), capture HEAD so `applyMergeToWorkingDir` can diff
+    old vs new and sync only what changed. This pattern appears in `pullLogic`,
+    `mergeContinue`, and `pullAcceptRemoteImpl`. The only exception is first
+    pull (`oldHead = Nothing`), which falls back to `syncRemoteFilesToLocal`.
+
 ### What We Deliberately Do NOT Do
 
 - **`RemoteState` does not need a typed state machine.** The pattern match in push logic is clear and total.
@@ -317,6 +410,11 @@ Interactive per-file conflict resolution:
 - **`GitDiff` does not need a Group structure.** rgit computes diffs fresh each time; inverse/compose would be dead code.
 - **No Arrow syntax.** Plain `>>=` and function composition are clearer.
 - **No MTL-style type classes** (`MonadGit`, `MonadRclone`). Everything is concrete.
+- **No post-sync metadata rescanning.** After syncing files to the working
+  directory, we do NOT re-scan and rewrite metadata. Git already put the
+  correct metadata in the index. Rescanning would be redundant at best,
+  wrong at worst (e.g., overwriting text file content with hash/size if the
+  scan's text/binary classification differs from git's).
 
 ---
 
@@ -329,6 +427,7 @@ Interactive per-file conflict resolution:
 - **Transaction logging**: For resumable push/pull operations.
 - **Progress reporting**: For long operations (scanning, uploading).
 - **Error messages**: Some need polish to match Git's style and include actionable hints.
+- **`isTextFileInIndex` fragility**: The current check (looking for `"hash: "` prefix) works but is indirect. A more robust approach might check whether the file parses as metadata vs. has arbitrary content. Low priority since current approach works correctly.
 
 ### Future (rgit-solid)
 
@@ -347,8 +446,8 @@ Interactive per-file conflict resolution:
 - `rgit commit`, `diff`, `status`, `log`, `restore`, `checkout`, `reset`, `rm`, `mv`, `branch`, `merge` Γאפ delegate to Git
 - `rgit remote add/show/check` Γאפ named remotes with device-aware resolution
 - `rgit push` Γאפ diff-based file sync via rclone, then push metadata bundle
-- `rgit pull` Γאפ fetch metadata bundle, then diff-based file sync
-- `rgit pull --accept-remote` Γאפ accept remote file state as truth
+- `rgit pull` Γאפ fetch metadata bundle, then diff-based file sync via `applyMergeToWorkingDir`
+- `rgit pull --accept-remote` Γאפ force-checkout remote branch, then mirror changes to working directory
 - `rgit pull --manual-merge` Γאפ interactive per-file conflict resolution
 - `rgit merge --continue / --abort` Γאפ merge lifecycle management
 - `rgit fetch` Γאפ fetch metadata bundle only
@@ -357,8 +456,9 @@ Interactive per-file conflict resolution:
 - `rgit fsck` Γאפ full integrity check
 - Pipeline: pure diff Γזע plan Γזע action generation with property tests
 - Device-identity system for filesystem remotes (UUID + hardware serial)
-- Conflict resolution module with structured fold
+- Conflict resolution module with structured fold (always commits when MERGE_HEAD exists)
 - Unified metadata parsing/serialization
+- `oldHead` pattern for diff-based working-tree sync across all pull/merge paths
 
 ### Module Map
 
@@ -397,6 +497,14 @@ Interactive per-file conflict resolution:
 - Implement CAS yet (that's rgit-solid, mark as TODO)
 - Add MTL-style type classes or free monad effects (premature)
 - Merge `diff` and `plan` into a single function
+- Write metadata to `.rgit/index/` directly and then commit (bypasses git;
+  rclone scans set `fIsText = False` for everything, producing wrong metadata
+  for text files)
+- Guard merge commits on `hasStagedChanges` when `MERGE_HEAD` exists (the
+  commit must always be created to finalize the merge, even when the tree is
+  unchanged Γאפ e.g., "keep local" resolution)
+- Re-scan the working directory after sync to "fix" metadata (the index is
+  already correct after the git operation; rescanning is redundant or harmful)
 
 **ALWAYS:**
 - Prefer `rclone moveto` over delete+upload when hash matches
@@ -408,6 +516,12 @@ Interactive per-file conflict resolution:
 - All business logic in Bit.hs
 - Use the unified metadata parser from `Rgit/Internal/Metadata.hs`
 - After pull/merge, set refs/remotes/origin/main to the bundle hash, not HEAD
+- Capture `oldHead` before any git operation that changes HEAD, then use
+  `applyMergeToWorkingDir` to sync the working directory
+- Let git manage `.rgit/index/` Γאפ all pull paths (normal, `--accept-remote`,
+  `--manual-merge`, `mergeContinue`) must update the index via git operations
+  (merge, checkout), never by writing files directly
+- Always call `git commit` after conflict resolution when `MERGE_HEAD` exists
 ```
 
 ---
