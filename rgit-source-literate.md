@@ -586,7 +586,10 @@ mergeContinue = do
                             liftIO $ putStrLn "Syncing binaries... done."
                             syncRemoteFilesToLocal
                             liftIO $ updateMetadataAfterSync cwd
-                            liftIO $ void Git.updateRemoteTrackingBranchToHead) mRemote
+                            maybeRemoteHash <- liftIO $ Git.getHashFromBundle fetchedBundle
+                            case maybeRemoteHash of
+                                Just rHash -> liftIO $ void $ Git.updateRemoteTrackingBranchToHash rHash
+                                Nothing    -> return ()) mRemote
                     else liftIO $ hPutStrLn stderr "error: no merge in progress."
             else do
                 invalid <- liftIO $ Metadata.validateMetadataDir (cwd </> rgitIndexPath)
@@ -610,7 +613,10 @@ mergeContinue = do
                     liftIO $ putStrLn "Syncing binaries... done."
                     syncRemoteFilesToLocal
                     liftIO $ updateMetadataAfterSync cwd
-                    liftIO $ void Git.updateRemoteTrackingBranchToHead) mRemote
+                    maybeRemoteHash <- liftIO $ Git.getHashFromBundle fetchedBundle
+                    case maybeRemoteHash of
+                        Just rHash -> liftIO $ void $ Git.updateRemoteTrackingBranchToHash rHash
+                        Nothing    -> return ()) mRemote
 
 -- ============================================================================
 -- Internal helpers (not exported, moved from Commands.hs)
@@ -1092,7 +1098,10 @@ pullAcceptRemoteImpl remote = do
             lift $ tell "Syncing files from remote..."
             syncRemoteFilesToLocal
             lift $ updateMetadataAfterSync cwd
-            lift $ void $ Git.updateRemoteTrackingBranchToHead
+            maybeRemoteHash <- lift $ Git.getHashFromBundle fetchedBundle
+            case maybeRemoteHash of
+                Just rHash -> lift $ void $ Git.updateRemoteTrackingBranchToHash rHash
+                Nothing    -> return ()
             lift $ tell "Pull with --accept-remote completed."
 
 -- | Pull with --manual-merge: detect remote divergence and create conflict directories.
@@ -1280,7 +1289,10 @@ pullLogic remote = do
                         syncRemoteFilesToLocal
                         lift $ tell "Syncing binaries... done."
                         lift $ updateMetadataAfterSync cwd
-                        lift $ void $ Git.updateRemoteTrackingBranchToHead
+                        maybeRemoteHash <- lift $ Git.getHashFromBundle fetchedBundle
+                        case maybeRemoteHash of
+                            Just rHash -> lift $ void $ Git.updateRemoteTrackingBranchToHash rHash
+                            Nothing    -> return ()
                     else do
                         lift $ tell finalMergeOut
                         lift $ tellErr finalMergeErr
@@ -1308,7 +1320,11 @@ pullLogic remote = do
                         syncRemoteFilesToLocal
                         lift $ tell "Syncing binaries... done."
                         lift $ updateMetadataAfterSync cwd
-                        when (null conflictsNow) $ lift $ void $ Git.updateRemoteTrackingBranchToHead
+                        when (null conflictsNow) $ do
+                            maybeRemoteHash <- lift $ Git.getHashFromBundle fetchedBundle
+                            case maybeRemoteHash of
+                                Just rHash -> lift $ void $ Git.updateRemoteTrackingBranchToHash rHash
+                                Nothing    -> return ()
 
 printVerifyIssue :: (String -> String) -> Verify.VerifyIssue -> IO ()
 printVerifyIssue fmtHash = \case
@@ -1923,7 +1939,7 @@ fetchFromBundle :: BundleName -> IO ExitCode
 fetchFromBundle name = do
     let (GitRelPath bundle) = bundleGitRelPath name
     (code, out, err) <- readProcessWithExitCode "git"
-        (baseFlags ++ ["fetch", bundle, "refs/heads/main:refs/remotes/origin/main"]) ""
+        (baseFlags ++ ["fetch", bundle, "+refs/heads/main:refs/remotes/origin/main"]) ""
     putStr out
     hPutStr stderr err
     return code
@@ -1946,8 +1962,11 @@ updateRemoteTrackingBranchToHash :: String -> IO ExitCode
 updateRemoteTrackingBranchToHash hash =
     readProcessWithExitCode "git" (baseFlags ++ ["update-ref", "refs/remotes/origin/main", hash]) "" >>= \(c, _, _) -> return c
 
--- | Set refs/remotes/origin/main to current HEAD. Use after a successful pull so status shows
--- "up to date with 'origin/main'" instead of "ahead by N commits".
+-- | Set refs/remotes/origin/main to current HEAD.
+-- WARNING: Only correct after PUSH (where remote now matches local HEAD).
+-- After PULL/MERGE, use updateRemoteTrackingBranchToHash with the bundle hash instead,
+-- because HEAD includes local merge commits the remote doesn't have.
+-- See: "Tracking Ref Invariant" in docs/spec.md.
 updateRemoteTrackingBranchToHead :: IO ExitCode
 updateRemoteTrackingBranchToHead = do
     (code, out, _) <- readProcessWithExitCode "git" (baseFlags ++ ["rev-parse", "HEAD"]) ""

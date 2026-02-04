@@ -301,6 +301,15 @@ Interactive per-file conflict resolution:
 
 6. **Remote as opaque type**: `Remote` is exported without its constructor. Only `remoteName` is public for display. `remoteUrl` exists for Transport to extract the URL, but business logic in Bit.hs should use `displayRemote` for user-facing messages.
 
+7. **Tracking ref invariant**: `refs/remotes/origin/main` must always reflect
+   what the remote actually has Γאפ never a local-only commit. After **push**,
+   updating to HEAD is correct (the remote now has our history). After
+   **pull/merge**, update to the hash from the fetched bundle, because HEAD
+   includes merge commits the remote doesn't know about. Violating this
+   causes the next `fetchFromBundle` to encounter a non-fast-forward update
+   and silently fail to update the tracking ref, making subsequent merges
+   operate against stale history.
+
 ### What We Deliberately Do NOT Do
 
 - **`RemoteState` does not need a typed state machine.** The pattern match in push logic is clear and total.
@@ -398,6 +407,7 @@ Interactive per-file conflict resolution:
 - Keep Git.hs dumb Γאפ no domain interpretation
 - All business logic in Bit.hs
 - Use the unified metadata parser from `Rgit/Internal/Metadata.hs`
+- After pull/merge, set refs/remotes/origin/main to the bundle hash, not HEAD
 ```
 
 ---
