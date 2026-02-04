@@ -758,6 +758,58 @@ rclone deletefile gdrive-test:bit-test/orphan.txt
 
 ---
 
+## test/cli/init-config.test
+
+**Path:** `test/cli/init-config.test`
+
+*Source file.*
+
+```text
+# Setup: clean environment and initialize repo
+rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit init
+<<<
+>>> /Initialized/
+>>>= 0
+
+# Verify core.excludesFile was configured
+cd test\cli\work & git -C .bit\index config --get core.excludesFile
+<<<
+>>> /\.bit/
+>>>= 0
+
+# Verify init.defaultBranch was set to "main"
+cd test\cli\work & git -C .bit\index config --get init.defaultBranch
+<<<
+>>>
+main
+>>>= 0
+
+# Verify merge driver was configured
+cd test\cli\work & git -C .bit\index config --get merge.bit-metadata.driver
+<<<
+>>>
+false
+>>>= 0
+
+# Verify bit status works after init (proves git commands work)
+cd test\cli\work & bit status
+<<<
+>>>= 0
+
+# Verify bit add works after init
+cd test\cli\work & echo test> file.txt & bit add file.txt
+<<<
+>>>= 0
+
+# Verify bit commit works after init
+cd test\cli\work & bit commit -m "test commit"
+<<<
+>>> /\[main|master|file/
+>>>= 0
+```
+
+---
+
 ## test/cli/init.test
 
 **Path:** `test/cli/init.test`
@@ -776,6 +828,124 @@ if exist "test\cli\work\.bit\" (echo exists) else (echo missing)
 <<<
 >>>
 exists
+>>>= 0
+```
+
+---
+
+## test/cli/ls-files.test
+
+**Path:** `test/cli/ls-files.test`
+
+*Source file.*
+
+```text
+# Setup fresh repo
+rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit init
+<<<
+>>> /Initialized/
+>>>= 0
+
+# ls-files with no tracked files should return nothing
+cd test\cli\work & bit ls-files
+<<<
+>>>
+>>>= 0
+
+# Add a text file
+cd test\cli\work & echo hello> test.txt & bit add test.txt
+<<<
+>>>
+>>>= 0
+
+# ls-files should show the staged file
+cd test\cli\work & bit ls-files
+<<<
+>>> /test\.txt/
+>>>= 0
+
+# Commit the file
+cd test\cli\work & bit commit -m "Add test.txt"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+# ls-files should still show the committed file
+cd test\cli\work & bit ls-files
+<<<
+>>> /test\.txt/
+>>>= 0
+
+# Add multiple files
+cd test\cli\work & echo data> data.txt & echo notes> notes.txt & bit add data.txt notes.txt
+<<<
+>>>
+>>>= 0
+
+# Commit the new files
+cd test\cli\work & bit commit -m "Add more files"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+# ls-files should show all tracked files (test.txt, data.txt, notes.txt)
+cd test\cli\work & bit ls-files
+<<<
+>>> /test\.txt/
+>>>= 0
+
+# ls-files with --stage should show metadata (mode, hash, stage, filename)
+cd test\cli\work & bit ls-files --stage
+<<<
+>>> /100644.*test\.txt/
+>>>= 0
+
+# ls-files with specific pathspec should filter results
+cd test\cli\work & bit ls-files test.txt
+<<<
+>>> /^test\.txt$/
+>>>= 0
+
+# Add a binary file
+cd test\cli\work & echo binary> file.bin & bit add file.bin & bit commit -m "Add binary"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+# ls-files should show all files including binary
+cd test\cli\work & bit ls-files
+<<<
+>>> /file\.bin/
+>>>= 0
+
+# ls-files with wildcard pattern (should show .txt files)
+cd test\cli\work & bit ls-files *.txt
+<<<
+>>> /\.txt/
+>>>= 0
+
+# ls-files --cached should work (default behavior)
+cd test\cli\work & bit ls-files --cached
+<<<
+>>> /test\.txt/
+>>>= 0
+
+# Create subdirectory with files
+cd test\cli\work & mkdir subdir & echo sub> subdir\sub.txt & bit add subdir\sub.txt & bit commit -m "Add subdir"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+# ls-files should show files in subdirectories
+cd test\cli\work & bit ls-files
+<<<
+>>> /subdir/
+>>>= 0
+
+# ls-files with directory pathspec
+cd test\cli\work & bit ls-files subdir
+<<<
+>>> /subdir/
 >>>= 0
 ```
 
