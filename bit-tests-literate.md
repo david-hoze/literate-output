@@ -786,6 +786,54 @@ cd test\cli\work_b & bit pull
 
 ---
 
+## test/cli/fs_remote/conflict.txt
+
+**Path:** `test/cli/fs_remote/conflict.txt`
+
+*Source file.*
+
+```text
+version A 
+```
+
+---
+
+## test/cli/fs_remote/test.txt
+
+**Path:** `test/cli/fs_remote/test.txt`
+
+*Source file.*
+
+```text
+updated content 
+```
+
+---
+
+## test/cli/fs_remote_direct/file.txt
+
+**Path:** `test/cli/fs_remote_direct/file.txt`
+
+*Source file.*
+
+```text
+remote change 
+```
+
+---
+
+## test/cli/fs_remote_direct/other.txt
+
+**Path:** `test/cli/fs_remote_direct/other.txt`
+
+*Source file.*
+
+```text
+local change 
+```
+
+---
+
 ## test/cli/fsck.test
 
 **Path:** `test/cli/fsck.test`
@@ -2277,6 +2325,18 @@ cd test\cli\work & bit status
 <<<
 >>> /file\.bin/
 >>>= 0
+```
+
+---
+
+## test/cli/work_direct/file.txt
+
+**Path:** `test/cli/work_direct/file.txt`
+
+*Source file.*
+
+```text
+remote change 
 ```
 
 ---

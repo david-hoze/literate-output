@@ -1062,18 +1062,28 @@ filesystemPush cwd remote = do
                    then Just (filter (not . isSpace) oldHeadOut)
                    else Nothing
     
-    -- 4. Merge at remote (ff-only)
+    -- 4. Check if remote HEAD is ancestor of what we're pushing (fast-forward check)
+    case mOldHead of
+        Just oldHead -> do
+            (checkCode, _, _) <- Git.runGitAt remoteIndex 
+                ["merge-base", "--is-ancestor", "HEAD", "refs/remotes/origin/main"]
+            when (checkCode /= ExitSuccess) $ do
+                hPutStrLn stderr "error: Remote has local commits that you don't have."
+                hPutStrLn stderr "hint: Run 'bit pull' to merge remote changes first, then push again."
+                exitWith (ExitFailure 1)
+        Nothing -> return ()  -- First push, no check needed
+    
+    -- 5. Merge at remote (ff-only)
     putStrLn "Merging at remote (fast-forward only)..."
     (mergeCode, mergeOut, mergeErr) <- Git.runGitAt remoteIndex 
         ["merge", "--ff-only", "refs/remotes/origin/main"]
     
     if mergeCode /= ExitSuccess
         then do
-            hPutStrLn stderr "error: Remote has local commits that you don't have."
-            hPutStrLn stderr "hint: Run 'bit pull' to merge remote changes first, then push again."
+            hPutStrLn stderr $ "error: Failed to merge at remote: " ++ mergeErr
             exitWith (ExitFailure 1)
         else do
-            -- 5. Get new HEAD at remote
+            -- 6. Get new HEAD at remote
             (newHeadCode, newHeadOut, _) <- Git.runGitAt remoteIndex ["rev-parse", "HEAD"]
             when (newHeadCode /= ExitSuccess) $ do
                 hPutStrLn stderr "Error: Could not get remote HEAD after merge"
@@ -1081,7 +1091,7 @@ filesystemPush cwd remote = do
             
             let newHead = filter (not . isSpace) newHeadOut
             
-            -- 6. Sync actual files based on what changed
+            -- 7. Sync actual files based on what changed
             case mOldHead of
                 Nothing -> do
                     -- First push: sync all files from new HEAD
@@ -1092,7 +1102,7 @@ filesystemPush cwd remote = do
                     putStrLn "Syncing changed files to remote..."
                     filesystemSyncChangedFiles cwd remotePath oldHead newHead
             
-            -- 7. Update local tracking ref
+            -- 8. Update local tracking ref
             putStrLn "Updating local tracking ref..."
             void $ Git.updateRemoteTrackingBranchToHead
             
@@ -4778,7 +4788,6 @@ getFilesAtCommit ref = do
 -- The indexPath should be the path to the .bit/index directory (NOT the .git subdirectory).
 runGitAt :: FilePath -> [String] -> IO (ExitCode, String, String)
 runGitAt indexPath args = readProcessWithExitCode "git" (["-C", indexPath] ++ args) ""
-
 ```
 
 ---
