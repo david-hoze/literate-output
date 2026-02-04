@@ -2354,7 +2354,7 @@ acquireDeviceName inputSource mLabel nameExists = do
     NonInteractive -> return defaultName
     Interactive ask -> do
       putStrLn "This path is on a storage device."
-      putStrLn "rgit identifies devices, not drive letters. The remote will stay linked"
+      putStrLn "bit identifies devices, not drive letters. The remote will stay linked"
       putStrLn "to this device even if the drive letter changes."
       putStrLn ""
       putStr $ "Name this device [" ++ defaultName ++ "]: "
@@ -4047,7 +4047,7 @@ runGitCommand cmd = do
     -- Don't print error messages for IsAncestor since non-zero exit codes are expected
     -- (they indicate "no, not an ancestor" which is a valid answer, not an error)
     when (c /= ExitSuccess && not (isAncestorCommand cmd)) $ 
-        hPutStrLn stderr ("rgit: git command failed: " ++ e)
+        hPutStrLn stderr ("bit: git command failed: " ++ e)
     putStr o
     hPutStr stderr e
     return c
@@ -4108,7 +4108,7 @@ runGitRaw args = do
   case code of
     ExitSuccess   -> pure ()
     ExitFailure n ->
-      hPutStrLn stderr ("rgit: git exited with code " ++ show n)
+      hPutStrLn stderr ("bit: git exited with code " ++ show n)
 
   pure code
 
