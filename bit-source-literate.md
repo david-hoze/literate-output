@@ -335,7 +335,7 @@ import Control.Exception (try, throwIO, SomeException, IOException)
 import System.IO (hFlush, stdout, stderr, hPutStrLn, hIsTerminalDevice)
 import Data.Maybe (fromMaybe, listToMaybe, maybe, maybeToList)
 import Data.Either (either)
-import Bit.Utils (toPosix, filterOutRgitPaths)
+import Bit.Utils (toPosix, filterOutBitPaths)
 import qualified Bit.Device as Device
 import qualified Bit.DevicePrompt as DevicePrompt
 import qualified Bit.Conflict as Conflict
@@ -1414,7 +1414,7 @@ pullManualMergeImpl remote = do
             case result of
                 Left _ -> lift $ tellErr "Error: Could not fetch remote file list."
                 Right remoteFiles -> do
-                    let filteredRemoteFiles = filterOutRgitPaths remoteFiles
+                    let filteredRemoteFiles = filterOutBitPaths remoteFiles
                     localMeta <- lift $ Verify.loadMetadataIndex (cwd </> bitIndexPath)
 
                     let remoteFileMap = Map.fromList
@@ -2892,7 +2892,7 @@ module Bit.Pipeline
 import Bit.Types
 import Bit.Diff (buildIndexFromFileEntries, computeDiff, GitDiff)
 import Bit.Plan (RcloneAction(..), planAction)
-import Bit.Utils (filterOutRgitPaths)
+import Bit.Utils (filterOutBitPaths)
 
 -- | Pure core: given source-of-truth files and current target files,
 -- produce the list of actions to make target match source.
@@ -2910,13 +2910,13 @@ diffAndPlan sourceFiles targetFiles =
 -- Takes pre-scanned local and remote file lists, returns planned actions.
 pushSyncFiles :: [FileEntry] -> [FileEntry] -> [RcloneAction]
 pushSyncFiles localFiles remoteFiles =
-  diffAndPlan localFiles (filterOutRgitPaths remoteFiles)
+  diffAndPlan localFiles (filterOutBitPaths remoteFiles)
 
 -- | Pull pipeline: compute actions to make local match remote.
 -- Note the reversed argument order: remote is source of truth, local is target.
 pullSyncFiles :: [FileEntry] -> [FileEntry] -> [RcloneAction]
 pullSyncFiles localFiles remoteFiles =
-  diffAndPlan (filterOutRgitPaths remoteFiles) localFiles
+  diffAndPlan (filterOutBitPaths remoteFiles) localFiles
 ```
 
 ---
@@ -3237,8 +3237,8 @@ scanWorkingDir root = go root
       isDir <- doesDirectoryExist path
       let rel = makeRelative root path
 
-      -- ignore .rgit folder and .git (git metadata / pointer)
-      if rel == ".rgit" || (".rgit" `isPrefixOf` rel)
+      -- ignore .bit folder and .git (git metadata / pointer)
+      if rel == ".bit" || (".bit" `isPrefixOf` rel)
           || rel == ".git" || (".git" `isPrefixOf` rel)
         then pure []
         else if isDir
@@ -3260,7 +3260,7 @@ scanWorkingDir root = go root
 
 writeMetadataFiles :: FilePath -> [FileEntry] -> IO ()
 writeMetadataFiles root entries = do
-    let metaRoot = root </> ".rgit/index"
+    let metaRoot = root </> ".bit/index"
     createDirectoryIfMissing True metaRoot
 
     forM_ entries $ \entry ->
@@ -3404,8 +3404,8 @@ runBitM env action = runReaderT action env
 
 module Bit.Utils
   ( toPosix
-  , isRgitPath
-  , filterOutRgitPaths
+  , isBitPath
+  , filterOutBitPaths
   , atomicWriteFile
   , atomicWriteFileStr
   ) where
@@ -3426,13 +3426,13 @@ import Control.Concurrent (threadDelay)
 toPosix :: FilePath -> FilePath
 toPosix = map (\c -> if c == '\\' then '/' else c)
 
--- | True if the path is or is under .rgit (rgit metadata, not user content).
-isRgitPath :: FilePath -> Bool
-isRgitPath p = p == ".rgit" || ".rgit" `isPrefixOf` p || "/.rgit" `isInfixOf` p || "\\.rgit" `isInfixOf` p
+-- | True if the path is or is under .bit (bit metadata, not user content).
+isBitPath :: FilePath -> Bool
+isBitPath p = p == ".bit" || ".bit" `isPrefixOf` p || "/.bit" `isInfixOf` p || "\\.bit" `isInfixOf` p
 
--- | Remove .rgit paths from a list of file entries (e.g. remote file list).
-filterOutRgitPaths :: [FileEntry] -> [FileEntry]
-filterOutRgitPaths = filter (\e -> not (isRgitPath e.path))
+-- | Remove .bit paths from a list of file entries (e.g. remote file list).
+filterOutBitPaths :: [FileEntry] -> [FileEntry]
+filterOutBitPaths = filter (\e -> not (isBitPath e.path))
 
 -- | Write content to target atomically (temp file + rename). Spec ┬º Atomic Operations.
 -- Uses bracketOnError to clean up temp file if an exception occurs.
@@ -3441,7 +3441,7 @@ atomicWriteFile :: FilePath -> BS.ByteString -> IO ()
 atomicWriteFile target content = do
   let tempDir = takeDirectory target
   bracketOnError
-    (openTempFile tempDir ".rgit-tmp")
+    (openTempFile tempDir ".bit-tmp")
     (\(tempPath, handle) -> do
         hClose handle
         removeFile tempPath `catch` \(_ :: IOException) -> return ())
@@ -3497,7 +3497,7 @@ module Bit.Verify
 
 import Data.Traversable (traverse)
 import Bit.Types (Hash(..), HashAlgo(..), Path, FileEntry(..), EntryKind(..), syncHash, hashToText)
-import Bit.Utils (filterOutRgitPaths)
+import Bit.Utils (filterOutBitPaths)
 import System.FilePath ((</>), makeRelative, normalise)
 import System.Directory (doesFileExist, listDirectory, doesDirectoryExist, removeFile)
 import Data.List (isPrefixOf)
@@ -3565,7 +3565,7 @@ loadMetadataIndex indexDir = do
 -- Returns (number of files checked, list of issues).
 verifyLocal :: FilePath -> IO (Int, [VerifyIssue])
 verifyLocal cwd = do
-  let indexDir = cwd </> ".rgit/index"
+  let indexDir = cwd </> ".bit/index"
   meta <- loadMetadataIndex indexDir
   -- Filter out .git directory entries
   let filteredMeta = filter (\(relPath, _, _) -> not (isGitPath relPath)) meta
@@ -3645,8 +3645,8 @@ verifyRemote cwd remote = do
   let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
   bundleExists <- doesFileExist fetchedPath
   when (not bundleExists) $ do
-    let localDest = ".rgit/temp_remote.bundle"
-    fetchResult <- Transport.copyFromRemoteDetailed remote ".rgit/rgit.bundle" localDest
+    let localDest = ".bit/temp_remote.bundle"
+    fetchResult <- Transport.copyFromRemoteDetailed remote ".bit/bit.bundle" localDest
     case fetchResult of
       Transport.CopySuccess -> do
         -- Copy to fetchedPath for consistency
@@ -3668,7 +3668,7 @@ verifyRemote cwd remote = do
       Remote.Scan.fetchRemoteFiles remote >>= either
         (\_ -> hPutStrLn stderr "Error: Could not fetch remote file list." >> return (0, []))
         (\remoteFiles -> do
-          let filteredRemoteFiles = filterOutRgitPaths remoteFiles
+          let filteredRemoteFiles = filterOutBitPaths remoteFiles
           
           -- 4. Build maps for comparison (both use MD5 hashes)
           let remoteFileMap = Map.fromList
@@ -4546,7 +4546,7 @@ checkRemote localPath remote = do
                , localPath
                , remoteUrl remote
                , "--combined", "-"
-               , "--exclude", ".rgit/**"
+               , "--exclude", ".bit/**"
                ]
     (code, out, err) <- readProcessWithExitCode "rclone" args ""
     let parsed = parseCombinedOutput out
