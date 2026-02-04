@@ -95,13 +95,13 @@ runCommand args = do
         ["verify"]                      -> runBitM env $ Bit.verify False
         ["verify", "--remote"]          -> runBitM env $ Bit.verify True
         ["fsck"]                        -> Bit.fsck cwd
-        ("add":rest)                    -> void $ Bit.add rest
-        ("commit":rest)                 -> void $ Bit.commit rest
-        ("diff":rest)                   -> void $ Bit.diff rest
-        ("log":rest)                    -> void $ Bit.log rest
-        ("restore":rest)                -> runBitM env $ Bit.restore rest
-        ("checkout":rest)               -> runBitM env $ Bit.checkout rest
-        ("status":rest)                 -> runBitM env $ Bit.status rest
+        ("add":rest)                    -> Bit.add rest >>= exitWith
+        ("commit":rest)                 -> Bit.commit rest >>= exitWith
+        ("diff":rest)                   -> Bit.diff rest >>= exitWith
+        ("log":rest)                    -> Bit.log rest >>= exitWith
+        ("restore":rest)                -> runBitM env (Bit.restore rest) >>= exitWith
+        ("checkout":rest)               -> runBitM env (Bit.checkout rest) >>= exitWith
+        ("status":rest)                 -> runBitM env (Bit.status rest) >>= exitWith
         ["fetch"]                       -> runBitM env Bit.fetch
         ["pull"]                        -> runBitM env $ Bit.pull Bit.defaultPullOptions
         ["pull", "--accept-remote"]     -> runBitM env $ Bit.pull Bit.defaultPullOptions { Bit.pullAcceptRemote = True }
@@ -622,14 +622,14 @@ removeDirectoryRecursive dir = do
 -- Stateful passthrough (needs BitEnv)
 -- ============================================================================
 
-status :: [String] -> BitM ()
+status :: [String] -> BitM ExitCode
 status args = do
-    liftIO $ void $ Git.runGitRaw ("status" : args)
+    liftIO $ Git.runGitRaw ("status" : args)
 
-restore :: [String] -> BitM ()
+restore :: [String] -> BitM ExitCode
 restore = doRestore
 
-checkout :: [String] -> BitM ()
+checkout :: [String] -> BitM ExitCode
 checkout = doCheckout
 
 -- ============================================================================
@@ -1755,7 +1755,7 @@ expandPathsToFiles cwd paths = do
 -- | Restore files from git. For text files, also copies the restored metadata
 -- file (which contains the actual content) back to the working directory.
 -- Supports full git restore syntax: restore [options] [--] <pathspec>...
-doRestore :: [String] -> BitM ()
+doRestore :: [String] -> BitM ExitCode
 doRestore args = do
     cwd <- asks envCwd
     code <- lift $ gitRaw ("restore" : args)
@@ -1775,10 +1775,11 @@ doRestore args = do
                     unless isBinaryMetadata $ do
                         lift $ createDirE (takeDirectory workPath)
                         lift $ copyFileE metaPath workPath
+    return code
 
 -- | Checkout paths from index/HEAD (git checkout [options] -- <path>).
 -- Same as restore for path form: restores metadata, copies text files to working dir.
-doCheckout :: [String] -> BitM ()
+doCheckout :: [String] -> BitM ExitCode
 doCheckout args = do
     let args' = case List.elemIndex "--" args of
           Just _ -> args
@@ -1799,6 +1800,7 @@ doCheckout args = do
                 unless isBinaryMetadata $ do
                     lift $ createDirE (takeDirectory workPath)
                     lift $ copyFileE metaPath workPath
+    return code
 
 ```
 
