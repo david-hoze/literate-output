@@ -630,6 +630,16 @@ if exist "test\cli\fs_remote_direct\other.txt" (echo other exists) else (echo mi
 >>>
 other exists
 >>>= 0
+
+# ======================================================================
+# CLEANUP
+# ======================================================================
+
+rmdir /s /q test\cli\work_direct 2>nul & rmdir /s /q test\cli\fs_remote_direct 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
+>>>= 0
 ```
 
 ---
@@ -781,6 +791,16 @@ cd test\cli\work_b & bit push
 cd test\cli\work_b & bit pull
 <<<
 >>> /Automatic merge|conflict/
+>>>= 0
+
+# ======================================================================
+# CLEANUP
+# ======================================================================
+
+rmdir /s /q test\cli\work_a 2>nul & rmdir /s /q test\cli\work_b 2>nul & rmdir /s /q test\cli\fs_remote 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
 >>>= 0
 ```
 
