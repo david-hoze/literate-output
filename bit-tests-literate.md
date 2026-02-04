@@ -1442,7 +1442,13 @@ if exist "test\cli\work_norepo\.bit\" (echo exists) else (echo missing)
 exists
 >>>= 0
 
-# After init, bit status should work
+# Clean up file.txt before testing status
+del test\cli\work_norepo\file.txt 2>nul
+<<<
+>>>
+>>>= 0
+
+# After init, bit status should work (clean working directory)
 cd test\cli\work_norepo & bit status
 <<<
 >>>
