@@ -323,13 +323,11 @@ import qualified System.Directory as Dir
 import System.Directory (copyFile, removeFile, createDirectoryIfMissing, removeDirectory, listDirectory, doesDirectoryExist)
 import System.FilePath ((</>), normalise, takeDirectory)
 import Control.Monad (when, unless, void, forM_)
-import qualified Data.ByteString.Lazy as LBS
-import qualified Data.ByteString.Lazy.Char8 as LBSC
 import System.Exit (ExitCode(..), exitWith)
 import qualified Data.Map as Map
 import qualified Internal.Git as Git
 import qualified Internal.Transport as Transport
-import Internal.Config (bitDir, bitIgnore, bitGitDir, fetchedBundle, bitIndexPath, bitDevicesDir, bitRemotesDir, bundleCwdPath, bundleGitRelPath, fromCwdPath, fromGitRelPath, BundleName(..))
+import Internal.Config (bitDir, bitGitDir, fetchedBundle, bitIndexPath, bitDevicesDir, bitRemotesDir, bundleCwdPath, bundleGitRelPath, fromCwdPath, fromGitRelPath, BundleName(..))
 import qualified Bit.Internal.Metadata as Metadata
 import Bit.Internal.Metadata (MetaContent(..), parseMetadata, displayHash, serializeMetadata)
 import Data.Char (isSpace)
@@ -457,37 +455,18 @@ initializeRepo = do
     -- 3a. Create .git/bundles directory for storing bundle files
     Dir.createDirectoryIfMissing True (bitGitDir </> "bundles")
 
-    -- 4. Configure Git to look for the ignore file inside .bit
-    -- This is the magic step!
-    Git.config "core.excludesFile" bitIgnore
-    
-    -- 5. Configure default branch name to "main" (for the repo we just created)
+    -- 4. Configure default branch name to "main" (for the repo we just created)
     -- This affects future branch operations in this repo
     Git.config "init.defaultBranch" "main"
     
-    -- 6. Rename the initial branch to "main" if it's "master"
+    -- 5. Rename the initial branch to "main" if it's "master"
     -- Git init creates "master" by default, so we rename it
     (code, _, _) <- Git.runGitWithOutput ["branch", "-m", "master", "main"]
     when (code /= ExitSuccess) $
         -- If rename failed (e.g., no commits yet), that's okay - first commit will use "main"
         return ()
 
-    -- 4. Create the ignore file inside .bit
-    -- Now we only need one rule: ignore everything. 
-    -- Because the git-dir and ignore file are inside .bit, 
-    -- they are "invisible" to the work-tree anyway.
-    LBS.writeFile bitIgnore (LBSC.pack $ unlines [
-        "*",                -- Ignore everything in the root
-        "!.bit/",          -- Allow the .bit folder
-        "!.bit/index/",
-        "!.bit/ignore",
-        "!.bit/target",
-        "!.bit/devices/",
-        "!.bit/remotes/",
-        ".bit/index/.git/"   -- EXPLICITLY ignore the git metadata folder
-        ])
-
-    -- 4. Create other .bit subdirectories (index already created above)
+    -- 6. Create other .bit subdirectories (index already created above)
     Dir.createDirectoryIfMissing True bitDevicesDir
     Dir.createDirectoryIfMissing True bitRemotesDir
 
@@ -3760,10 +3739,9 @@ newtype GitRelPath = GitRelPath FilePath deriving (Show, Eq)
 -- | Path relative to CWD. Used for direct filesystem operations (copyFile, doesFileExist, etc).
 newtype CwdPath = CwdPath FilePath deriving (Show, Eq)
 
-bitDir, bitTargetPath, bitIgnore, bitGitDir, bitIndexPath, bitDevicesDir, bitRemotesDir :: FilePath
+bitDir, bitTargetPath, bitGitDir, bitIndexPath, bitDevicesDir, bitRemotesDir :: FilePath
 bitDir           = ".bit"
 bitTargetPath    = bitDir </> "target"
-bitIgnore        = bitDir </> "ignore"
 bitDevicesDir    = bitDir </> "devices"
 bitRemotesDir    = bitDir </> "remotes"
 bitIndexPath     = bitDir </> "index"

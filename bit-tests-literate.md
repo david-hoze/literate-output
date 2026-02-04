@@ -771,12 +771,6 @@ rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit i
 >>> /Initialized/
 >>>= 0
 
-# Verify core.excludesFile was configured
-cd test\cli\work & git -C .bit\index config --get core.excludesFile
-<<<
->>> /\.bit/
->>>= 0
-
 # Verify init.defaultBranch was set to "main"
 cd test\cli\work & git -C .bit\index config --get init.defaultBranch
 <<<
