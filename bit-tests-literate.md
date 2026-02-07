@@ -89,9 +89,9 @@ import Test.Tasty
 import Test.Tasty.HUnit
 import System.Directory (doesDirectoryExist, listDirectory)
 import System.FilePath ((</>), takeExtension)
-import Control.Monad (filterM, forM)
+import Control.Monad (filterM)
 import Data.Char (toLower, isSpace)
-import Data.List (isInfixOf, isPrefixOf, groupBy)
+import Data.List (isInfixOf, isPrefixOf)
 
 main :: IO ()
 main = do
@@ -211,25 +211,6 @@ dangerousPatterns =
        "Use relative paths or test-specific directories instead.")
     ]
 
--- | Classify a line within a test case
-classifyLine :: Maybe LineType -> String -> LineType
-classifyLine _ line
-    | all isSpace line = BlankLine
-    | "#" `isPrefixOf` stripped = CommentLine
-    | ">>>=" `isPrefixOf` stripped = ExitCodeDirective (drop 4 stripped)
-    | ">>>2" `isPrefixOf` stripped = StderrDirective (drop 4 stripped)
-    | ">>>" `isPrefixOf` stripped = StdoutDirective (drop 3 stripped)
-    | "<<<" `isPrefixOf` stripped = StdinDirective (drop 3 stripped)
-    | otherwise = case prevLineType of
-        Just (StdinDirective _) -> ContinuationLine line
-        Just (StdoutDirective _) -> ContinuationLine line
-        Just (StderrDirective _) -> ContinuationLine line
-        Just (ContinuationLine _) -> ContinuationLine line
-        _ -> CommandLine line
-  where
-    stripped = dropWhile isSpace line
-    prevLineType = Nothing  -- This gets tracked in the fold
-
 -- | Split file content into test cases
 splitTestCases :: [(Int, String)] -> [TestCase]
 splitTestCases linesWithNums = 
@@ -242,8 +223,8 @@ splitTestCases linesWithNums =
     -- Group consecutive non-blank lines into test cases
     groupTestCaseBlocks :: [(Int, String)] -> [[(Int, String)]]
     groupTestCaseBlocks [] = []
-    groupTestCaseBlocks lines =
-        let (block, rest) = span (not . isBlankOrComment . snd) lines
+    groupTestCaseBlocks linesWithNumbers =
+        let (block, rest) = span (not . isBlankOrComment . snd) linesWithNumbers
             rest' = dropWhile (isBlankOrComment . snd) rest
         in if null block
             then groupTestCaseBlocks rest'
@@ -297,7 +278,7 @@ checkDuplicateDirective path directiveName occurrences
 
 -- | Check for missing exit code (warning level)
 checkMissingExitCode :: FilePath -> TestCase -> [String]
-checkMissingExitCode path tc
+checkMissingExitCode _path tc
     | null (tcExitCode tc) && isActualTestCase tc = []  -- Temporarily disabled - too many false positives
     | otherwise = []
   where
@@ -575,12 +556,11 @@ import Test.Tasty
 import Test.Tasty.QuickCheck
 import Test.Tasty.HUnit
 
-import qualified Data.List as List
 import Data.List (sort, group)
 import Bit.Types
 import Bit.Diff (GitDiff(..), LightFileEntry(..), FileIndex, buildIndexFromFileEntries, computeDiff)
-import Bit.Plan (RcloneAction(..), planAction)
-import Bit.Pipeline (diffAndPlan, pushSyncFiles, pullSyncFiles)
+import Bit.Plan (RcloneAction(..))
+import Bit.Pipeline (diffAndPlan)
 import qualified Data.Text as T
 
 -- Arbitrary instances for property testing
@@ -600,9 +580,9 @@ instance Arbitrary FileEntry where
     -- Generate simple relative paths
     depth <- choose (1, 3) :: Gen Int
     segments <- vectorOf depth (vectorOf 5 (elements "abcdefghijklmnop"))
-    let path = foldl1 (\a b -> a ++ "/" ++ b) segments
+    let filePath = foldl1 (\a b -> a ++ "/" ++ b) segments
     k <- arbitrary
-    return $ FileEntry path k
+    return $ FileEntry filePath k
 
 main :: IO ()
 main = defaultMain tests
@@ -710,9 +690,7 @@ import Control.Exception (catch, SomeException)
 import Control.Monad (void)
 import System.Environment (getEnvironment, setEnv)
 import System.FilePath (takeDirectory, (</>))
-import System.Directory (getCurrentDirectory)
 import Data.List (lookup)
-import Data.Maybe (fromMaybe)
 import System.Info (os)
 
 main :: IO ()
