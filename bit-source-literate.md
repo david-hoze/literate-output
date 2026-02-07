@@ -7587,7 +7587,8 @@ test-suite pipeline
     type:                exitcode-stdio-1.0
     main-is:             PipelineSpec.hs
     hs-source-dirs:      test, .
-    other-modules:       Bit.Types,
+    other-modules:       Bit.AtomicWrite,
+                         Bit.Types,
                          Bit.Diff,
                          Bit.Plan,
                          Bit.Pipeline,
