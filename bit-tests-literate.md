@@ -733,7 +733,7 @@ main = do
 # =============================================================================
 
 # ---- Clean up all known test directories ----
-timeout /t 1 >nul & rmdir /s /q test\cli\work 2>nul & rmdir /s /q test\cli\work_a 2>nul & rmdir /s /q test\cli\work_b 2>nul & rmdir /s /q test\cli\work_gdrive_a 2>nul & rmdir /s /q test\cli\work_gdrive_b 2>nul & rmdir /s /q test\cli\work_merge_a 2>nul & rmdir /s /q test\cli\work_merge_b 2>nul & rmdir /s /q test\cli\work_direct 2>nul & rmdir /s /q test\cli\shared_remote 2>nul & rmdir /s /q test\cli\shared_merge_remote 2>nul & rmdir /s /q test\cli\fs_remote_direct 2>nul & rmdir /s /q test\cli\device_prompt_remote 2>nul & rmdir /s /q test\cli\remote_mirror 2>nul & rmdir /s /q test\cli\upstream-local 2>nul & rmdir /s /q test\cli\upstream-local2 2>nul & rmdir /s /q test\cli\upstream-local3 2>nul & rmdir /s /q test\cli\upstream-local4 2>nul & rmdir /s /q test\cli\upstream-remote 2>nul & rmdir /s /q test\cli\upstream-remote3 2>nul & rmdir /s /q test\cli\upstream-remote4 2>nul & rmdir /s /q test\cli\work_progress_a 2>nul & rmdir /s /q test\cli\work_progress_b 2>nul & rmdir /s /q test\cli\fs_remote_progress 2>nul & rmdir /s /q test\cli\work_verify_progress 2>nul & rmdir /s /q test\cli\work_process 2>nul & rmdir /s /q test\cli\work_skipscan 2>nul & rmdir /s /q test\cli\work_remote_show 2>nul & rmdir /s /q test\cli\remote_show_a 2>nul & rmdir /s /q test\cli\remote_show_b 2>nul & rmdir /s /q test\cli\work_check_progress 2>nul & rmdir /s /q test\cli\remote_check_progress 2>nul & rmdir /s /q test\cli\work_check_small 2>nul & rmdir /s /q test\cli\remote_check_small 2>nul & rmdir /s /q test\cli\work_unicode_remote 2>nul & rmdir /s /q test\cli\work_unicode_remote_b 2>nul & rmdir /s /q test\cli\fs_unicode_remote 2>nul & rmdir /s /q test\cli\work_pop_local 2>nul & rmdir /s /q test\cli\work_pop_remote 2>nul & rmdir /s /q test\cli\work_rmt_a 2>nul & rmdir /s /q test\cli\fs_remote_rmt 2>nul & echo global cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\work 2>nul & rmdir /s /q test\cli\work_a 2>nul & rmdir /s /q test\cli\work_b 2>nul & rmdir /s /q test\cli\work_gdrive_a 2>nul & rmdir /s /q test\cli\work_gdrive_b 2>nul & rmdir /s /q test\cli\work_merge_a 2>nul & rmdir /s /q test\cli\work_merge_b 2>nul & rmdir /s /q test\cli\work_direct 2>nul & rmdir /s /q test\cli\shared_remote 2>nul & rmdir /s /q test\cli\shared_merge_remote 2>nul & rmdir /s /q test\cli\fs_remote_direct 2>nul & rmdir /s /q test\cli\device_prompt_remote 2>nul & rmdir /s /q test\cli\remote_mirror 2>nul & rmdir /s /q test\cli\upstream-local 2>nul & rmdir /s /q test\cli\upstream-local2 2>nul & rmdir /s /q test\cli\upstream-local3 2>nul & rmdir /s /q test\cli\upstream-local4 2>nul & rmdir /s /q test\cli\upstream-remote 2>nul & rmdir /s /q test\cli\upstream-remote3 2>nul & rmdir /s /q test\cli\upstream-remote4 2>nul & rmdir /s /q test\cli\work_progress_a 2>nul & rmdir /s /q test\cli\work_progress_b 2>nul & rmdir /s /q test\cli\fs_remote_progress 2>nul & rmdir /s /q test\cli\work_verify_progress 2>nul & rmdir /s /q test\cli\work_process 2>nul & rmdir /s /q test\cli\work_skipscan 2>nul & rmdir /s /q test\cli\work_remote_show 2>nul & rmdir /s /q test\cli\remote_show_a 2>nul & rmdir /s /q test\cli\remote_show_b 2>nul & rmdir /s /q test\cli\work_check_progress 2>nul & rmdir /s /q test\cli\remote_check_progress 2>nul & rmdir /s /q test\cli\work_check_small 2>nul & rmdir /s /q test\cli\remote_check_small 2>nul & rmdir /s /q test\cli\work_unicode_remote 2>nul & rmdir /s /q test\cli\work_unicode_remote_b 2>nul & rmdir /s /q test\cli\fs_unicode_remote 2>nul & rmdir /s /q test\cli\work_pop_local 2>nul & rmdir /s /q test\cli\work_pop_remote 2>nul & rmdir /s /q test\cli\work_rmt_a 2>nul & rmdir /s /q test\cli\fs_remote_rmt 2>nul & rmdir /s /q test\cli\work_fetch_a 2>nul & rmdir /s /q test\cli\work_fetch_b 2>nul & echo global cleanup done
 <<<
 >>>
 global cleanup done
@@ -1062,6 +1062,147 @@ findstr /C:"device:" test\cli\work\.bit\remotes\origin >nul || findstr /C:"local
 subst Z: /D 2>nul & rmdir /s /q test\cli\work 2>nul & rmdir /s /q test\cli\device_prompt_remote 2>nul
 <<<
 >>>
+>>>= 0
+```
+
+---
+
+## test/cli/fetch-output.test
+
+**Path:** `test/cli/fetch-output.test`
+
+*Source file.*
+
+```text
+# =============================================================================
+# Fetch Output - Test FetchOutcome rendering patterns
+#
+# Tests that fetch produces correct output for different scenarios:
+# - FetchedFirst: First fetch shows "Fetched: <hash>"
+# - UpToDate: Silent when bundle unchanged
+# - Updated: Shows "Updated: <old> -> <new>"
+# Prerequisites: rclone remote "gdrive-test" configured
+# =============================================================================
+
+# ---- CLEANUP: remove any leftover state from previous runs ----
+timeout /t 1 >nul & rmdir /s /q test\cli\work_fetch_a 2>nul & rmdir /s /q test\cli\work_fetch_b 2>nul & rclone purge gdrive-test:bit-test-fetch 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
+>>>= 0
+
+# ======================================================================
+# SETUP
+# ======================================================================
+
+mkdir test\cli\work_fetch_a
+<<<
+>>>
+>>>= 0
+
+mkdir test\cli\work_fetch_b
+<<<
+>>>
+>>>= 0
+
+rclone mkdir gdrive-test:bit-test-fetch
+<<<
+>>>
+>>>= 0
+
+# ---- Repo A: init, add remote, create initial file ----
+cd test\cli\work_fetch_a & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+cd test\cli\work_fetch_a & bit remote add origin gdrive-test:bit-test-fetch
+<<<
+>>> /Remote.*added/
+>>>= 0
+
+cd test\cli\work_fetch_a & echo initial> file1.txt & bit add file1.txt & bit commit -m "Initial commit"
+<<<
+>>> /\[master|main|file changed/
+>>>= 0
+
+cd test\cli\work_fetch_a & bit push
+<<<
+>>> /Metadata push complete\.|Remote check passed/
+>>>= 0
+
+# ======================================================================
+# TEST CASE 1: FetchedFirst - First fetch should show output
+# ======================================================================
+
+cd test\cli\work_fetch_b & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+cd test\cli\work_fetch_b & bit remote add origin gdrive-test:bit-test-fetch
+<<<
+>>> /Remote.*added/
+>>>= 0
+
+# ---- First fetch: should show "Fetched: <hash>" and "From <remote>" ----
+cd test\cli\work_fetch_b & bit fetch
+<<<
+>>> /Scanning remote|Fetched:|Fetch complete/
+>>>2 /From gdrive-test:bit-test-fetch|new branch.*origin\/main/
+>>>= 0
+
+# ======================================================================
+# TEST CASE 2: UpToDate - Second fetch should be silent
+# ======================================================================
+
+# ---- Second fetch with no changes: should be silent (UpToDate) ----
+cd test\cli\work_fetch_b & bit fetch
+<<<
+>>>
+>>>= 0
+
+# ---- Third fetch still silent ----
+cd test\cli\work_fetch_b & bit fetch
+<<<
+>>>
+>>>= 0
+
+# ======================================================================
+# TEST CASE 3: Updated - Fetch after remote update should show update
+# ======================================================================
+
+# ---- A: make a change and push ----
+cd test\cli\work_fetch_a & echo updated> file2.txt & bit add file2.txt & bit commit -m "Second commit"
+<<<
+>>> /\[master|main|file changed/
+>>>= 0
+
+cd test\cli\work_fetch_a & bit push
+<<<
+>>> /Metadata push complete\.|Remote check passed/
+>>>= 0
+
+# ---- B: fetch should show "Updated: <old> -> <new>" ----
+cd test\cli\work_fetch_b & bit fetch
+<<<
+>>> /Scanning remote|Updated:|Fetch complete/
+>>>= 0
+
+# ---- B: fetch again should be silent (UpToDate) ----
+cd test\cli\work_fetch_b & bit fetch
+<<<
+>>>
+>>>= 0
+
+# ======================================================================
+# CLEANUP
+# ======================================================================
+
+timeout /t 1 >nul & rmdir /s /q test\cli\work_fetch_a 2>nul & rmdir /s /q test\cli\work_fetch_b 2>nul & rclone purge gdrive-test:bit-test-fetch 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
 >>>= 0
 ```
 
