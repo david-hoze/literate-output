@@ -1945,7 +1945,7 @@ A remote workspace is a temporary `.bit/index` built from the remote's actual fi
 
 #### Text File Classification Without Full Download
 
-The `rclone lsjson --hash` scan returns hashes for all files, but `fIsText = False` for everything (rclone can't classify text without reading content). bit's text classification needs:
+The `rclone lsjson --hash` scan returns hashes for all files, but `fContentType = BinaryContent` for everything (rclone can't classify text without reading content). bit's text classification needs:
 1. File size (available from rclone scan)
 2. File extension (available from path)
 3. First 8KB of content (for NULL-byte and UTF-8 checks)
@@ -2307,7 +2307,7 @@ The flow:
 
 **Important**: `--accept-remote` must NOT scan remote files via rclone and write
 metadata directly. Rclone cannot distinguish text from binary files
-(`fIsText = False` for everything), so text files would get `hash:/size:`
+(`fContentType = BinaryContent` for everything), so text files would get `hash:/size:`
 metadata instead of their actual content.
 
 ### Resolution Option 2: Force Local (`bit push --force`)
@@ -2640,7 +2640,7 @@ See `test/cli/README.md` "Forbidden Patterns" section for detailed explanation a
 - Add MTL-style type classes or free monad effects (premature)
 - Merge `diff` and `plan` into a single function
 - Write metadata to `.bit/index/` directly and then commit (bypasses git;
-  rclone scans set `fIsText = False` for everything, producing wrong metadata
+  rclone scans set `fContentType = BinaryContent` for everything, producing wrong metadata
   for text files)
 - Guard merge commits on `hasStagedChanges` when `MERGE_HEAD` exists (the
   commit must always be created to finalize the merge, even when the tree is

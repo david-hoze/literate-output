@@ -1840,7 +1840,7 @@ import Data.Char (isSpace)
 import Data.List (isPrefixOf, foldl')
 import System.IO (stderr, hPutStrLn)
 import Data.Maybe (mapMaybe)
-import Bit.Types (BitM, BitEnv(..))
+import Bit.Types (BitM, BitEnv(..), unPath)
 import Control.Monad.Trans.Reader (asks)
 import Control.Monad.IO.Class (liftIO)
 import Bit.Utils (toPosix, atomicWriteFileStr)
@@ -1951,11 +1951,11 @@ formatPathList paths
 printVerifyIssue :: (String -> String) -> Verify.VerifyIssue -> IO ()
 printVerifyIssue fmtHash = \case
   Verify.HashMismatch filePath expectedHash actualHash _expectedSize _actualSize -> do
-    hPutStrLn stderr $ "[ERROR] Hash mismatch: " ++ toPosix filePath
+    hPutStrLn stderr $ "[ERROR] Hash mismatch: " ++ toPosix (unPath filePath)
     hPutStrLn stderr $ "  Expected: " ++ fmtHash expectedHash
     hPutStrLn stderr $ "  Actual:   " ++ fmtHash actualHash
   Verify.Missing filePath ->
-    hPutStrLn stderr $ "[ERROR] Missing: " ++ toPosix filePath
+    hPutStrLn stderr $ "[ERROR] Missing: " ++ toPosix (unPath filePath)
 
 parseFilesystemDiffOutput :: String -> [(Char, FilePath, Maybe FilePath)]
 parseFilesystemDiffOutput = mapMaybe parseLine . lines
@@ -2188,7 +2188,7 @@ import Control.Exception (try, SomeException, throwIO)
 import Bit.Utils (toPosix, filterOutBitPaths)
 import Data.Maybe (maybeToList)
 import Bit.Remote (Remote, remoteName, remoteUrl)
-import Bit.Types (BitM, BitEnv(..), Hash, HashAlgo(..), EntryKind(..), syncHash, runBitM)
+import Bit.Types (BitM, BitEnv(..), Hash, HashAlgo(..), EntryKind(..), syncHash, runBitM, unPath)
 import Control.Monad.Trans.Reader (asks)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Class (lift)
@@ -2466,12 +2466,12 @@ pullManualMergeImpl remote = do
                     localMeta <- lift $ Verify.loadBinaryMetadata (cwd </> bitIndexPath) (Parallel 0)
 
                     let remoteFileMap = Map.fromList
-                          [ (normalise e.path, (h, e.kind))
+                          [ (normalise (unPath e.path), (h, e.kind))
                           | e <- filteredRemoteFiles
                           , h <- maybeToList (syncHash e.kind)
                           ]
-                        remoteMetaMap = Map.fromList [(normalise p, (h, sz)) | (p, h, sz) <- remoteMeta]
-                        localMetaMap = Map.fromList [(normalise p, (h, sz)) | (p, h, sz) <- localMeta]
+                        remoteMetaMap = Map.fromList [(normalise (unPath p), (h, sz)) | (p, h, sz) <- remoteMeta]
+                        localMetaMap = Map.fromList [(normalise (unPath p), (h, sz)) | (p, h, sz) <- localMeta]
 
                     lift $ tell "Comparing..."
                     let divergentFiles = findDivergentFiles remoteFileMap remoteMetaMap localMetaMap
@@ -3445,7 +3445,7 @@ import System.IO (stderr, hPutStrLn)
 import Bit.Utils (toPosix)
 import Bit.Plan (RcloneAction(..))
 import Bit.Remote (Remote)
-import Bit.Types (BitM, BitEnv(..))
+import Bit.Types (BitM, BitEnv(..), unPath)
 import Control.Monad.Trans.Reader (asks)
 import Control.Monad.IO.Class (liftIO)
 import qualified Bit.CopyProgress as CopyProgress
@@ -3879,14 +3879,14 @@ syncBinariesAfterMerge transport _remote oldHead = do
 executeCommand :: FilePath -> Remote -> RcloneAction -> IO ()
 executeCommand localRoot remote action = case action of
         Copy src dest -> do
-            let localPath = toPosix (localRoot </> src)
-            void $ Transport.copyToRemote localPath remote (toPosix dest)
+            let localPath = toPosix (localRoot </> unPath src)
+            void $ Transport.copyToRemote localPath remote (toPosix (unPath dest))
 
         Move src dest ->
-            void $ Transport.moveRemote remote (toPosix src) (toPosix dest)
+            void $ Transport.moveRemote remote (toPosix (unPath src)) (toPosix (unPath dest))
 
         Delete p ->
-            void $ Transport.deleteRemote remote (toPosix p)
+            void $ Transport.deleteRemote remote (toPosix (unPath p))
 
         Swap _ _ _ -> pure ()  -- not produced by planAction; future-proofing
 
@@ -3895,26 +3895,26 @@ executeCommand localRoot remote action = case action of
 executePullCommand :: FilePath -> Remote -> RcloneAction -> IO ()
 executePullCommand localRoot remote action = case action of
         Copy _src dest -> do
-            fromIndex <- isTextFileInIndex localRoot dest
+            fromIndex <- isTextFileInIndex localRoot (unPath dest)
             if fromIndex
-            then copyFromIndexToWorkTree localRoot dest
+            then copyFromIndexToWorkTree localRoot (unPath dest)
             else do
-                let localPath = toPosix (localRoot </> dest)
-                createDirectoryIfMissing True (takeDirectory (localRoot </> dest))
-                void $ Transport.copyFromRemote remote (toPosix dest) localPath
+                let localPath = toPosix (localRoot </> unPath dest)
+                createDirectoryIfMissing True (takeDirectory (localRoot </> unPath dest))
+                void $ Transport.copyFromRemote remote (toPosix (unPath dest)) localPath
         Move src dest -> do
-            fromIndex <- isTextFileInIndex localRoot src
+            fromIndex <- isTextFileInIndex localRoot (unPath src)
             if fromIndex
-            then copyFromIndexToWorkTree localRoot src
+            then copyFromIndexToWorkTree localRoot (unPath src)
             else do
-                let localSrcPath = localRoot </> src
+                let localSrcPath = localRoot </> unPath src
                 createDirectoryIfMissing True (takeDirectory localSrcPath)
-                void $ Transport.copyFromRemote remote (toPosix src) (toPosix localSrcPath)
-            let localDestPath = localRoot </> dest
+                void $ Transport.copyFromRemote remote (toPosix (unPath src)) (toPosix localSrcPath)
+            let localDestPath = localRoot </> unPath dest
             exists <- Dir.doesFileExist localDestPath
             when exists $ Dir.removeFile localDestPath
         Delete filePath -> do
-            let localPath = localRoot </> filePath
+            let localPath = localRoot </> unPath filePath
             exists <- Dir.doesFileExist localPath
             when exists $ Dir.removeFile localPath
         Swap _ _ _ -> pure ()
@@ -4802,10 +4802,10 @@ computeDiff local remote =
       ]
 
 formatDiff :: GitDiff -> String
-formatDiff (Added f)      = "[+] Added:    " ++ f.filePath
-formatDiff (Deleted f)    = "[-] Deleted:  " ++ f.filePath
-formatDiff (Modified f)   = "[*] Modified: " ++ f.filePath
-formatDiff (Renamed o n)  = "[M] Moved:    " ++ o.filePath ++ " -> " ++ n.filePath
+formatDiff (Added f)      = "[+] Added:    " ++ unPath f.filePath
+formatDiff (Deleted f)    = "[-] Deleted:  " ++ unPath f.filePath
+formatDiff (Modified f)   = "[*] Modified: " ++ unPath f.filePath
+formatDiff (Renamed o n)  = "[M] Moved:    " ++ unPath o.filePath ++ " -> " ++ unPath n.filePath
 ```
 
 ---
@@ -4969,6 +4969,7 @@ module Bit.Fsck
 import qualified Bit.Verify as Verify
 import qualified Bit.Utils as Utils
 import qualified Internal.Git as Git
+import Bit.Types (unPath)
 import Bit.Concurrency (Concurrency(..))
 import System.FilePath ((</>))
 import System.Exit (ExitCode(..), exitWith)
@@ -5044,9 +5045,9 @@ doFsck cwd concurrency = do
     printIssue :: (FilePath -> FilePath) -> Verify.VerifyIssue -> IO ()
     printIssue toP = \case
       Verify.HashMismatch path _ _ _ _ ->
-        hPutStrLn stderr $ "hash mismatch " ++ toP path
+        hPutStrLn stderr $ "hash mismatch " ++ toP (unPath path)
       Verify.Missing path ->
-        hPutStrLn stderr $ "missing " ++ toP path
+        hPutStrLn stderr $ "missing " ++ toP (unPath path)
     
     -- Progress reporter loop for fsck operation
     fsckProgressLoop :: IORef Int -> Int -> IO ()
@@ -5704,7 +5705,7 @@ module Bit.RemoteWorkspace
   , remoteWorkspacePath
   ) where
 
-import Bit.Types (FileEntry(..), EntryKind(..))
+import Bit.Types (FileEntry(..), EntryKind(..), ContentType(..), Path(..))
 import Bit.Remote (Remote, remoteUrl)
 import qualified Bit.Remote.Scan as Remote.Scan
 import Bit.Scan (hashAndClassifyFile, binaryExtensions)
@@ -5749,7 +5750,7 @@ partitionFiles config = partition isBinary
     isBinary fe = case kind fe of
         File{fSize} ->
             fSize >= ConfigFile.textSizeLimit config
-            || map toLower (takeExtension (path fe)) `elem` binaryExtensions
+            || map toLower (takeExtension (unPath (path fe))) `elem` binaryExtensions
         _ -> True  -- directories are not text candidates
 
 -- | Download text candidate files from remote, classify them, return updated FileEntries.
@@ -5764,22 +5765,22 @@ classifyRemoteTextCandidates remote config candidates = do
     -- Download and classify each candidate file
     classifiedEntries <- forM candidates $ \fe -> do
         let remotePath = path fe  -- Already normalized by rclone
-        let localPath = tempDir </> path fe
+        let localPath = tempDir </> unPath (path fe)
         createDirectoryIfMissing True (takeDirectory localPath)
 
         -- Download via rclone
-        code <- Transport.copyFromRemote remote remotePath localPath
+        code <- Transport.copyFromRemote remote (unPath remotePath) localPath
         case code of
             ExitSuccess -> do
                 -- Classify using existing function
                 case kind fe of
                     File{fSize} -> do
                         (h, isText) <- hashAndClassifyFile localPath fSize config
-                        pure fe { kind = File { fHash = h, fSize = fSize, fIsText = isText } }
+                        pure fe { kind = File { fHash = h, fSize = fSize, fContentType = if isText then TextContent else BinaryContent } }
                     _ -> pure fe
             _ -> do
                 -- Download failed — treat as binary, keep rclone hash
-                hPutStrLn stderr $ "Warning: Could not download " ++ path fe ++ " for classification, treating as binary."
+                hPutStrLn stderr $ "Warning: Could not download " ++ unPath (path fe) ++ " for classification, treating as binary."
                 pure fe
 
     -- Cleanup temp dir
@@ -5809,7 +5810,7 @@ initRemoteWorkspace cwd remote remName = do
             hPutStrLn stderr $ "Error scanning remote: " ++ show err
             exitWith (ExitFailure 1)
         Right remoteFiles -> do
-            let files = filter (not . isBitPath . path) remoteFiles
+            let files = filter (not . isBitPath . unPath . path) remoteFiles
             putStrLn $ "Found " ++ show (length files) ++ " files on remote."
 
             -- Step 2: Partition into binary (certain) and text candidates
@@ -5837,22 +5838,22 @@ initRemoteWorkspace cwd remote remName = do
             let (textFiles, binaryFiles) = partition isTextFile allFiles
                   where
                     isTextFile fe = case kind fe of
-                        File{fIsText} -> fIsText
+                        File{fContentType = TextContent} -> True
                         _ -> False
             
             -- For text files from the classified set: download them again to the workspace
             -- (we could optimize by keeping the temp files, but this is simpler and more robust)
             putStrLn $ "Downloading " ++ show (length textFiles) ++ " text files..."
             forM_ textFiles $ \fe -> do
-                let localPath = wsPath </> path fe
+                let localPath = wsPath </> unPath (path fe)
                 createDirectoryIfMissing True (takeDirectory localPath)
-                code <- Transport.copyFromRemote remote (path fe) localPath
+                code <- Transport.copyFromRemote remote (unPath (path fe)) localPath
                 when (code /= ExitSuccess) $
-                    hPutStrLn stderr $ "Warning: Failed to download text file " ++ path fe
+                    hPutStrLn stderr $ "Warning: Failed to download text file " ++ unPath (path fe)
 
             -- For binary files: write metadata
             forM_ binaryFiles $ \fe -> do
-                let metaPath = wsPath </> path fe
+                let metaPath = wsPath </> unPath (path fe)
                 createDirectoryIfMissing True (takeDirectory metaPath)
                 case kind fe of
                     File{fHash, fSize} ->
@@ -5933,8 +5934,8 @@ fetchRemoteFiles remote = do
 rcloneFileToFileEntry :: RcloneFile -> FileEntry
 rcloneFileToFileEntry rf =
   FileEntry
-    { path = normalise rf.rfPath
-    , kind = File { fHash = Hash (T.pack ("md5:" ++ md5)), fSize = rf.rfSize, fIsText = False }
+    { path = Path (normalise rf.rfPath)
+    , kind = File { fHash = Hash (T.pack ("md5:" ++ md5)), fSize = rf.rfSize, fContentType = BinaryContent }
     }
     where
       md5 =
@@ -5985,7 +5986,7 @@ module Bit.Scan
   , EntryKind(..)
   ) where
 
-import Bit.Types (Hash(..), HashAlgo(..), FileEntry(..), EntryKind(..), hashToText)
+import Bit.Types (Hash(..), HashAlgo(..), FileEntry(..), EntryKind(..), ContentType(..), hashToText, Path(..))
 import System.FilePath
 import System.Directory
     ( doesDirectoryExist,
@@ -6222,7 +6223,7 @@ scanWorkingDir root = do
     
       -- Separate directories from files to hash
       let (dirs, _files) = partition snd allPaths
-          dirEntries = [FileEntry { path = rel, kind = Directory } | (rel, _) <- dirs]
+          dirEntries = [FileEntry { path = Path rel, kind = Directory } | (rel, _) <- dirs]
           filesToHash = [(rel, root </> rel) | (rel, False) <- allPaths
                                              , not (Set.member (normalizePath rel) ignoredSet)]
     
@@ -6244,8 +6245,8 @@ scanWorkingDir root = do
                   -- Cache hit: reuse hash and isText
                   atomicModifyIORef' counter (\n -> (n + 1, ()))
                   pure $ FileEntry
-                      { path = rel
-                      , kind = File { fHash = ceHash ce, fSize = fromIntegral size, fIsText = ceIsText ce }
+                      { path = Path rel
+                      , kind = File { fHash = ceHash ce, fSize = fromIntegral size, fContentType = if ceIsText ce then TextContent else BinaryContent }
                       }
                 _ -> do
                   -- Cache miss: hash the file, save cache entry
@@ -6253,8 +6254,8 @@ scanWorkingDir root = do
                   saveCacheEntry root rel (CacheEntry mtimeInt (fromIntegral size) h isText)
                   atomicModifyIORef' counter (\n -> (n + 1, ()))
                   pure $ FileEntry
-                      { path = rel
-                      , kind = File { fHash = h, fSize = fromIntegral size, fIsText = isText }
+                      { path = Path rel
+                      , kind = File { fHash = h, fSize = fromIntegral size, fContentType = if isText then TextContent else BinaryContent }
                       }
     
       -- Wrap hashing with progress reporter
@@ -6310,7 +6311,7 @@ writeMetadataFiles root entries = do
         createDirectoryIfMissing True fullPath
     
       -- Second pass: create parent directories for files
-      let parentDirs = Set.fromList [takeDirectory (path e) | e <- files]
+      let parentDirs = Set.fromList [takeDirectory (unPath (path e)) | e <- files]
       forM_ parentDirs $ \dirPath -> do
         let fullPath = metaRoot </> dirPath
         createDirectoryIfMissing True fullPath
@@ -6332,19 +6333,19 @@ writeMetadataFiles root entries = do
       let concurrency = max 4 (caps * 4)
     
       let writeWithProgress entry = do
-              let metaPath = metaRoot </> path entry
+              let metaPath = metaRoot </> unPath (path entry)
               case kind entry of
-                File { fHash, fSize, fIsText } -> do
+                File { fHash, fSize, fContentType } -> do
                   -- Check if file is unchanged before writing
-                  needsWrite <- shouldWriteFile root metaPath entry fHash fSize fIsText
+                  needsWrite <- shouldWriteFile root metaPath entry fHash fSize fContentType
                   if needsWrite
                     then do
-                      if fIsText
-                        then do
+                      case fContentType of
+                        TextContent -> do
                           -- For text files, copy the actual content directly
-                          let actualPath = root </> path entry
+                          let actualPath = root </> unPath (path entry)
                           copyFileWithMetadata actualPath metaPath
-                        else do
+                        BinaryContent -> do
                           -- For binary files, write metadata (hash + size). Spec: raw hash value; atomic write.
                           atomicWriteFileStr metaPath $
                             serializeMetadata (MetaContent fHash fSize)
@@ -6372,7 +6373,7 @@ writeMetadataFiles root entries = do
   where
     partitionEntries :: [FileEntry] -> ([FilePath], [FileEntry])
     partitionEntries es =
-      let dirs = [path e | e <- es, case kind e of Directory -> True; _ -> False]
+      let dirs = [unPath (path e) | e <- es, case kind e of Directory -> True; _ -> False]
           files = [e | e <- es, case kind e of File{} -> True; _ -> False]
       in (dirs, files)
     
@@ -6391,22 +6392,22 @@ writeMetadataFiles root entries = do
             when (n < total) go
 
 -- | Check if a metadata file needs to be written (returns True if write needed)
-shouldWriteFile :: FilePath -> FilePath -> FileEntry -> Hash 'MD5 -> Integer -> Bool -> IO Bool
-shouldWriteFile root metaPath entry fHash fSize fIsText = do
+shouldWriteFile :: FilePath -> FilePath -> FileEntry -> Hash 'MD5 -> Integer -> ContentType -> IO Bool
+shouldWriteFile root metaPath entry fHash fSize fContentType = do
   exists <- doesFileExist metaPath
   if not exists
     then pure True  -- File doesn't exist, must write
-    else if fIsText
-      then do
+    else case fContentType of
+      TextContent -> do
         -- For text files: compare mtime and size of source vs destination
-        let sourcePath = root </> path entry
+        let sourcePath = root </> unPath (path entry)
         sourceMtime <- getModificationTime sourcePath
         sourceSize <- getFileSize sourcePath
         destMtime <- getModificationTime metaPath
         destSize <- getFileSize metaPath
         -- Write if mtime or size differs
         pure (sourceMtime /= destMtime || sourceSize /= destSize)
-      else do
+      BinaryContent -> do
         -- For binary files: read existing metadata and compare hash/size
         existing <- readMetadataOrComputeHash metaPath
         case existing of
@@ -6461,13 +6462,16 @@ getFileHashAndSize root relPath = do
 ```haskell
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE KindSignatures #-}
 
 module Bit.Types
-  ( Path
+  ( Path(..)
   , HashAlgo(..)
   , Hash(..)
   , hashToText
+  , ContentType(..)
   , EntryKind(..)
   , FileEntry(..)
   , syncHash
@@ -6477,11 +6481,14 @@ module Bit.Types
   ) where
 
 import Control.Monad.Trans.Reader (ReaderT, runReaderT)
+import Data.String (IsString)
 import Data.Text (Text)
 import GHC.Generics (Generic)
 import Bit.Remote (Remote)
 
-type Path = String
+newtype Path = Path { unPath :: FilePath }
+  deriving stock (Show, Generic)
+  deriving newtype (Eq, Ord, IsString)
 
 data HashAlgo = MD5 | SHA256
   deriving (Show, Eq, Generic)
@@ -6492,8 +6499,11 @@ newtype Hash (a :: HashAlgo) = Hash Text
 hashToText :: Hash a -> Text
 hashToText (Hash t) = t
 
+data ContentType = TextContent | BinaryContent
+  deriving (Show, Eq, Generic)
+
 data EntryKind
-  = File { fHash :: Hash 'MD5, fSize :: Integer, fIsText :: Bool }
+  = File { fHash :: Hash 'MD5, fSize :: Integer, fContentType :: ContentType }
   | Directory
   | Symlink FilePath
   deriving (Show, Eq, Generic)
@@ -6501,10 +6511,10 @@ data EntryKind
 -- | Hash to use for sync diff (MD5). File has one hash; Directory/Symlink have none.
 syncHash :: EntryKind -> Maybe (Hash 'MD5)
 syncHash (File h _ _) = Just h
-syncHash _           = Nothing
+syncHash _            = Nothing
 
 data FileEntry = FileEntry
-  { path :: FilePath
+  { path :: Path
   , kind :: EntryKind
   } deriving (Show, Eq, Generic)
 
@@ -6565,7 +6575,7 @@ module Bit.Utils
   ) where
 
 import Data.List (isPrefixOf, isInfixOf)
-import Bit.Types (FileEntry(..))
+import Bit.Types (FileEntry(..), Path(unPath))
 import Bit.AtomicWrite
     ( atomicWriteFile
     , atomicWriteFileStr
@@ -6588,7 +6598,7 @@ isBitPath p = p == ".bit" || ".bit" `isPrefixOf` p || "/.bit" `isInfixOf` p || "
 
 -- | Remove .bit paths from a list of file entries (e.g. remote file list).
 filterOutBitPaths :: [FileEntry] -> [FileEntry]
-filterOutBitPaths = filter (\e -> not (isBitPath e.path))
+filterOutBitPaths = filter (\e -> not (isBitPath (unPath e.path)))
 
 -- | Format bytes in human-readable form (B, KB, MB, GB, TB).
 -- Uses 1 decimal place for KB and above, 1024 base.
@@ -6640,7 +6650,7 @@ module Bit.Verify
   , allEntryPaths
   ) where
 
-import Bit.Types (Hash(..), HashAlgo(..), Path, FileEntry(..), EntryKind(..), syncHash, hashToText)
+import Bit.Types (Hash(..), HashAlgo(..), Path(..), FileEntry(..), EntryKind(..), syncHash, hashToText)
 import Bit.Utils (filterOutBitPaths)
 import Bit.Concurrency (Concurrency(..), runConcurrently, ioConcurrency)
 import System.FilePath ((</>), makeRelative, normalise)
@@ -6760,9 +6770,9 @@ readEntryFromFilesystem indexDir relPath = do
       -- Check if this was parsed as metadata (binary) or computed from content (text)
       -- by trying parseMetadata on the raw content
       parseMetadataFile fullPath >>= \case
-        Just _ -> pure (BinaryEntry relPath h sz)   -- has hash:/size: format → binary
-        Nothing -> pure (TextEntry relPath)          -- content IS the file → text
-    Nothing -> pure (TextEntry relPath)  -- shouldn't happen, but safe fallback
+        Just _ -> pure (BinaryEntry (Path relPath) h sz)   -- has hash:/size: format → binary
+        Nothing -> pure (TextEntry (Path relPath))          -- content IS the file → text
+    Nothing -> pure (TextEntry (Path relPath))  -- shouldn't happen, but safe fallback
 
 -- | Read a single metadata entry from a git commit tree.
 readEntryFromCommit :: String -> FilePath -> IO MetadataEntry
@@ -6771,12 +6781,12 @@ readEntryFromCommit commitHash relPath = do
   (code, content, _) <- readProcessWithExitCode "git"
     [ "-C", bitIndexPath, "show", commitHash ++ ":" ++ relPath ] ""
   if code /= ExitSuccess
-    then pure (TextEntry relPath)
+    then pure (TextEntry (Path relPath))
     else case parseMetadata content of
       Just (MetaContent { metaHash = h, metaSize = sz }) ->
-        pure (BinaryEntry relPath h sz)
+        pure (BinaryEntry (Path relPath) h sz)
       Nothing ->
-        pure (TextEntry relPath)  -- text file: content IS the data, skip hash verify
+        pure (TextEntry (Path relPath))  -- text file: content IS the data, skip hash verify
 
 -- | Load only binary (hash-verifiable) metadata entries from the index.
 -- Text files are excluded. If you need all entries, use 'loadMetadata' directly.
@@ -6793,7 +6803,7 @@ verifyLocalAt root mCounter concurrency = do
   let indexDir = root </> ".bit/index"
   entries <- loadMetadata (FromFilesystem indexDir) concurrency
   -- Filter out .git directory entries
-  let filteredEntries = filter (\entry -> not (isGitPath (entryPath entry))) entries
+  let filteredEntries = filter (\entry -> not (isGitPath (unPath (entryPath entry)))) entries
   
   -- Determine concurrency level
   bound <- resolveConcurrency concurrency
@@ -6804,7 +6814,7 @@ verifyLocalAt root mCounter concurrency = do
   where
     checkOne rootPath indexPath entry = do
       let relPath = entryPath entry
-          actualPath = rootPath </> relPath
+          actualPath = rootPath </> unPath relPath
       exists <- doesFileExist actualPath
       result <- if not exists
         then pure [Missing relPath]
@@ -6822,7 +6832,7 @@ verifyLocalAt root mCounter concurrency = do
             actualHash <- hashFile actualPath
             actualSize <- fromIntegral . BS.length <$> BS.readFile actualPath
             -- For text files, we need to check against what's in the index
-            let indexFilePath = indexPath </> relPath
+            let indexFilePath = indexPath </> unPath relPath
             indexHash <- hashFile indexFilePath
             indexSize <- fromIntegral . BS.length <$> BS.readFile indexFilePath
             if actualHash == indexHash && actualSize == indexSize
@@ -6900,7 +6910,7 @@ verifyRemote _cwd remote mCounter _concurrency = do
           
           -- 4. Build maps for comparison (both use MD5 hashes)
           let remoteFileMap = Map.fromList
-                [ (normalise e.path, (h, e.kind))
+                [ (normalise (unPath e.path), (h, e.kind))
                 | e <- filteredRemoteFiles
                 , h <- maybeToList (syncHash e.kind)
                 ]
@@ -6910,7 +6920,7 @@ verifyRemote _cwd remote mCounter _concurrency = do
           
           -- 6. Check for files on remote that aren't known to the bundle
           -- Use allKnownPaths (binary + text) to avoid false positives for text files
-          let filePaths = Set.fromList (Map.keys remoteFileMap)
+          let filePaths = Set.fromList (map Path (Map.keys remoteFileMap))
               extraPaths = filePaths `Set.difference` allKnownPaths
               extraIssues = map (\p -> HashMismatch p "(not in metadata)" "(exists on remote)" 0 0) (Set.toList extraPaths)
           
@@ -6919,7 +6929,7 @@ verifyRemote _cwd remote mCounter _concurrency = do
     -- Check one file from metadata against remote (both use MD5)
     checkRemoteFile :: Map.Map FilePath (Hash 'MD5, EntryKind) -> (Path, Hash 'MD5, Integer) -> IO [VerifyIssue]
     checkRemoteFile remoteFileMap (relPath, expectedHash, expectedSize) = do
-      let normalizedPath = normalise relPath
+      let normalizedPath = normalise (unPath relPath)
       result <- case Map.lookup normalizedPath remoteFileMap of
         Nothing -> pure [Missing relPath]
         Just (actualHash, File _ actualSize _) ->
