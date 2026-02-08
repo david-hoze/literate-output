@@ -4290,3 +4290,27 @@ cleanup done
 
 ---
 
+## test/cli/work_pop_local/file.txt
+
+**Path:** `test/cli/work_pop_local/file.txt`
+
+*Source file.*
+
+```text
+original content  
+```
+
+---
+
+## test/cli/work_pop_remote/file.txt
+
+**Path:** `test/cli/work_pop_remote/file.txt`
+
+*Source file.*
+
+```text
+original content  
+```
+
+---
+
