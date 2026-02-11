@@ -188,27 +188,34 @@ data LineType
     | ContinuationLine String
     deriving (Show, Eq)
 
--- | Dangerous patterns that must not appear in test files
-dangerousPatterns :: [(String, String, String)]
+-- | Dangerous pattern: variable that must not appear in test files, with explanation and fix.
+-- Record avoids transposition bugs vs bare (pattern, reason, fix) tuple — all three are String.
+data DangerousPattern = DangerousPattern
+  { dpPattern :: String
+  , dpReason  :: String
+  , dpFix     :: String
+  } deriving (Show, Eq)
+
+dangerousPatterns :: [DangerousPattern]
 dangerousPatterns =
-    [ ("%CD%", 
-       "Windows expands %CD% before the command chain executes. If the preceding `cd` fails, commands run in the main repo directory.",
-       "Use relative paths (e.g., ..\\remote_mirror) instead.")
-    , ("%~dp0",
-       "Batch script directory variable expands before command execution, risking sandbox escape.",
-       "Use relative paths instead.")
-    , ("%USERPROFILE%",
-       "Could resolve to real user directories outside the test sandbox.",
-       "Use relative paths or test-specific directories instead.")
-    , ("%APPDATA%",
-       "Could resolve to real user directories outside the test sandbox.",
-       "Use relative paths or test-specific directories instead.")
-    , ("%HOMEDRIVE%",
-       "Could resolve to real user directories outside the test sandbox.",
-       "Use relative paths or test-specific directories instead.")
-    , ("%HOMEPATH%",
-       "Could resolve to real user directories outside the test sandbox.",
-       "Use relative paths or test-specific directories instead.")
+    [ DangerousPattern "%CD%"
+        "Windows expands %CD% before the command chain executes. If the preceding `cd` fails, commands run in the main repo directory."
+        "Use relative paths (e.g., ..\\remote_mirror) instead."
+    , DangerousPattern "%~dp0"
+        "Batch script directory variable expands before command execution, risking sandbox escape."
+        "Use relative paths instead."
+    , DangerousPattern "%USERPROFILE%"
+        "Could resolve to real user directories outside the test sandbox."
+        "Use relative paths or test-specific directories instead."
+    , DangerousPattern "%APPDATA%"
+        "Could resolve to real user directories outside the test sandbox."
+        "Use relative paths or test-specific directories instead."
+    , DangerousPattern "%HOMEDRIVE%"
+        "Could resolve to real user directories outside the test sandbox."
+        "Use relative paths or test-specific directories instead."
+    , DangerousPattern "%HOMEPATH%"
+        "Could resolve to real user directories outside the test sandbox."
+        "Use relative paths or test-specific directories instead."
     ]
 
 -- | Split file content into test cases
@@ -339,9 +346,9 @@ scanForViolations :: FilePath -> String -> [String]
 scanForViolations path content =
     let linesWithNumbers = zip [1..] (lines content)
         checkLine (lineNum, lineText) =
-            [ formatViolation path lineNum lineText pattern reason fix
-            | (pattern, reason, fix) <- dangerousPatterns
-            , containsPattern pattern lineText
+            [ formatViolation path lineNum lineText dp
+            | dp <- dangerousPatterns
+            , containsPattern (dpPattern dp) lineText
             ]
     in concatMap checkLine linesWithNumbers
 
@@ -353,16 +360,16 @@ containsPattern pattern text =
     in lowerPattern `isInfixOf` lowerText
 
 -- | Format a violation message
-formatViolation :: FilePath -> Int -> String -> String -> String -> String -> String
-formatViolation path lineNum lineText pattern reason fix =
+formatViolation :: FilePath -> Int -> String -> DangerousPattern -> String
+formatViolation path lineNum lineText dp =
     unlines
         [ ""
         , "DANGEROUS PATTERN in " ++ path ++ ":" ++ show lineNum
-        , "  Found: " ++ pattern
+        , "  Found: " ++ dpPattern dp
         , "  Line:  " ++ lineText
         , ""
-        , "  Why dangerous: " ++ reason
-        , "  Fix: " ++ fix
+        , "  Why dangerous: " ++ dpReason dp
+        , "  Fix: " ++ dpFix dp
         , ""
         ]
 ```
@@ -599,6 +606,12 @@ tests = testGroup "Pipeline"
     [ testCase "single added file produces Copy" test_singleAddedFile
     , testCase "single deleted file produces Delete" test_singleDeletedFile
     , testCase "modified file produces Copy (overwrite)" test_modifiedFile
+    , testCase "swapped files produce Swap, not two Moves" test_swappedFiles
+    , testCase "non-swap rename produces Move" test_nonSwapRename
+    , testCase "three-way cycle stays as Moves" test_threeWayCycle
+    ]
+  , testGroup "resolveSwaps properties"
+    [ testProperty "swapped paths produce exactly one Swap" prop_swapDetection
     ]
   ]
 
@@ -617,7 +630,7 @@ prop_noDuplicateTargets source target =
     actionTargets (Copy _ d)    = [d]
     actionTargets (Move _ d)    = [d]
     actionTargets (Delete p)    = [p]
-    actionTargets (Swap _ _ _)  = []
+    actionTargets (Swap _ s d)  = [s, d]
 
 prop_emptySourceOnlyDeletes :: [FileEntry] -> Bool
 prop_emptySourceOnlyDeletes target =
@@ -666,6 +679,75 @@ test_modifiedFile = do
   case actions of
     [Copy "foo.bin" "foo.bin"] -> pure ()
     _ -> assertFailure $ "Expected [Copy (overwrite)], got: " ++ show actions
+
+-- | Two files swap paths: a.txt gets b.txt's hash, b.txt gets a.txt's hash.
+-- Should produce a single Swap, not two Moves.
+test_swappedFiles :: Assertion
+test_swappedFiles = do
+  let hX = Hash (T.pack "md5:xxxx")
+      hY = Hash (T.pack "md5:yyyy")
+      source = [ FileEntry "a.txt" (File hY 100 BinaryContent)
+               , FileEntry "b.txt" (File hX 200 BinaryContent) ]
+      target = [ FileEntry "a.txt" (File hX 100 BinaryContent)
+               , FileEntry "b.txt" (File hY 200 BinaryContent) ]
+      actions = diffAndPlan source target
+      swaps = [() | Swap {} <- actions]
+      moves = [() | Move {} <- actions]
+  assertEqual "expected exactly one Swap" 1 (length swaps)
+  assertEqual "expected no Moves" 0 (length moves)
+
+-- | A rename that is NOT a swap: A→B with no B→A.
+test_nonSwapRename :: Assertion
+test_nonSwapRename = do
+  let h = Hash (T.pack "md5:abc123")
+      source = [FileEntry "new.bin" (File h 100 BinaryContent)]
+      target = [FileEntry "old.bin" (File h 100 BinaryContent)]
+      actions = diffAndPlan source target
+  case actions of
+    [Move "old.bin" "new.bin"] -> pure ()
+    _ -> assertFailure $ "Expected [Move old->new], got: " ++ show actions
+
+-- | Three-way cycle (A→B, B→C, C→A) — resolveSwaps leaves these as Moves
+-- since Swap only handles pairwise swaps.
+test_threeWayCycle :: Assertion
+test_threeWayCycle = do
+  let hA = Hash (T.pack "md5:aaaa")
+      hB = Hash (T.pack "md5:bbbb")
+      hC = Hash (T.pack "md5:cccc")
+      -- Source has: a→hB, b→hC, c→hA (rotated)
+      source = [ FileEntry "a.txt" (File hB 100 BinaryContent)
+               , FileEntry "b.txt" (File hC 100 BinaryContent)
+               , FileEntry "c.txt" (File hA 100 BinaryContent) ]
+      -- Target has: a→hA, b→hB, c→hC (original)
+      target = [ FileEntry "a.txt" (File hA 100 BinaryContent)
+               , FileEntry "b.txt" (File hB 100 BinaryContent)
+               , FileEntry "c.txt" (File hC 100 BinaryContent) ]
+      actions = diffAndPlan source target
+      swaps = [() | Swap {} <- actions]
+  -- Three-way cycles cannot be detected by pairwise swap detection.
+  -- They should remain as individual Moves (known limitation).
+  assertEqual "expected no Swaps for three-way cycle" 0 (length swaps)
+
+-- | Property: when source and target have the same paths but with two paths'
+-- contents swapped, diffAndPlan produces exactly one Swap.
+prop_swapDetection :: Property
+prop_swapDetection = forAll genSwapPair $ \(source, target) ->
+  let actions = diffAndPlan source target
+      swaps = [() | Swap {} <- actions]
+  in  length swaps === 1
+  where
+    genSwapPair :: Gen ([FileEntry], [FileEntry])
+    genSwapPair = do
+      h1 <- arbitrary
+      h2 <- arbitrary `suchThat` (/= h1)
+      sz1 <- choose (0, 10000000)
+      sz2 <- choose (0, 10000000)
+      let ct = BinaryContent
+          source = [ FileEntry "swap_a" (File h1 sz1 ct)
+                   , FileEntry "swap_b" (File h2 sz2 ct) ]
+          target = [ FileEntry "swap_a" (File h2 sz2 ct)
+                   , FileEntry "swap_b" (File h1 sz1 ct) ]
+      pure (source, target)
 ```
 
 ---
@@ -2723,6 +2805,138 @@ cd test\cli\output\work & bit log --pretty=format:"%s" -n 1
 <<<
 >>> /Update test\.txt/
 >>>= 0
+```
+
+---
+
+## test/cli/output/shared_merge_remote/bonly.txt
+
+**Path:** `test/cli/output/shared_merge_remote/bonly.txt`
+
+*Source file.*
+
+```text
+B only file 
+```
+
+---
+
+## test/cli/output/shared_merge_remote/data.bin
+
+**Path:** `test/cli/output/shared_merge_remote/data.bin`
+
+*Source file.*
+
+```text
+binarydata 
+```
+
+---
+
+## test/cli/output/shared_merge_remote/extra.txt
+
+**Path:** `test/cli/output/shared_merge_remote/extra.txt`
+
+*Source file.*
+
+```text
+new from A 
+```
+
+---
+
+## test/cli/output/shared_merge_remote/text.txt
+
+**Path:** `test/cli/output/shared_merge_remote/text.txt`
+
+*Source file.*
+
+```text
+updated by A 
+```
+
+---
+
+## test/cli/output/work_merge_a/data.bin
+
+**Path:** `test/cli/output/work_merge_a/data.bin`
+
+*Source file.*
+
+```text
+binarydata 
+```
+
+---
+
+## test/cli/output/work_merge_a/extra.txt
+
+**Path:** `test/cli/output/work_merge_a/extra.txt`
+
+*Source file.*
+
+```text
+new from A 
+```
+
+---
+
+## test/cli/output/work_merge_a/text.txt
+
+**Path:** `test/cli/output/work_merge_a/text.txt`
+
+*Source file.*
+
+```text
+updated by A 
+```
+
+---
+
+## test/cli/output/work_merge_b/bonly.txt
+
+**Path:** `test/cli/output/work_merge_b/bonly.txt`
+
+*Source file.*
+
+```text
+B only file 
+```
+
+---
+
+## test/cli/output/work_merge_b/data.bin
+
+**Path:** `test/cli/output/work_merge_b/data.bin`
+
+*Source file.*
+
+```text
+binarydata 
+```
+
+---
+
+## test/cli/output/work_merge_b/extra.txt
+
+**Path:** `test/cli/output/work_merge_b/extra.txt`
+
+*Source file.*
+
+```text
+new from A 
+```
+
+---
+
+## test/cli/output/work_merge_b/text.txt
+
+**Path:** `test/cli/output/work_merge_b/text.txt`
+
+*Source file.*
+
+```text
+updated by A 
 ```
 
 ---

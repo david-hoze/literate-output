@@ -1865,6 +1865,7 @@ module Bit.Core.Helpers
     , PullOptions(..)
     , defaultPullOptions
       -- Git helpers
+    , AncestorQuery(..)
     , getLocalHeadE
     , checkIsAheadE
     , hasStagedChangesE
@@ -1897,6 +1898,7 @@ import System.Directory (copyFile, removeFile, createDirectoryIfMissing, removeD
 import System.FilePath ((</>), normalise)
 import Control.Monad (when, unless, forM_)
 import System.Exit (ExitCode(..), exitWith)
+import Internal.Git (AncestorQuery(..))
 import qualified Internal.Git as Git
 import qualified Bit.Device as Device
 import Bit.Remote (Remote)
@@ -1943,12 +1945,11 @@ getLocalHeadE = do
         ExitSuccess -> Just (trimGitOutput out)
         _ -> Nothing
 
--- | Check if @localHash@ is ahead of @remoteHash@ (i.e., remote is an ancestor of local).
--- Parameter order: remote hash first, local hash second — matching @git merge-base --is-ancestor@.
-checkIsAheadE :: String -> String -> IO Bool
-checkIsAheadE remoteHash localHash =
+-- | Check if aqDescendant is ahead of aqAncestor (i.e., aqAncestor is an ancestor of aqDescendant).
+checkIsAheadE :: AncestorQuery -> IO Bool
+checkIsAheadE (AncestorQuery ancestor descendant) =
     (\(code, _, _) -> code == ExitSuccess) <$>
-    Git.runGitWithOutput ["merge-base", "--is-ancestor", remoteHash, localHash]
+    Git.runGitWithOutput ["merge-base", "--is-ancestor", ancestor, descendant]
 
 hasStagedChangesE :: IO Bool
 hasStagedChangesE =
@@ -2530,7 +2531,7 @@ pullManualMergeImpl remote = do
                         localMetaMap = Map.fromList [(normalise (unPath m.bfmPath), (m.bfmHash, m.bfmSize)) | m <- localMeta]
 
                     lift $ tell "Comparing..."
-                    let divergentFiles = findDivergentFiles remoteFileMap remoteMetaMap localMetaMap
+                    let divergentFiles = findDivergentFiles remoteFileMap remoteMetaMap
 
                     if null divergentFiles
                         then do
@@ -2679,8 +2680,8 @@ data DivergentFile = DivergentFile
     deriving (Show, Eq)
 
 -- | Find files where remote actual files don't match remote metadata.
-findDivergentFiles :: Map.Map FilePath (Hash 'MD5, EntryKind) -> Map.Map FilePath (Hash 'MD5, Integer) -> Map.Map FilePath (Hash 'MD5, Integer) -> [DivergentFile]
-findDivergentFiles remoteFileMap remoteMetaMap _localMetaMap =
+findDivergentFiles :: Map.Map FilePath (Hash 'MD5, EntryKind) -> Map.Map FilePath (Hash 'MD5, Integer) -> [DivergentFile]
+findDivergentFiles remoteFileMap remoteMetaMap =
     Map.foldlWithKey (\acc filePath (expectedHash, expectedSize) ->
         let normalizedPath = normalise filePath
         in case Map.lookup normalizedPath remoteFileMap of
@@ -2802,7 +2803,8 @@ import Bit.Concurrency (Concurrency(..))
 import qualified Bit.Device as Device
 import System.Directory (copyFile)
 import Bit.Core.Helpers
-    ( getRemoteType
+    ( AncestorQuery(..)
+    , getRemoteType
     , withRemote
     , getLocalHeadE
     , checkIsAheadE
@@ -3082,7 +3084,7 @@ processExistingRemote = do
 
                     case (maybeLocalHash, maybeRemoteHash) of
                         (Just lHash, Just rHash) -> do
-                            isAhead <- lift $ checkIsAheadE rHash lHash
+                            isAhead <- lift $ checkIsAheadE (AncestorQuery { aqAncestor = rHash, aqDescendant = lHash })
 
                             if isAhead
                                 then do
@@ -3129,6 +3131,7 @@ import qualified System.Directory as Dir
 import System.FilePath ((</>), takeDirectory)
 import Control.Monad (unless, void, when, forM_)
 import System.Exit (ExitCode(..), exitWith)
+import Internal.Git (AncestorQuery(..))
 import qualified Internal.Git as Git
 import qualified Internal.Transport as Transport
 import qualified Bit.Device as Device
@@ -3184,12 +3187,18 @@ addRemoteFilesystem cwd name filePath = do
     exists <- Dir.doesDirectoryExist absPath
     unless exists $ do
         hPutStrLn stderr ("fatal: Path does not exist or is not accessible: " ++ filePath)
+        case filePath of
+            ('\\':_) -> uncHint
+            ('/':'/':_) -> uncHint
+            _ -> pure ()
         exitWith (ExitFailure 1)
     volRoot <- Device.getVolumeRoot absPath
     isFixed <- Device.isFixedDrive volRoot
     if isFixed
         then addRemoteFixed cwd name absPath
         else addRemoteDevice cwd name absPath volRoot
+  where
+    uncHint = hPutStrLn stderr "hint: For UNC paths under Git Bash / MINGW, use forward slashes: //server/share/path"
 
 -- | Add a fixed-drive filesystem remote. Path stored only in git config.
 addRemoteFixed :: FilePath -> String -> FilePath -> IO ()
@@ -3679,8 +3688,8 @@ data PushRefStatus
 -- callers never see raw boolean ancestry flags.
 classifyPushStatus :: String -> String -> IO PushRefStatus
 classifyPushStatus localHash remoteHash = do
-  localAhead  <- Git.checkIsAhead remoteHash localHash  -- is local ahead of remote?
-  remoteAhead <- Git.checkIsAhead localHash remoteHash  -- is remote ahead of local?
+  localAhead  <- Git.checkIsAhead (AncestorQuery { aqAncestor = remoteHash, aqDescendant = localHash })
+  remoteAhead <- Git.checkIsAhead (AncestorQuery { aqAncestor = localHash, aqDescendant = remoteHash })
   pure $ case (localAhead, remoteAhead) of
     (True, False) -> PushRefFastForwardable
     (False, True) -> PushRefLocalOutOfDate
@@ -3845,7 +3854,9 @@ mkCloudTransport remote = FileTransport
               sizes <- forM actions $ \a -> case a of
                   Copy _ dest -> getFileSizeFromIndex cwd (unPath dest)
                   Move src _  -> getFileSizeFromIndex cwd (unPath src)
-                  _           -> pure 0
+                  Swap _ src dest -> (+) <$> getFileSizeFromIndex cwd (unPath src)
+                                        <*> getFileSizeFromIndex cwd (unPath dest)
+                  Delete _    -> pure 0
               let totalBytes = sum sizes
 
               -- Create progress tracker with byte totals
@@ -4229,7 +4240,10 @@ executeCommand localRoot remote action = case action of
         Delete p ->
             void $ Transport.deleteRemote remote (toPosix (unPath p))
 
-        Swap _ _ _ -> pure ()  -- not produced by planAction; future-proofing
+        Swap tmp src dest -> do
+            void $ Transport.moveRemote remote (toPosix (unPath src)) (toPosix (unPath tmp))
+            void $ Transport.moveRemote remote (toPosix (unPath dest)) (toPosix (unPath src))
+            void $ Transport.moveRemote remote (toPosix (unPath tmp)) (toPosix (unPath dest))
 
 -- | Execute a single pull action: copy from remote to local or delete local file.
 -- Text files are already in the git bundle (index); copy from index to work dir instead of rclone.
@@ -4269,7 +4283,36 @@ executePullCommand localRoot remote progress action = case action of
             let localPath = localRoot </> unPath filePath
             exists <- Dir.doesFileExist localPath
             when exists $ Dir.removeFile localPath
-        Swap _ _ _ -> pure ()
+        Swap tmp src dest -> do
+            -- For pull, swap files on the local filesystem.
+            -- Text files: copy fresh from index (index has correct post-merge content).
+            -- Binary files: three-step rename via temp file.
+            srcIsText <- isTextFileInIndex localRoot (unPath src)
+            destIsText <- isTextFileInIndex localRoot (unPath dest)
+            case (srcIsText, destIsText) of
+                (True, True) -> do
+                    copyFromIndexToWorkTree localRoot (unPath src)
+                    copyFromIndexToWorkTree localRoot (unPath dest)
+                (False, False) -> do
+                    let tmpPath = localRoot </> unPath tmp
+                        srcPath = localRoot </> unPath src
+                        destPath = localRoot </> unPath dest
+                    Dir.renameFile srcPath tmpPath
+                    Dir.renameFile destPath srcPath
+                    Dir.renameFile tmpPath destPath
+                (True, False) -> do
+                    -- src is text (from index), dest is binary (swap via temp)
+                    let tmpPath = localRoot </> unPath tmp
+                        destPath = localRoot </> unPath dest
+                    Dir.renameFile destPath tmpPath
+                    copyFromIndexToWorkTree localRoot (unPath src)
+                    Dir.renameFile tmpPath destPath
+                (False, True) -> do
+                    let tmpPath = localRoot </> unPath tmp
+                        srcPath = localRoot </> unPath src
+                    Dir.renameFile srcPath tmpPath
+                    copyFromIndexToWorkTree localRoot (unPath dest)
+                    Dir.renameFile tmpPath srcPath
 ```
 
 ---
@@ -5434,13 +5477,17 @@ import System.Exit (ExitCode(..), exitWith)
 import System.IO (hPutStrLn, stderr)
 import Control.Monad (unless)
 
+-- | Option or example: (item, description). Record avoids transposition vs (String, String).
+data HelpItem = HelpItem { hiItem, hiDescription :: String }
+  deriving (Show, Eq)
+
 data CommandHelp = CommandHelp
     { cmdName     :: String
     , cmdSynopsis :: String
     , cmdUsage    :: String
     , cmdDesc     :: [String]
-    , cmdOptions  :: [(String, String)]
-    , cmdExamples :: [(String, String)]
+    , cmdOptions  :: [HelpItem]
+    , cmdExamples :: [HelpItem]
     }
 
 lookupCommand :: String -> Maybe CommandHelp
@@ -5518,11 +5565,11 @@ printCommandHelp name = case lookupCommand name of
             mapM_ printExample (cmdExamples cmd)
     Nothing -> unknownCommand name
 
-printOption :: (String, String) -> IO ()
-printOption (flag, desc) = putStrLn $ "  " ++ padRight 34 flag ++ desc
+printOption :: HelpItem -> IO ()
+printOption item = putStrLn $ "  " ++ padRight 34 (hiItem item) ++ hiDescription item
 
-printExample :: (String, String) -> IO ()
-printExample (ex, desc) = putStrLn $ "  " ++ padRight 34 ex ++ desc
+printExample :: HelpItem -> IO ()
+printExample item = putStrLn $ "  " ++ padRight 34 (hiItem item) ++ hiDescription item
 
 padRight :: Int -> String -> String
 padRight n s = s ++ replicate (max 1 (n - length s)) ' '
@@ -5543,7 +5590,7 @@ commandRegistry =
                         , "This creates a .bit/ directory with an internal Git repository"
                         , "for tracking file metadata." ]
         , cmdOptions  = []
-        , cmdExamples = [("bit init", "Initialize in current directory")]
+        , cmdExamples = [HelpItem "bit init" "Initialize in current directory"]
         }
     , CommandHelp
         { cmdName     = "status"
@@ -5552,7 +5599,7 @@ commandRegistry =
         , cmdDesc     = [ "Show the state of the working tree: which files are modified,"
                         , "added, or deleted relative to the last commit." ]
         , cmdOptions  = []
-        , cmdExamples = [("bit status", "Show status")]
+        , cmdExamples = [HelpItem "bit status" "Show status"]
         }
     , CommandHelp
         { cmdName     = "add"
@@ -5563,16 +5610,16 @@ commandRegistry =
                         , ""
                         , "Use 'bit add .' to add all modified and new files." ]
         , cmdOptions  = []
-        , cmdExamples = [ ("bit add file.txt", "Add a single file")
-                        , ("bit add .", "Add all files") ]
+        , cmdExamples = [ HelpItem "bit add file.txt" "Add a single file"
+                        , HelpItem "bit add ." "Add all files" ]
         }
     , CommandHelp
         { cmdName     = "commit"
         , cmdSynopsis = "Record changes to the repository"
         , cmdUsage    = "bit commit -m <msg>"
         , cmdDesc     = ["Commit staged metadata changes with the given message."]
-        , cmdOptions  = [("-m <msg>", "Commit message")]
-        , cmdExamples = [("bit commit -m \"Add new files\"", "Commit with message")]
+        , cmdOptions  = [HelpItem "-m <msg>" "Commit message"]
+        , cmdExamples = [HelpItem "bit commit -m \"Add new files\"" "Commit with message"]
         }
     , CommandHelp
         { cmdName     = "diff"
@@ -5580,9 +5627,9 @@ commandRegistry =
         , cmdUsage    = "bit diff [--staged]"
         , cmdDesc     = [ "Show hash/size changes between the working tree and the index."
                         , "With --staged, show changes between the index and HEAD." ]
-        , cmdOptions  = [("--staged", "Show staged changes")]
-        , cmdExamples = [ ("bit diff", "Show unstaged changes")
-                        , ("bit diff --staged", "Show staged changes") ]
+        , cmdOptions  = [HelpItem "--staged" "Show staged changes"]
+        , cmdExamples = [ HelpItem "bit diff" "Show unstaged changes"
+                        , HelpItem "bit diff --staged" "Show staged changes" ]
         }
     , CommandHelp
         { cmdName     = "log"
@@ -5590,7 +5637,7 @@ commandRegistry =
         , cmdUsage    = "bit log"
         , cmdDesc     = ["Show the commit history of the repository."]
         , cmdOptions  = []
-        , cmdExamples = [("bit log", "Show full log")]
+        , cmdExamples = [HelpItem "bit log" "Show full log"]
         }
     , CommandHelp
         { cmdName     = "rm"
@@ -5598,7 +5645,7 @@ commandRegistry =
         , cmdUsage    = "bit rm [options] <path>"
         , cmdDesc     = ["Remove files from tracking and optionally from the working tree."]
         , cmdOptions  = []
-        , cmdExamples = [("bit rm file.txt", "Remove a file")]
+        , cmdExamples = [HelpItem "bit rm file.txt" "Remove a file"]
         }
     , CommandHelp
         { cmdName     = "restore"
@@ -5606,11 +5653,11 @@ commandRegistry =
         , cmdUsage    = "bit restore [options] [--] <path>"
         , cmdDesc     = [ "Restore working tree files from the index or a specific commit."
                         , "Supports full git restore syntax: --staged, --worktree, --source=, etc." ]
-        , cmdOptions  = [ ("--staged", "Restore staged changes")
-                        , ("--worktree", "Restore working tree (default)")
-                        , ("--source=<commit>", "Restore from specific commit") ]
-        , cmdExamples = [ ("bit restore -- file.txt", "Restore file from index")
-                        , ("bit restore --staged file.txt", "Unstage a file") ]
+        , cmdOptions  = [ HelpItem "--staged" "Restore staged changes"
+                        , HelpItem "--worktree" "Restore working tree (default)"
+                        , HelpItem "--source=<commit>" "Restore from specific commit" ]
+        , cmdExamples = [ HelpItem "bit restore -- file.txt" "Restore file from index"
+                        , HelpItem "bit restore --staged file.txt" "Unstage a file" ]
         }
     , CommandHelp
         { cmdName     = "checkout"
@@ -5619,7 +5666,7 @@ commandRegistry =
         , cmdDesc     = [ "Restore working tree files from the index (legacy syntax)."
                         , "Prefer 'bit restore' for new usage." ]
         , cmdOptions  = []
-        , cmdExamples = [("bit checkout -- file.txt", "Restore file from index")]
+        , cmdExamples = [HelpItem "bit checkout -- file.txt" "Restore file from index"]
         }
     , CommandHelp
         { cmdName     = "ls-files"
@@ -5627,7 +5674,7 @@ commandRegistry =
         , cmdUsage    = "bit ls-files"
         , cmdDesc     = ["List all files tracked by bit."]
         , cmdOptions  = []
-        , cmdExamples = [("bit ls-files", "List all tracked files")]
+        , cmdExamples = [HelpItem "bit ls-files" "List all tracked files"]
         }
     , CommandHelp
         { cmdName     = "push"
@@ -5638,12 +5685,12 @@ commandRegistry =
                         , ""
                         , "If no remote is specified, pushes to the upstream remote or falls"
                         , "back to 'origin' if it exists." ]
-        , cmdOptions  = [ ("-u, --set-upstream <remote>", "Push and set upstream tracking")
-                        , ("--force", "Force push (skip ancestry check)")
-                        , ("--force-with-lease", "Force push if remote matches expected state") ]
-        , cmdExamples = [ ("bit push", "Push to default remote")
-                        , ("bit push origin", "Push to named remote")
-                        , ("bit push -u origin", "Push and set upstream tracking") ]
+        , cmdOptions  = [ HelpItem "-u, --set-upstream <remote>" "Push and set upstream tracking"
+                        , HelpItem "--force" "Force push (skip ancestry check)"
+                        , HelpItem "--force-with-lease" "Force push if remote matches expected state" ]
+        , cmdExamples = [ HelpItem "bit push" "Push to default remote"
+                        , HelpItem "bit push origin" "Push to named remote"
+                        , HelpItem "bit push -u origin" "Push and set upstream tracking" ]
         }
     , CommandHelp
         { cmdName     = "pull"
@@ -5651,11 +5698,11 @@ commandRegistry =
         , cmdUsage    = "bit pull [<remote>] [options]"
         , cmdDesc     = [ "Pull metadata and files from a remote. Verifies remote files"
                         , "match remote metadata before pulling (proof of possession)." ]
-        , cmdOptions  = [ ("--accept-remote", "Accept remote file state as truth")
-                        , ("--manual-merge", "Interactive per-file conflict resolution") ]
-        , cmdExamples = [ ("bit pull", "Pull from default remote")
-                        , ("bit pull origin", "Pull from named remote")
-                        , ("bit pull --accept-remote", "Accept remote state") ]
+        , cmdOptions  = [ HelpItem "--accept-remote" "Accept remote file state as truth"
+                        , HelpItem "--manual-merge" "Interactive per-file conflict resolution" ]
+        , cmdExamples = [ HelpItem "bit pull" "Pull from default remote"
+                        , HelpItem "bit pull origin" "Pull from named remote"
+                        , HelpItem "bit pull --accept-remote" "Accept remote state" ]
         }
     , CommandHelp
         { cmdName     = "fetch"
@@ -5664,8 +5711,8 @@ commandRegistry =
         , cmdDesc     = [ "Fetch metadata from a remote without syncing files."
                         , "Only transfers the metadata bundle, no file content is downloaded." ]
         , cmdOptions  = []
-        , cmdExamples = [ ("bit fetch", "Fetch from default remote")
-                        , ("bit fetch origin", "Fetch from named remote") ]
+        , cmdExamples = [ HelpItem "bit fetch" "Fetch from default remote"
+                        , HelpItem "bit fetch origin" "Fetch from named remote" ]
         }
     , CommandHelp
         { cmdName     = "remote"
@@ -5678,19 +5725,23 @@ commandRegistry =
                         , "  show [<name>]      Show remote information"
                         , "  repair [<name>]    Verify and repair files against remote" ]
         , cmdOptions  = []
-        , cmdExamples = [ ("bit remote add origin gdrive:Projects/foo", "Add a cloud remote")
-                        , ("bit remote show", "Show all remotes")
-                        , ("bit remote repair origin", "Repair files against remote") ]
+        , cmdExamples = [ HelpItem "bit remote add origin gdrive:Projects/foo" "Add a cloud remote"
+                        , HelpItem "bit remote show" "Show all remotes"
+                        , HelpItem "bit remote repair origin" "Repair files against remote" ]
         }
     , CommandHelp
         { cmdName     = "remote add"
         , cmdSynopsis = "Add a remote"
         , cmdUsage    = "bit remote add <name> <url>"
         , cmdDesc     = [ "Add a named remote pointing to the given URL."
-                        , "Does not set upstream tracking (use 'bit push -u' for that)." ]
+                        , "Does not set upstream tracking (use 'bit push -u' for that)."
+                        , ""
+                        , "For network shares under Git Bash / MINGW, use forward slashes:"
+                        , "  //server/share/path   (not \\\\server\\share\\path)" ]
         , cmdOptions  = []
-        , cmdExamples = [ ("bit remote add origin gdrive:Projects/foo", "Add a cloud remote")
-                        , ("bit remote add backup /mnt/usb/myproject", "Add a filesystem remote") ]
+        , cmdExamples = [ HelpItem "bit remote add origin gdrive:Projects/foo" "Add a cloud remote"
+                        , HelpItem "bit remote add backup /mnt/usb/myproject" "Add a filesystem remote"
+                        , HelpItem "bit remote add nas //server/share/project" "Add a network share" ]
         }
     , CommandHelp
         { cmdName     = "remote show"
@@ -5700,8 +5751,8 @@ commandRegistry =
                         , "With no arguments, lists all remotes."
                         , "With a name, shows detailed information about that remote." ]
         , cmdOptions  = []
-        , cmdExamples = [ ("bit remote show", "List all remotes")
-                        , ("bit remote show origin", "Show details for origin") ]
+        , cmdExamples = [ HelpItem "bit remote show" "List all remotes"
+                        , HelpItem "bit remote show origin" "Show details for origin" ]
         }
     , CommandHelp
         { cmdName     = "remote repair"
@@ -5710,9 +5761,9 @@ commandRegistry =
         , cmdDesc     = [ "Verify both local and remote files against their metadata,"
                         , "then repair broken or missing files by copying from the other side."
                         , "Uses content-addressable lookup (matches by hash, not path)." ]
-        , cmdOptions  = [("--sequential", "Run verification sequentially (no parallelism)")]
-        , cmdExamples = [ ("bit remote repair", "Repair against default remote")
-                        , ("bit remote repair origin", "Repair against named remote") ]
+        , cmdOptions  = [HelpItem "--sequential" "Run verification sequentially (no parallelism)"]
+        , cmdExamples = [ HelpItem "bit remote repair" "Repair against default remote"
+                        , HelpItem "bit remote repair origin" "Repair against named remote" ]
         }
     , CommandHelp
         { cmdName     = "verify"
@@ -5721,10 +5772,10 @@ commandRegistry =
         , cmdDesc     = [ "Verify that files match their committed metadata (hash, size)."
                         , "Without --remote, checks local working tree files."
                         , "With --remote, checks files on the remote." ]
-        , cmdOptions  = [ ("--remote", "Verify remote files instead of local")
-                        , ("--sequential", "Run verification sequentially") ]
-        , cmdExamples = [ ("bit verify", "Verify local files")
-                        , ("bit verify --remote", "Verify remote files") ]
+        , cmdOptions  = [ HelpItem "--remote" "Verify remote files instead of local"
+                        , HelpItem "--sequential" "Run verification sequentially" ]
+        , cmdExamples = [ HelpItem "bit verify" "Verify local files"
+                        , HelpItem "bit verify --remote" "Verify remote files" ]
         }
     , CommandHelp
         { cmdName     = "fsck"
@@ -5734,7 +5785,7 @@ commandRegistry =
                         , "Checks the integrity of the object store -- that all commits,"
                         , "trees, and blobs are valid and consistent." ]
         , cmdOptions  = []
-        , cmdExamples = [("bit fsck", "Check integrity")]
+        , cmdExamples = [HelpItem "bit fsck" "Check integrity"]
         }
     , CommandHelp
         { cmdName     = "merge"
@@ -5746,8 +5797,8 @@ commandRegistry =
                         , "  --continue   Continue after conflict resolution"
                         , "  --abort      Abort current merge" ]
         , cmdOptions  = []
-        , cmdExamples = [ ("bit merge --continue", "Continue merge after resolving conflicts")
-                        , ("bit merge --abort", "Abort current merge") ]
+        , cmdExamples = [ HelpItem "bit merge --continue" "Continue merge after resolving conflicts"
+                        , HelpItem "bit merge --abort" "Abort current merge" ]
         }
     , CommandHelp
         { cmdName     = "merge --continue"
@@ -5755,7 +5806,7 @@ commandRegistry =
         , cmdUsage    = "bit merge --continue"
         , cmdDesc     = ["Continue a merge after manually resolving conflicts."]
         , cmdOptions  = []
-        , cmdExamples = [("bit merge --continue", "Continue merge")]
+        , cmdExamples = [HelpItem "bit merge --continue" "Continue merge"]
         }
     , CommandHelp
         { cmdName     = "merge --abort"
@@ -5763,7 +5814,7 @@ commandRegistry =
         , cmdUsage    = "bit merge --abort"
         , cmdDesc     = ["Abort the current merge operation and restore the pre-merge state."]
         , cmdOptions  = []
-        , cmdExamples = [("bit merge --abort", "Abort merge")]
+        , cmdExamples = [HelpItem "bit merge --abort" "Abort merge"]
         }
     , CommandHelp
         { cmdName     = "branch"
@@ -5774,7 +5825,7 @@ commandRegistry =
                         , "Available subcommands:"
                         , "  --unset-upstream   Remove upstream tracking configuration" ]
         , cmdOptions  = []
-        , cmdExamples = [("bit branch --unset-upstream", "Remove upstream tracking")]
+        , cmdExamples = [HelpItem "bit branch --unset-upstream" "Remove upstream tracking"]
         }
     , CommandHelp
         { cmdName     = "branch --unset-upstream"
@@ -5782,7 +5833,7 @@ commandRegistry =
         , cmdUsage    = "bit branch --unset-upstream"
         , cmdDesc     = ["Remove the upstream tracking configuration for the current branch."]
         , cmdOptions  = []
-        , cmdExamples = [("bit branch --unset-upstream", "Remove upstream tracking")]
+        , cmdExamples = [HelpItem "bit branch --unset-upstream" "Remove upstream tracking"]
         }
     ]
 ```
@@ -5984,7 +6035,7 @@ module Bit.Pipeline
 
 import Bit.Types
 import Bit.Diff (buildIndexFromFileEntries, computeDiff)
-import Bit.Plan (RcloneAction(..), planAction)
+import Bit.Plan (RcloneAction(..), planAction, resolveSwaps)
 import Bit.Utils (filterOutBitPaths)
 
 -- | Pure core: given source-of-truth files and current target files,
@@ -5997,7 +6048,7 @@ diffAndPlan sourceFiles targetFiles =
   let sourceIndex = buildIndexFromFileEntries sourceFiles
       targetIndex = buildIndexFromFileEntries targetFiles
       diffs = computeDiff sourceIndex targetIndex
-  in  map planAction diffs
+  in  resolveSwaps (map planAction diffs)
 
 -- | Push pipeline: compute actions to make remote match local.
 -- Takes pre-scanned local and remote file lists, returns planned actions.
@@ -6027,10 +6078,13 @@ pullSyncFiles localFiles remoteFiles =
 module Bit.Plan
   ( RcloneAction(..)
   , planAction
+  , resolveSwaps
   ) where
 
 import Bit.Diff (GitDiff(..), LightFileEntry(..))
 import Bit.Types
+import Data.List (foldl')
+import qualified Data.Map.Strict as Map
 
 -- Specific instructions to be executed via rclone
 data RcloneAction
@@ -6046,6 +6100,29 @@ planAction (Modified f)      = Copy f.filePath f.filePath -- Upload over existin
 planAction (Renamed old new) = Move old.filePath new.filePath
 planAction (Added f)         = Copy f.filePath f.filePath
 planAction (Deleted f)       = Delete f.filePath
+
+-- | Detect mirrored Move pairs (A→B and B→A) and replace each pair with a
+-- single Swap action that uses a temporary path to avoid overwriting.
+-- Non-paired actions pass through unchanged. Only handles pairwise swaps;
+-- longer cycles (A→B→C→A) are left as individual Moves (known limitation).
+resolveSwaps :: [RcloneAction] -> [RcloneAction]
+resolveSwaps actions =
+    let moves = [(src, dest) | Move src dest <- actions]
+        moveMap = Map.fromList moves
+        -- A swap pair exists when Move A B and Move B A both appear
+        swapPairs = [ (a, b)
+                    | (a, b) <- moves
+                    , Map.lookup b moveMap == Just a
+                    , a < b  -- canonical ordering to avoid emitting the pair twice
+                    ]
+        swappedPaths = foldl' (\acc (a, b) -> Map.insert a () (Map.insert b () acc))
+                              Map.empty swapPairs
+        isSwapped action = case action of
+            Move src dest -> Map.member src swappedPaths && Map.member dest swappedPaths
+            _             -> False
+        kept = filter (not . isSwapped) actions
+        newSwaps = [ Swap (Path (unPath a <> ".bit-swap-tmp")) a b | (a, b) <- swapPairs ]
+    in  kept ++ newSwaps
 ```
 
 ---
@@ -6476,7 +6553,7 @@ module Bit.RemoteWorkspace
 import Bit.Types (FileEntry(..), EntryKind(..), ContentType(..), Path(..))
 import Bit.Remote (Remote)
 import qualified Bit.Remote.Scan as Remote.Scan
-import Bit.Scan (hashAndClassifyFile, HashWithContentType(..), binaryExtensions)
+import Bit.Scan (hashAndClassifyFile, binaryExtensions)
 import qualified Internal.ConfigFile as ConfigFile
 import Internal.ConfigFile (TextConfig)
 import qualified Internal.Transport as Transport
@@ -6663,8 +6740,8 @@ classifyTextCandidates remote config candidates = do
             ExitSuccess ->
                 case kind fe of
                     File{fSize} -> do
-                        hwc <- hashAndClassifyFile localPath fSize config
-                        pure fe { kind = File { fHash = hwcHash hwc, fSize = fSize, fContentType = hwcContentType hwc } }
+                        (h, contentType) <- hashAndClassifyFile localPath fSize config
+                        pure fe { kind = File { fHash = h, fSize = fSize, fContentType = contentType } }
                     _ -> pure fe
             _ -> do
                 hPutStrLn stderr $ "Warning: Could not download " ++ unPath (path fe) ++ " for classification, treating as binary."
@@ -6974,7 +7051,6 @@ module Bit.Scan
   , listMetadataPaths
   , getFileHashAndSize
   , hashAndClassifyFile
-  , HashWithContentType(..)
   , binaryExtensions
   , FileEntry(..)
   , EntryKind(..)
@@ -7022,16 +7098,10 @@ binaryExtensions = [".mp4", ".zip", ".bin", ".exe", ".dll", ".so", ".dylib", ".j
 data ScannedEntry = ScannedFile FilePath | ScannedDir FilePath
   deriving (Show, Eq)
 
--- | Result of hashing and classifying a file. Replaces bare (Hash, ContentType) tuple.
-data HashWithContentType = HashWithContentType
-  { hwcHash :: Hash 'MD5
-  , hwcContentType :: ContentType
-  } deriving (Show, Eq)
-
--- | Single-pass file hash and classification. Returns hash and content type.
+-- | Single-pass file hash and classification. Returns (hash, contentType).
 -- For large files or binary extensions: streams hash only, returns BinaryContent.
 -- For others: reads first 8KB for text classification, then streams remaining chunks for hash.
-hashAndClassifyFile :: FilePath -> Integer -> ConfigFile.TextConfig -> IO HashWithContentType
+hashAndClassifyFile :: FilePath -> Integer -> ConfigFile.TextConfig -> IO (Hash 'MD5, ContentType)
 hashAndClassifyFile filePath size config = do
     let ext = map toLower (takeExtension filePath)
     
@@ -7039,7 +7109,7 @@ hashAndClassifyFile filePath size config = do
     if size >= ConfigFile.textSizeLimit config || ext `elem` binaryExtensions
         then do
             h <- streamHash filePath
-            pure (HashWithContentType h BinaryContent)
+            pure (h, BinaryContent)
         else
             -- Single-pass: read first 8KB for classification, continue streaming for hash
             withFile filePath ReadMode $ \handle -> do
@@ -7060,7 +7130,7 @@ hashAndClassifyFile filePath size config = do
                 
                 -- Start with first chunk already included
                 h <- loop (MD5.update MD5.init firstChunk)
-                pure (HashWithContentType h contentType)
+                pure (h, contentType)
   where
     -- Stream hash for files we're not classifying
     streamHash fp = withFile fp ReadMode $ \h -> do
@@ -7250,12 +7320,12 @@ scanWorkingDir root = do
                       }
                 _ -> do
                   -- Cache miss: hash the file, save cache entry
-                  hwc <- hashAndClassifyFile fullPath (fromIntegral size) config
-                  saveCacheEntry root rel (CacheEntry mtimeInt (fromIntegral size) (hwcHash hwc) (hwcContentType hwc))
+                  (h, contentType) <- hashAndClassifyFile fullPath (fromIntegral size) config
+                  saveCacheEntry root rel (CacheEntry mtimeInt (fromIntegral size) h contentType)
                   atomicModifyIORef' counter (\n -> (n + 1, ()))
                   pure $ FileEntry
                       { path = Path rel
-                      , kind = File { fHash = hwcHash hwc, fSize = fromIntegral size, fContentType = hwcContentType hwc }
+                      , kind = File { fHash = h, fSize = fromIntegral size, fContentType = contentType }
                       }
     
       -- Wrap hashing with progress reporter
@@ -8292,6 +8362,7 @@ module Internal.Git
     , createBundle
     , config
     , getLocalHead
+    , AncestorQuery(..)
     , checkIsAhead
     , getHashFromBundle
     , restore
@@ -8350,6 +8421,10 @@ baseFlags = ["-C", bitIndexPath]
 remoteTrackingRef :: String -> String
 remoteTrackingRef name = "refs/remotes/" ++ name ++ "/main"
 
+-- | Query: is aqAncestor an ancestor of aqDescendant? Record avoids transposing the two String hashes.
+data AncestorQuery = AncestorQuery { aqAncestor, aqDescendant :: String }
+  deriving (Show, Eq)
+
 -- | Represents the subset of Git functionality rgit uses
 data GitCommand
     = Init { _separateGitDir :: FilePath }
@@ -8359,7 +8434,7 @@ data GitCommand
     | RevList { _revListLeft :: String, _revListRight :: String }
     | CreateBundle { _createBundlePath :: FilePath }
     | GetBundleHead { _getBundleHeadPath :: FilePath }
-    | IsAncestor { _ancestorHash :: String, _descendantHash :: String }
+    | IsAncestor AncestorQuery
     | GetHead
 
 -- | Run a Git command and return (ExitCode, StdOut, StdErr)
@@ -8397,7 +8472,7 @@ runGit cmd = do
         GetBundleHead path ->
             ["bundle", "list-heads", path]
 
-        IsAncestor a d ->
+        IsAncestor (AncestorQuery a d) ->
             ["merge-base", "--is-ancestor", a, d]
 
         GetHead ->
@@ -8425,7 +8500,7 @@ runGitCommand cmd = do
     hPutStr stderr e
     pure c
   where
-    isAncestorCommand (IsAncestor _ _) = True
+    isAncestorCommand (IsAncestor _) = True
     isAncestorCommand _ = False
 
 commitFile :: String -> FilePath -> IO ExitCode
@@ -8442,11 +8517,10 @@ createBundle bundleName =
 config :: String -> String -> IO ExitCode
 config configName configValue = runGitCommand (Config configName configValue)
 
--- | Check if @localHash@ is ahead of @remoteHash@ (i.e., remote is an ancestor of local).
--- Parameter order: remote hash first, local hash second — matching @git merge-base --is-ancestor@.
-checkIsAhead :: String -> String -> IO Bool
-checkIsAhead remoteHash localHash =
-    (== ExitSuccess) <$> runGitCommand (IsAncestor remoteHash localHash)
+-- | Check if aqDescendant is ahead of aqAncestor (i.e., aqAncestor is an ancestor of aqDescendant).
+checkIsAhead :: AncestorQuery -> IO Bool
+checkIsAhead q =
+    (== ExitSuccess) <$> runGitCommand (IsAncestor q)
 
 replace :: String -> String -> String -> String
 replace _ _ [] = []
