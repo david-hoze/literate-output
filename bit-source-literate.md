@@ -3120,6 +3120,7 @@ processExistingRemote = do
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 
 module Bit.Core.RemoteManagement
     ( remoteAdd
@@ -3446,8 +3447,8 @@ runRepairLogic localMeta remoteMeta localIssues remoteIssues executeAction =
                 localVerified  = buildContentIndex localMeta localIssueSet
 
             -- Build metadata maps for lookup
-            let localMetaMap = Map.fromList [(Verify.bfmPath m, (Verify.bfmHash m, Verify.bfmSize m)) | m <- localMeta]
-                remoteMetaMap = Map.fromList [(Verify.bfmPath m, (Verify.bfmHash m, Verify.bfmSize m)) | m <- remoteMeta]
+            let localMetaMap = Map.fromList [(m.bfmPath, (m.bfmHash, m.bfmSize)) | m <- localMeta]
+                remoteMetaMap = Map.fromList [(m.bfmPath, (m.bfmHash, m.bfmSize)) | m <- remoteMeta]
 
             -- Plan repairs: use the OTHER side's metadata as source of truth
             -- (local metadata may reflect corrupted state after a scan)
@@ -3502,9 +3503,9 @@ issuePath (Verify.Missing p) = p
 buildContentIndex :: [Verify.BinaryFileMeta] -> Set.Set Path -> Map.Map (String, Integer) Path
 buildContentIndex entries issueSet =
     Map.fromList
-        [ ((T.unpack (hashToText (Verify.bfmHash m)), Verify.bfmSize m), Verify.bfmPath m)
+        [ ((T.unpack (hashToText m.bfmHash), m.bfmSize), m.bfmPath)
         | m <- entries
-        , not (Set.member (Verify.bfmPath m) issueSet)
+        , not (Set.member m.bfmPath issueSet)
         ]
 
 -- | Plan repair actions for a list of issues.

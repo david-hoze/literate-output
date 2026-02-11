@@ -787,7 +787,18 @@ main = do
 # leftover directories from previous test runs or interrupted tests.
 #
 # Note: We use timeout to give Windows time to release file handles.
+#
+# IMPORTANT: Tests must be run from the repository root. If a test's "cd"
+# fails (e.g. wrong cwd), subsequent commands in the same line run in the
+# project root and can create files like text.txt, file1.txt there. We remove
+# known merge-local artifacts from the project root to recover from that.
 # =============================================================================
+
+# ---- Remove leaked test artifacts from project root (merge-local creates these in subdirs) ----
+(if exist file1.txt del file1.txt) & (if exist file2.txt del file2.txt) & (if exist shared_new.txt del shared_new.txt) & (if exist text.txt del text.txt)
+<<<
+>>>
+>>>= 0
 
 # ---- Clean up entire test output directory and recreate it ----
 timeout /t 1 >nul & rmdir /s /q test\cli\output 2>nul & mkdir test\cli\output & echo global cleanup done
