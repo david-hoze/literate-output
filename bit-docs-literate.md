@@ -2159,6 +2159,7 @@ bit/Commands.hs → Bit.hs → Internal/Transport.hs → rclone (only here!)
 | `Remote` | `bit.Remote` | Resolved remote: name + URL. Smart constructor, `remoteUrl` for Transport only |
 | `RemoteState` | `bit.Remote` | Remote classification: Empty, ValidRgit, NonRgitOccupied, Corrupted, NetworkError |
 | `FetchResult` | `bit.Remote` | Bundle fetch result: BundleFound, RemoteEmpty, NetworkError |
+| `FetchOutcome` | `bit.Core.Fetch` | UpToDate, Updated { foOldHash, foNewHash }, FetchedFirst, FetchError |
 | `GitDiff` | `bit.Diff` | Added, Modified, Deleted, Renamed — pure diff result |
 | `RcloneAction` | `bit.Plan` | Copy, Move, Delete, Swap — concrete rclone operations |
 | `FileIndex` | `bit.Diff` | Dual-indexed file map (byPath + byHash) for efficient diff/rename detection |
@@ -2170,6 +2171,7 @@ bit/Commands.hs → Bit.hs → Internal/Transport.hs → rclone (only here!)
 | `ScannedEntry` | `bit.Scan` | ScannedFile / ScannedDir — internal type for scan pass, replaces (FilePath, Bool) |
 | `FileToSync` | `bit.Core.Transport` | TextToSync / BinaryToSync — text has no size, binary carries byte count |
 | `BinaryFileMeta` | `bit.Verify` | Record: bfmPath, bfmHash, bfmSize — replaces bare (Path, Hash, Integer) tuple |
+| `VerifyResult` | `bit.Verify` | Record: vrCount, vrIssues — replaces bare (Int, [VerifyIssue]) tuple |
 | `VerifyTarget` | `bit.Core.Verify` | VerifyLocal or VerifyRemote — whether verify checks local or remote |
 | `DeviceInfo` | `bit.Device` | UUID + storage type + optional hardware serial |
 | `RemoteType` | `bit.Device` | RemoteFilesystem, RemoteDevice, RemoteCloud |
@@ -3212,7 +3214,7 @@ Interactive per-file conflict resolution:
 | `Internal/ConfigFile.hs` | Config file parsing (strict ByteString) |
 | `bit/Types.hs` | Core types: Hash, FileEntry, BitEnv, BitM |
 | `bit/Internal/Metadata.hs` | Canonical metadata parser/serializer |
-| `bit/Scan.hs` | Working directory scanning, hash computation (`hashAndClassifyFile` returns `ContentType`), cache entries use `ContentType`, parallel metadata writing with skip-unchanged optimization (concurrent, strict IO) |
+| `bit/Scan.hs` | Working directory scanning, hash computation (`hashAndClassifyFile` returns `HashWithContentType`), cache entries use `ContentType`, parallel metadata writing with skip-unchanged optimization (concurrent, strict IO). `readMetadataFile`, `getFileHashAndSize` return `Maybe MetaContent`. |
 | `bit/Concurrency.hs` | Bounded parallelism helpers: concurrency level calculation, sequential/parallel mode switching |
 | `bit/Diff.hs` | Pure diff: FileIndex → FileIndex → [GitDiff] |
 | `bit/Plan.hs` | Pure plan: GitDiff → RcloneAction |

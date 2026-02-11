@@ -1594,6 +1594,103 @@ cleanup done
 
 ---
 
+## test/cli/help.test
+
+**Path:** `test/cli/help.test`
+
+*Source file.*
+
+```text
+# Test: bit help system
+# Help commands work without a bit repository
+
+# Setup: clean directory with no .bit folder
+rmdir /s /q test\cli\output\work_help 2>nul & mkdir test\cli\output\work_help
+<<<
+>>>
+>>>= 0
+
+# bit with no args prints help to stdout, exits 0
+cd test\cli\output\work_help & bit
+<<<
+>>> /Usage: bit/
+>>>= 0
+
+# bit help prints same help
+cd test\cli\output\work_help & bit help
+<<<
+>>> /Usage: bit/
+>>>= 0
+
+# bit -h prints help
+cd test\cli\output\work_help & bit -h
+<<<
+>>> /Usage: bit/
+>>>= 0
+
+# bit --help prints help
+cd test\cli\output\work_help & bit --help
+<<<
+>>> /Usage: bit/
+>>>= 0
+
+# bit help push shows detailed help
+cd test\cli\output\work_help & bit help push
+<<<
+>>> /usage: bit push/
+>>>= 0
+
+# bit push -h shows terse usage line
+cd test\cli\output\work_help & bit push -h
+<<<
+>>> /usage: bit push/
+>>>= 0
+
+# bit push --help shows detailed help with description
+cd test\cli\output\work_help & bit push --help
+<<<
+>>> /usage: bit push/
+>>>= 0
+
+# bit help remote add shows detailed help for compound command
+cd test\cli\output\work_help & bit help remote add
+<<<
+>>> /usage: bit remote add/
+>>>= 0
+
+# bit remote add --help shows detailed help (outside repo)
+cd test\cli\output\work_help & bit remote add --help
+<<<
+>>> /usage: bit remote add/
+>>>= 0
+
+# bit help remote shows the remote grouping help
+cd test\cli\output\work_help & bit help remote
+<<<
+>>> /usage: bit remote/
+>>>= 0
+
+# bit help merge --continue shows detailed help for compound command
+cd test\cli\output\work_help & bit help merge --continue
+<<<
+>>> /usage: bit merge --continue/
+>>>= 0
+
+# bit with unknown command prints error to stderr and exits 1 (needs repo)
+cd test\cli\output\work_help & bit init >nul 2>&1 & bit frobnicate 2>&1
+<<<
+>>> /not a bit command/
+>>>= 1
+
+# Cleanup
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_help 2>nul
+<<<
+>>>
+>>>= 0
+```
+
+---
+
 ## test/cli/init-config.test
 
 **Path:** `test/cli/init-config.test`

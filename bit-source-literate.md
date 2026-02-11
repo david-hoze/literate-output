@@ -235,7 +235,8 @@ import Bit.Utils (atomicWriteFileStr)
 import Bit.Concurrency (Concurrency(..))
 import qualified Bit.RemoteWorkspace as RemoteWorkspace
 import System.Environment (getArgs)
-import System.Exit (ExitCode(..), exitWith)
+import Bit.Help (printMainHelp, printTerseHelp, printCommandHelp)
+import System.Exit (ExitCode(..), exitWith, exitSuccess)
 import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
 import Control.Monad (when, unless, void)
@@ -251,42 +252,12 @@ run :: IO ()
 run = do
     args <- getArgs
     case args of
-        [] -> hPutStrLn stderr $ unlines
-            [ "Usage: bit <command> [options]"
-            , ""
-            , "Commands:"
-            , "  init                           Initialize a new bit repository"
-            , "  status                         Show working tree status"
-            , "  add <path>                     Add file contents to metadata"
-            , "  commit -m <msg>                Record changes to the repository"
-            , "  log                            Show commit history"
-            , "  diff                           Show changes"
-            , "  rm [options] <path>            Remove files from tracking"
-            , "  restore [options] [--] <path>  Restore working tree files"
-            , "  checkout [options] -- <path>   Checkout files from index"
-            , ""
-            , "  push [-u|--set-upstream] [<remote>]"
-            , "                                 Push to remote"
-            , "  pull [<remote>] [options]      Pull from remote"
-            , "      --accept-remote            Accept remote state as truth"
-            , "      --manual-merge             Manual conflict resolution"
-            , "  fetch [<remote>]               Fetch metadata from remote"
-            , ""
-            , "  remote add <name> <url>        Add a remote"
-            , "  remote show [<name>]           Show remote information"
-            , "  remote repair [<name>]         Verify and repair files against remote"
-            , ""
-            , "  verify [--remote]              Verify files match committed metadata"
-            , "  fsck                           Check metadata repository integrity"
-            , "  merge --continue|--abort       Continue or abort merge"
-            , "  branch --unset-upstream        Unset upstream tracking"
-            , ""
-            , "Remote-targeted commands:"
-            , "  --remote <name> <cmd>          Target a remote workspace (portable)"
-            , "  @<remote> <cmd>                Shorthand (needs quoting in PowerShell)"
-            , ""
-            , "  Supported: init, add <path>, commit -m <msg>, status, log, ls-files"
-            ]
+        []               -> printMainHelp >> exitSuccess
+        ["help"]         -> printMainHelp >> exitSuccess
+        ["help", cmd]    -> printCommandHelp cmd >> exitSuccess
+        ["help", c1, c2] -> printCommandHelp (c1 ++ " " ++ c2) >> exitSuccess
+        ["-h"]           -> printMainHelp >> exitSuccess
+        ["--help"]       -> printMainHelp >> exitSuccess
         _  -> case extractRemoteTarget args of
             RemoteError msg -> do
                 hPutStrLn stderr $ "fatal: " ++ msg
@@ -385,8 +356,22 @@ syncBitignoreToIndex cwd = do
     trim :: String -> String
     trim = dropWhile (== ' ') . dropWhileEnd (== ' ')
 
+-- | Extract the command key from args for help lookup.
+-- Handles multi-word commands like "remote add", "merge --continue", etc.
+commandKey :: [String] -> String
+commandKey ("remote":sub:_)
+    | sub `elem` ["add", "show", "repair"] = "remote " ++ sub
+commandKey ("merge":sub:_)
+    | sub `elem` ["--continue", "--abort"] = "merge " ++ sub
+commandKey ("branch":sub:_)
+    | sub `elem` ["--unset-upstream"] = "branch " ++ sub
+commandKey (cmd:_) = cmd
+commandKey [] = ""
+
 runCommand :: [String] -> IO ()
 runCommand args = do
+    let hasHelp = "--help" `elem` args
+    let hasTerseHelp = "-h" `elem` args
     let hasForce = "--force" `elem` args || "-f" `elem` args
     let hasForceWithLease = "--force-with-lease" `elem` args
     let isSequential = "--sequential" `elem` args
@@ -397,7 +382,16 @@ runCommand args = do
           | hasForce          = Force
           | hasForceWithLease = ForceWithLease
           | otherwise         = NoForce
-    let cmd = filter (`notElem` ["--force", "-f", "--force-with-lease", "--sequential"]) args
+    let cmd = filter (`notElem` ["--force", "-f", "--force-with-lease", "--sequential", "-h", "--help"]) args
+
+    -- Help intercept (before repo check — help works without a repo)
+    when (hasHelp || hasTerseHelp) $ do
+        let key = commandKey cmd
+        if null key
+            then printMainHelp >> exitSuccess
+            else if hasTerseHelp
+                then printTerseHelp key >> exitSuccess
+                else printCommandHelp key >> exitSuccess
 
     cwd <- Dir.getCurrentDirectory
     bitExists <- Dir.doesDirectoryExist (cwd </> ".bit")
@@ -488,7 +482,9 @@ runCommand args = do
         ["fetch", name]                 -> runScannedWithRemote name Bit.fetch
         
         ["merge", "--continue"]         -> runScanned Bit.mergeContinue
-        _                               -> hPutStrLn stderr "Unknown command."
+        _                               -> do
+            hPutStrLn stderr $ "bit: '" ++ unwords cmd ++ "' is not a bit command. See 'bit help'."
+            exitWith (ExitFailure 1)
 ```
 
 ---
@@ -1314,7 +1310,7 @@ import Bit.Utils (trimGitOutput)
 
 data FetchOutcome
     = UpToDate
-    | Updated String String  -- old hash -> new hash
+    | Updated { foOldHash :: String, foNewHash :: String }
     | FetchedFirst String    -- new hash
     | FetchError String
     deriving (Show, Eq)
@@ -1481,7 +1477,7 @@ saveFetchedBundle remote (Just bPath) = do
             Nothing -> Nothing  -- will be caught below
     case (maybeOldHash, effectiveNewHash) of
         (Just oldHash, Just newHash) | oldHash == newHash -> pure UpToDate
-        (Just oldHash, Just newHash) -> pure (Updated oldHash newHash)
+        (Just oldHash, Just newHash) -> pure (Updated { foOldHash = oldHash, foNewHash = newHash })
         (Nothing, Just newHash) -> pure (FetchedFirst newHash)
         _ -> pure (FetchError "Could not extract hash from bundle")
 
@@ -1496,9 +1492,9 @@ revParseTrackingRef name = do
 -- | Render fetch outcome to stdout/stderr.
 renderFetchOutcome :: Remote -> FetchOutcome -> IO ()
 renderFetchOutcome _remote UpToDate = pure ()  -- Silent on up-to-date
-renderFetchOutcome _remote (Updated oldHash newHash) = do
+renderFetchOutcome _remote (Updated { foOldHash = old, foNewHash = new }) = do
     putStrLn "Scanning remote..."
-    putStrLn $ "Updated: " ++ oldHash ++ " -> " ++ newHash
+    putStrLn $ "Updated: " ++ old ++ " -> " ++ new
     putStrLn "Fetch complete."
 renderFetchOutcome remote (FetchedFirst newHash) = do
     putStrLn "Scanning remote..."
@@ -2348,12 +2344,12 @@ filesystemPull cwd remote opts = do
     -- Proof of possession — always verify filesystem remote before pulling
     unless (pullMode opts == PullAcceptRemote) $ do
         putStrLn "Verifying remote repository..."
-        (remoteCount, remoteIssues) <- Verify.verifyLocalAt remotePath Nothing (Parallel 0)
-        if null remoteIssues
-            then putStrLn $ "Verified " ++ show remoteCount ++ " remote files."
+        result <- Verify.verifyLocalAt remotePath Nothing (Parallel 0)
+        if null result.vrIssues
+            then putStrLn $ "Verified " ++ show result.vrCount ++ " remote files."
             else do
-                hPutStrLn stderr $ "error: Remote working tree does not match remote metadata (" ++ show (length remoteIssues) ++ " issues)."
-                mapM_ (printVerifyIssue id) remoteIssues
+                hPutStrLn stderr $ "error: Remote working tree does not match remote metadata (" ++ show (length result.vrIssues) ++ " issues)."
+                mapM_ (printVerifyIssue id) result.vrIssues
                 hPutStrLn stderr "hint: Run 'bit verify' in the remote repo to see all mismatches."
                 hPutStrLn stderr "hint: Run 'bit pull --accept-remote' to accept the remote's actual state."
                 exitWith (ExitFailure 1)
@@ -2596,12 +2592,12 @@ pullLogic transport remote _opts = do
 
             -- Proof of possession — always verify remote before pulling
             lift $ putStrLn "Verifying remote files..."
-            (remoteFileCount, remoteIssues) <- lift $ Verify.verifyRemote cwd remote Nothing (Parallel 0)
-            if null remoteIssues
-                then lift $ putStrLn $ "Verified " ++ show remoteFileCount ++ " remote files."
+            result <- lift $ Verify.verifyRemote cwd remote Nothing (Parallel 0)
+            if null result.vrIssues
+                then lift $ putStrLn $ "Verified " ++ show result.vrCount ++ " remote files."
                 else lift $ do
-                    hPutStrLn stderr $ "error: Remote files do not match remote metadata (" ++ show (length remoteIssues) ++ " issues)."
-                    mapM_ (printVerifyIssue id) remoteIssues
+                    hPutStrLn stderr $ "error: Remote files do not match remote metadata (" ++ show (length result.vrIssues) ++ " issues)."
+                    mapM_ (printVerifyIssue id) result.vrIssues
                     hPutStrLn stderr "hint: Run 'bit verify --remote' to see all mismatches."
                     hPutStrLn stderr "hint: Run 'bit pull --accept-remote' to accept the remote's actual state."
                     exitWith (ExitFailure 1)
@@ -2764,6 +2760,7 @@ printConflictList divergentFiles localMetaMap = do
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 
 module Bit.Core.Push
     ( push
@@ -2829,12 +2826,12 @@ push = withRemote $ \remote -> do
 
     -- Proof of possession — always verify local before pushing
     liftIO $ putStrLn "Verifying local files..."
-    (fileCount, issues) <- liftIO $ Verify.verifyLocal cwd Nothing (Parallel 0)
-    if null issues
-        then liftIO $ putStrLn $ "Verified " ++ show fileCount ++ " files. All match metadata."
+    result <- liftIO $ Verify.verifyLocal cwd Nothing (Parallel 0)
+    if null result.vrIssues
+        then liftIO $ putStrLn $ "Verified " ++ show result.vrCount ++ " files. All match metadata."
         else liftIO $ do
-            hPutStrLn stderr $ "error: Working tree does not match metadata (" ++ show (length issues) ++ " issues)."
-            mapM_ (printVerifyIssue id) issues  -- full hash, no truncation
+            hPutStrLn stderr $ "error: Working tree does not match metadata (" ++ show (length result.vrIssues) ++ " issues)."
+            mapM_ (printVerifyIssue id) result.vrIssues  -- full hash, no truncation
             hPutStrLn stderr "hint: Run 'bit verify' to see all mismatches."
             hPutStrLn stderr "hint: Run 'bit add' to update metadata, or 'bit restore' to restore files."
             exitWith (ExitFailure 1)
@@ -3375,14 +3372,14 @@ repairFilesystem cwd _remote remotePath concurrency = do
 
     -- Verify both sides
     putStrLn "Verifying local files..."
-    (localCount, localIssues) <- Verify.verifyLocal cwd Nothing concurrency
-    putStrLn $ "  " ++ show localCount ++ " files checked, " ++ show (length localIssues) ++ " issues"
+    localResult <- Verify.verifyLocal cwd Nothing concurrency
+    putStrLn $ "  " ++ show localResult.vrCount ++ " files checked, " ++ show (length localResult.vrIssues) ++ " issues"
 
     putStrLn "Verifying remote files..."
-    (remoteCount, remoteIssues) <- Verify.verifyLocalAt remotePath Nothing concurrency
-    putStrLn $ "  " ++ show remoteCount ++ " files checked, " ++ show (length remoteIssues) ++ " issues"
+    remoteResult <- Verify.verifyLocalAt remotePath Nothing concurrency
+    putStrLn $ "  " ++ show remoteResult.vrCount ++ " files checked, " ++ show (length remoteResult.vrIssues) ++ " issues"
 
-    runRepairLogic localMeta remoteMeta localIssues remoteIssues
+    runRepairLogic localMeta remoteMeta localResult.vrIssues remoteResult.vrIssues
         (executeFilesystemRepair cwd remotePath)
 
 -- | Repair against a cloud remote (bundle-based, uses rclone).
@@ -3410,14 +3407,14 @@ repairCloud cwd remote concurrency = do
 
     -- Verify both sides
     putStrLn "Verifying local files..."
-    (localCount, localIssues) <- Verify.verifyLocal cwd Nothing concurrency
-    putStrLn $ "  " ++ show localCount ++ " files checked, " ++ show (length localIssues) ++ " issues"
+    localResult <- Verify.verifyLocal cwd Nothing concurrency
+    putStrLn $ "  " ++ show localResult.vrCount ++ " files checked, " ++ show (length localResult.vrIssues) ++ " issues"
 
     putStrLn "Verifying remote files..."
-    (remoteCount, remoteIssues) <- Verify.verifyRemote cwd remote Nothing concurrency
-    putStrLn $ "  " ++ show remoteCount ++ " files checked, " ++ show (length remoteIssues) ++ " issues"
+    remoteResult <- Verify.verifyRemote cwd remote Nothing concurrency
+    putStrLn $ "  " ++ show remoteResult.vrCount ++ " files checked, " ++ show (length remoteResult.vrIssues) ++ " issues"
 
-    runRepairLogic localMeta remoteMeta localIssues remoteIssues
+    runRepairLogic localMeta remoteMeta localResult.vrIssues remoteResult.vrIssues
         (executeRepair cwd remote)
 
 -- | Common repair logic shared between filesystem and cloud remotes.
@@ -4286,6 +4283,7 @@ executePullCommand localRoot remote progress action = case action of
 ```haskell
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 
 module Bit.Core.Verify
     ( VerifyTarget(..)
@@ -4344,36 +4342,24 @@ verify target concurrency = case target of
             then Just <$> forkIO (verifyProgressLoop counter fileCount)
             else pure Nothing
 
-          (actualCount, issues) <- finally
+          result <- finally
             (Verify.verifyLocal cwd (Just counter) concurrency)
             (do
               traverse_ killThread reporterThread
               when shouldShowProgress clearProgress
             )
 
-          if null issues
-            then putStrLn $ "[OK] All " ++ show actualCount ++ " files match metadata."
-            else do
-              mapM_ (printVerifyIssue truncateHash) issues
-              putStrLn $ "Checked " ++ show actualCount ++ " files. " ++ show (length issues) ++ " issues found. Run 'bit status' for details."
+          printVerifyResult truncateHash " Run 'bit status' for details." result
         else liftIO $ do
-          (actualCount, issues) <- Verify.verifyLocal cwd Nothing concurrency
-          if null issues
-            then putStrLn $ "[OK] All " ++ show actualCount ++ " files match metadata."
-            else do
-              mapM_ (printVerifyIssue truncateHash) issues
-              putStrLn $ "Checked " ++ show actualCount ++ " files. " ++ show (length issues) ++ " issues found. Run 'bit status' for details."
+          result <- Verify.verifyLocal cwd Nothing concurrency
+          printVerifyResult truncateHash " Run 'bit status' for details." result
 
 -- | Verify a filesystem remote by scanning its working directory.
 verifyFilesystemRemote :: FilePath -> Concurrency -> BitM ()
 verifyFilesystemRemote remotePath concurrency = liftIO $ do
     putStrLn "Verifying remote files..."
-    (actualCount, issues) <- Verify.verifyLocalAt remotePath Nothing concurrency
-    if null issues
-      then putStrLn $ "[OK] All " ++ show actualCount ++ " files match metadata."
-      else do
-        mapM_ (printVerifyIssue truncateHash) issues
-        putStrLn $ "Checked " ++ show actualCount ++ " files. " ++ show (length issues) ++ " issues found."
+    result <- Verify.verifyLocalAt remotePath Nothing concurrency
+    printVerifyResult truncateHash "" result
 
 -- | Verify a cloud remote using the fetched bundle.
 verifyCloudRemote :: FilePath -> Remote -> Concurrency -> BitM ()
@@ -4394,25 +4380,17 @@ verifyCloudRemote cwd remote concurrency = liftIO $ do
           then Just <$> forkIO (verifyProgressLoop counter fileCount)
           else pure Nothing
 
-        (actualCount, issues) <- finally
+        result <- finally
           (Verify.verifyRemote cwd remote (Just counter) concurrency)
           (do
             traverse_ killThread reporterThread
             when shouldShowProgress clearProgress
           )
 
-        if null issues
-          then putStrLn $ "[OK] All " ++ show actualCount ++ " files match metadata."
-          else do
-            mapM_ (printVerifyIssue truncateHash) issues
-            putStrLn $ "Checked " ++ show actualCount ++ " files. " ++ show (length issues) ++ " issues found."
+        printVerifyResult truncateHash "" result
       else do
-        (actualCount, issues) <- Verify.verifyRemote cwd remote Nothing concurrency
-        if null issues
-          then putStrLn $ "[OK] All " ++ show actualCount ++ " files match metadata."
-          else do
-            mapM_ (printVerifyIssue truncateHash) issues
-            putStrLn $ "Checked " ++ show actualCount ++ " files. " ++ show (length issues) ++ " issues found."
+        result <- Verify.verifyRemote cwd remote Nothing concurrency
+        printVerifyResult truncateHash "" result
 
 verifyProgressLoop :: IORef Int -> Int -> IO ()
 verifyProgressLoop counter total = go
@@ -4427,6 +4405,17 @@ verifyProgressLoop counter total = go
 -- | Truncate a hash string to 16 characters with ellipsis.
 truncateHash :: String -> String
 truncateHash s = take 16 s ++ if length s > 16 then "..." else ""
+
+-- | Print VerifyResult: success message or issues plus summary.
+-- hashFn: how to display hashes (e.g. truncateHash or id).
+-- suffix: appended to the failure line (e.g. " Run 'bit status' for details." or "").
+printVerifyResult :: (String -> String) -> String -> Verify.VerifyResult -> IO ()
+printVerifyResult hashFn suffix result =
+  if null result.vrIssues
+    then putStrLn $ "[OK] All " ++ show result.vrCount ++ " files match metadata."
+    else do
+      mapM_ (printVerifyIssue hashFn) result.vrIssues
+      putStrLn $ "Checked " ++ show result.vrCount ++ " files. " ++ show (length result.vrIssues) ++ " issues found." ++ suffix
 
 fsck :: FilePath -> IO ()
 fsck = Fsck.doFsck
@@ -5430,6 +5419,376 @@ doFsck _cwd = do
 
 ---
 
+## Bit/Help.hs
+
+**Path:** `Bit/Help.hs`
+
+*Source file.*
+
+```haskell
+module Bit.Help (
+    printMainHelp, printTerseHelp, printCommandHelp
+) where
+
+import System.Exit (ExitCode(..), exitWith)
+import System.IO (hPutStrLn, stderr)
+import Control.Monad (unless)
+
+data CommandHelp = CommandHelp
+    { cmdName     :: String
+    , cmdSynopsis :: String
+    , cmdUsage    :: String
+    , cmdDesc     :: [String]
+    , cmdOptions  :: [(String, String)]
+    , cmdExamples :: [(String, String)]
+    }
+
+lookupCommand :: String -> Maybe CommandHelp
+lookupCommand name = case filter (\c -> cmdName c == name) commandRegistry of
+    (x:_) -> Just x
+    []    -> Nothing
+
+-- | Print the main help summary (grouped by category) to stdout.
+printMainHelp :: IO ()
+printMainHelp = putStr $ unlines
+    [ "Usage: bit <command> [options]"
+    , ""
+    , "Getting started:"
+    , "  init                              Initialize a new bit repository"
+    , ""
+    , "Tracking changes:"
+    , "  status                            Show working tree status"
+    , "  add <path>                        Add file contents to metadata"
+    , "  commit -m <msg>                   Record changes to the repository"
+    , "  diff [--staged]                   Show changes"
+    , "  log                               Show commit history"
+    , ""
+    , "File management:"
+    , "  rm [options] <path>               Remove files from tracking"
+    , "  restore [options] [--] <path>     Restore working tree files"
+    , "  checkout [options] -- <path>      Checkout files from index"
+    , "  ls-files                          List tracked files"
+    , ""
+    , "Syncing:"
+    , "  push [-u] [<remote>]              Push to remote"
+    , "  pull [<remote>] [options]         Pull from remote"
+    , "  fetch [<remote>]                  Fetch metadata from remote"
+    , ""
+    , "Remote management:"
+    , "  remote add <name> <url>           Add a remote"
+    , "  remote show [<name>]              Show remote information"
+    , "  remote repair [<name>]            Verify and repair files against remote"
+    , ""
+    , "Integrity:"
+    , "  verify [--remote]                 Verify files match committed metadata"
+    , "  fsck                              Check metadata repository integrity"
+    , ""
+    , "Merge and branching:"
+    , "  merge --continue|--abort          Continue or abort merge"
+    , "  branch --unset-upstream           Unset upstream tracking"
+    , ""
+    , "Remote workspace:"
+    , "  --remote <name> <cmd>             Target a remote workspace (portable)"
+    , "  @<remote> <cmd>                   Shorthand (needs quoting in PowerShell)"
+    , "  Supported: init, add, commit, status, log, ls-files"
+    , ""
+    , "See 'bit help <command>' for more information on a specific command."
+    ]
+
+-- | Print terse help for a command (-h): just the usage line.
+printTerseHelp :: String -> IO ()
+printTerseHelp name = case lookupCommand name of
+    Just cmd -> putStrLn $ "usage: " ++ cmdUsage cmd
+    Nothing  -> unknownCommand name
+
+-- | Print detailed help for a command (--help / help <cmd>).
+printCommandHelp :: String -> IO ()
+printCommandHelp name = case lookupCommand name of
+    Just cmd -> do
+        putStrLn $ "usage: " ++ cmdUsage cmd
+        putStrLn ""
+        mapM_ putStrLn (cmdDesc cmd)
+        unless (null (cmdOptions cmd)) $ do
+            putStrLn ""
+            putStrLn "Options:"
+            mapM_ printOption (cmdOptions cmd)
+        unless (null (cmdExamples cmd)) $ do
+            putStrLn ""
+            putStrLn "Examples:"
+            mapM_ printExample (cmdExamples cmd)
+    Nothing -> unknownCommand name
+
+printOption :: (String, String) -> IO ()
+printOption (flag, desc) = putStrLn $ "  " ++ padRight 34 flag ++ desc
+
+printExample :: (String, String) -> IO ()
+printExample (ex, desc) = putStrLn $ "  " ++ padRight 34 ex ++ desc
+
+padRight :: Int -> String -> String
+padRight n s = s ++ replicate (max 1 (n - length s)) ' '
+
+unknownCommand :: String -> IO ()
+unknownCommand name = do
+    hPutStrLn stderr $ "bit: '" ++ name ++ "' is not a bit command. See 'bit help'."
+    exitWith (ExitFailure 1)
+
+-- | Registry of all commands with their help metadata.
+commandRegistry :: [CommandHelp]
+commandRegistry =
+    [ CommandHelp
+        { cmdName     = "init"
+        , cmdSynopsis = "Initialize a new bit repository"
+        , cmdUsage    = "bit init"
+        , cmdDesc     = [ "Create an empty bit repository in the current directory."
+                        , "This creates a .bit/ directory with an internal Git repository"
+                        , "for tracking file metadata." ]
+        , cmdOptions  = []
+        , cmdExamples = [("bit init", "Initialize in current directory")]
+        }
+    , CommandHelp
+        { cmdName     = "status"
+        , cmdSynopsis = "Show working tree status"
+        , cmdUsage    = "bit status"
+        , cmdDesc     = [ "Show the state of the working tree: which files are modified,"
+                        , "added, or deleted relative to the last commit." ]
+        , cmdOptions  = []
+        , cmdExamples = [("bit status", "Show status")]
+        }
+    , CommandHelp
+        { cmdName     = "add"
+        , cmdSynopsis = "Add file contents to metadata"
+        , cmdUsage    = "bit add <path>"
+        , cmdDesc     = [ "Compute metadata (hash, size) for the specified files and stage"
+                        , "the changes in the internal Git repository."
+                        , ""
+                        , "Use 'bit add .' to add all modified and new files." ]
+        , cmdOptions  = []
+        , cmdExamples = [ ("bit add file.txt", "Add a single file")
+                        , ("bit add .", "Add all files") ]
+        }
+    , CommandHelp
+        { cmdName     = "commit"
+        , cmdSynopsis = "Record changes to the repository"
+        , cmdUsage    = "bit commit -m <msg>"
+        , cmdDesc     = ["Commit staged metadata changes with the given message."]
+        , cmdOptions  = [("-m <msg>", "Commit message")]
+        , cmdExamples = [("bit commit -m \"Add new files\"", "Commit with message")]
+        }
+    , CommandHelp
+        { cmdName     = "diff"
+        , cmdSynopsis = "Show changes"
+        , cmdUsage    = "bit diff [--staged]"
+        , cmdDesc     = [ "Show hash/size changes between the working tree and the index."
+                        , "With --staged, show changes between the index and HEAD." ]
+        , cmdOptions  = [("--staged", "Show staged changes")]
+        , cmdExamples = [ ("bit diff", "Show unstaged changes")
+                        , ("bit diff --staged", "Show staged changes") ]
+        }
+    , CommandHelp
+        { cmdName     = "log"
+        , cmdSynopsis = "Show commit history"
+        , cmdUsage    = "bit log"
+        , cmdDesc     = ["Show the commit history of the repository."]
+        , cmdOptions  = []
+        , cmdExamples = [("bit log", "Show full log")]
+        }
+    , CommandHelp
+        { cmdName     = "rm"
+        , cmdSynopsis = "Remove files from tracking"
+        , cmdUsage    = "bit rm [options] <path>"
+        , cmdDesc     = ["Remove files from tracking and optionally from the working tree."]
+        , cmdOptions  = []
+        , cmdExamples = [("bit rm file.txt", "Remove a file")]
+        }
+    , CommandHelp
+        { cmdName     = "restore"
+        , cmdSynopsis = "Restore working tree files"
+        , cmdUsage    = "bit restore [options] [--] <path>"
+        , cmdDesc     = [ "Restore working tree files from the index or a specific commit."
+                        , "Supports full git restore syntax: --staged, --worktree, --source=, etc." ]
+        , cmdOptions  = [ ("--staged", "Restore staged changes")
+                        , ("--worktree", "Restore working tree (default)")
+                        , ("--source=<commit>", "Restore from specific commit") ]
+        , cmdExamples = [ ("bit restore -- file.txt", "Restore file from index")
+                        , ("bit restore --staged file.txt", "Unstage a file") ]
+        }
+    , CommandHelp
+        { cmdName     = "checkout"
+        , cmdSynopsis = "Checkout files from index"
+        , cmdUsage    = "bit checkout [options] -- <path>"
+        , cmdDesc     = [ "Restore working tree files from the index (legacy syntax)."
+                        , "Prefer 'bit restore' for new usage." ]
+        , cmdOptions  = []
+        , cmdExamples = [("bit checkout -- file.txt", "Restore file from index")]
+        }
+    , CommandHelp
+        { cmdName     = "ls-files"
+        , cmdSynopsis = "List tracked files"
+        , cmdUsage    = "bit ls-files"
+        , cmdDesc     = ["List all files tracked by bit."]
+        , cmdOptions  = []
+        , cmdExamples = [("bit ls-files", "List all tracked files")]
+        }
+    , CommandHelp
+        { cmdName     = "push"
+        , cmdSynopsis = "Push to remote"
+        , cmdUsage    = "bit push [-u|--set-upstream] [<remote>]"
+        , cmdDesc     = [ "Push metadata and files to a remote. Verifies local files match"
+                        , "committed metadata before pushing (proof of possession)."
+                        , ""
+                        , "If no remote is specified, pushes to the upstream remote or falls"
+                        , "back to 'origin' if it exists." ]
+        , cmdOptions  = [ ("-u, --set-upstream <remote>", "Push and set upstream tracking")
+                        , ("--force", "Force push (skip ancestry check)")
+                        , ("--force-with-lease", "Force push if remote matches expected state") ]
+        , cmdExamples = [ ("bit push", "Push to default remote")
+                        , ("bit push origin", "Push to named remote")
+                        , ("bit push -u origin", "Push and set upstream tracking") ]
+        }
+    , CommandHelp
+        { cmdName     = "pull"
+        , cmdSynopsis = "Pull from remote"
+        , cmdUsage    = "bit pull [<remote>] [options]"
+        , cmdDesc     = [ "Pull metadata and files from a remote. Verifies remote files"
+                        , "match remote metadata before pulling (proof of possession)." ]
+        , cmdOptions  = [ ("--accept-remote", "Accept remote file state as truth")
+                        , ("--manual-merge", "Interactive per-file conflict resolution") ]
+        , cmdExamples = [ ("bit pull", "Pull from default remote")
+                        , ("bit pull origin", "Pull from named remote")
+                        , ("bit pull --accept-remote", "Accept remote state") ]
+        }
+    , CommandHelp
+        { cmdName     = "fetch"
+        , cmdSynopsis = "Fetch metadata from remote"
+        , cmdUsage    = "bit fetch [<remote>]"
+        , cmdDesc     = [ "Fetch metadata from a remote without syncing files."
+                        , "Only transfers the metadata bundle, no file content is downloaded." ]
+        , cmdOptions  = []
+        , cmdExamples = [ ("bit fetch", "Fetch from default remote")
+                        , ("bit fetch origin", "Fetch from named remote") ]
+        }
+    , CommandHelp
+        { cmdName     = "remote"
+        , cmdSynopsis = "Manage remotes"
+        , cmdUsage    = "bit remote <subcommand>"
+        , cmdDesc     = [ "Manage remote repositories."
+                        , ""
+                        , "Available subcommands:"
+                        , "  add <name> <url>   Add a remote"
+                        , "  show [<name>]      Show remote information"
+                        , "  repair [<name>]    Verify and repair files against remote" ]
+        , cmdOptions  = []
+        , cmdExamples = [ ("bit remote add origin gdrive:Projects/foo", "Add a cloud remote")
+                        , ("bit remote show", "Show all remotes")
+                        , ("bit remote repair origin", "Repair files against remote") ]
+        }
+    , CommandHelp
+        { cmdName     = "remote add"
+        , cmdSynopsis = "Add a remote"
+        , cmdUsage    = "bit remote add <name> <url>"
+        , cmdDesc     = [ "Add a named remote pointing to the given URL."
+                        , "Does not set upstream tracking (use 'bit push -u' for that)." ]
+        , cmdOptions  = []
+        , cmdExamples = [ ("bit remote add origin gdrive:Projects/foo", "Add a cloud remote")
+                        , ("bit remote add backup /mnt/usb/myproject", "Add a filesystem remote") ]
+        }
+    , CommandHelp
+        { cmdName     = "remote show"
+        , cmdSynopsis = "Show remote information"
+        , cmdUsage    = "bit remote show [<name>]"
+        , cmdDesc     = [ "Show information about configured remotes."
+                        , "With no arguments, lists all remotes."
+                        , "With a name, shows detailed information about that remote." ]
+        , cmdOptions  = []
+        , cmdExamples = [ ("bit remote show", "List all remotes")
+                        , ("bit remote show origin", "Show details for origin") ]
+        }
+    , CommandHelp
+        { cmdName     = "remote repair"
+        , cmdSynopsis = "Verify and repair files against remote"
+        , cmdUsage    = "bit remote repair [<name>]"
+        , cmdDesc     = [ "Verify both local and remote files against their metadata,"
+                        , "then repair broken or missing files by copying from the other side."
+                        , "Uses content-addressable lookup (matches by hash, not path)." ]
+        , cmdOptions  = [("--sequential", "Run verification sequentially (no parallelism)")]
+        , cmdExamples = [ ("bit remote repair", "Repair against default remote")
+                        , ("bit remote repair origin", "Repair against named remote") ]
+        }
+    , CommandHelp
+        { cmdName     = "verify"
+        , cmdSynopsis = "Verify files match committed metadata"
+        , cmdUsage    = "bit verify [--remote]"
+        , cmdDesc     = [ "Verify that files match their committed metadata (hash, size)."
+                        , "Without --remote, checks local working tree files."
+                        , "With --remote, checks files on the remote." ]
+        , cmdOptions  = [ ("--remote", "Verify remote files instead of local")
+                        , ("--sequential", "Run verification sequentially") ]
+        , cmdExamples = [ ("bit verify", "Verify local files")
+                        , ("bit verify --remote", "Verify remote files") ]
+        }
+    , CommandHelp
+        { cmdName     = "fsck"
+        , cmdSynopsis = "Check metadata repository integrity"
+        , cmdUsage    = "bit fsck"
+        , cmdDesc     = [ "Run 'git fsck' on the internal metadata repository (.bit/index)."
+                        , "Checks the integrity of the object store -- that all commits,"
+                        , "trees, and blobs are valid and consistent." ]
+        , cmdOptions  = []
+        , cmdExamples = [("bit fsck", "Check integrity")]
+        }
+    , CommandHelp
+        { cmdName     = "merge"
+        , cmdSynopsis = "Continue or abort merge"
+        , cmdUsage    = "bit merge --continue|--abort"
+        , cmdDesc     = [ "Manage an in-progress merge."
+                        , ""
+                        , "Available subcommands:"
+                        , "  --continue   Continue after conflict resolution"
+                        , "  --abort      Abort current merge" ]
+        , cmdOptions  = []
+        , cmdExamples = [ ("bit merge --continue", "Continue merge after resolving conflicts")
+                        , ("bit merge --abort", "Abort current merge") ]
+        }
+    , CommandHelp
+        { cmdName     = "merge --continue"
+        , cmdSynopsis = "Continue after conflict resolution"
+        , cmdUsage    = "bit merge --continue"
+        , cmdDesc     = ["Continue a merge after manually resolving conflicts."]
+        , cmdOptions  = []
+        , cmdExamples = [("bit merge --continue", "Continue merge")]
+        }
+    , CommandHelp
+        { cmdName     = "merge --abort"
+        , cmdSynopsis = "Abort current merge"
+        , cmdUsage    = "bit merge --abort"
+        , cmdDesc     = ["Abort the current merge operation and restore the pre-merge state."]
+        , cmdOptions  = []
+        , cmdExamples = [("bit merge --abort", "Abort merge")]
+        }
+    , CommandHelp
+        { cmdName     = "branch"
+        , cmdSynopsis = "Branch management"
+        , cmdUsage    = "bit branch --unset-upstream"
+        , cmdDesc     = [ "Branch management commands."
+                        , ""
+                        , "Available subcommands:"
+                        , "  --unset-upstream   Remove upstream tracking configuration" ]
+        , cmdOptions  = []
+        , cmdExamples = [("bit branch --unset-upstream", "Remove upstream tracking")]
+        }
+    , CommandHelp
+        { cmdName     = "branch --unset-upstream"
+        , cmdSynopsis = "Unset upstream tracking"
+        , cmdUsage    = "bit branch --unset-upstream"
+        , cmdDesc     = ["Remove the upstream tracking configuration for the current branch."]
+        , cmdOptions  = []
+        , cmdExamples = [("bit branch --unset-upstream", "Remove upstream tracking")]
+        }
+    ]
+```
+
+---
+
 ## Bit/Internal/Metadata.hs
 
 **Path:** `Bit/Internal/Metadata.hs`
@@ -6117,7 +6476,7 @@ module Bit.RemoteWorkspace
 import Bit.Types (FileEntry(..), EntryKind(..), ContentType(..), Path(..))
 import Bit.Remote (Remote)
 import qualified Bit.Remote.Scan as Remote.Scan
-import Bit.Scan (hashAndClassifyFile, binaryExtensions)
+import Bit.Scan (hashAndClassifyFile, HashWithContentType(..), binaryExtensions)
 import qualified Internal.ConfigFile as ConfigFile
 import Internal.ConfigFile (TextConfig)
 import qualified Internal.Transport as Transport
@@ -6304,8 +6663,8 @@ classifyTextCandidates remote config candidates = do
             ExitSuccess ->
                 case kind fe of
                     File{fSize} -> do
-                        (h, contentType) <- hashAndClassifyFile localPath fSize config
-                        pure fe { kind = File { fHash = h, fSize = fSize, fContentType = contentType } }
+                        hwc <- hashAndClassifyFile localPath fSize config
+                        pure fe { kind = File { fHash = hwcHash hwc, fSize = fSize, fContentType = hwcContentType hwc } }
                     _ -> pure fe
             _ -> do
                 hPutStrLn stderr $ "Warning: Could not download " ++ unPath (path fe) ++ " for classification, treating as binary."
@@ -6615,6 +6974,7 @@ module Bit.Scan
   , listMetadataPaths
   , getFileHashAndSize
   , hashAndClassifyFile
+  , HashWithContentType(..)
   , binaryExtensions
   , FileEntry(..)
   , EntryKind(..)
@@ -6662,10 +7022,16 @@ binaryExtensions = [".mp4", ".zip", ".bin", ".exe", ".dll", ".so", ".dylib", ".j
 data ScannedEntry = ScannedFile FilePath | ScannedDir FilePath
   deriving (Show, Eq)
 
--- | Single-pass file hash and classification. Returns (hash, contentType).
+-- | Result of hashing and classifying a file. Replaces bare (Hash, ContentType) tuple.
+data HashWithContentType = HashWithContentType
+  { hwcHash :: Hash 'MD5
+  , hwcContentType :: ContentType
+  } deriving (Show, Eq)
+
+-- | Single-pass file hash and classification. Returns hash and content type.
 -- For large files or binary extensions: streams hash only, returns BinaryContent.
 -- For others: reads first 8KB for text classification, then streams remaining chunks for hash.
-hashAndClassifyFile :: FilePath -> Integer -> ConfigFile.TextConfig -> IO (Hash 'MD5, ContentType)
+hashAndClassifyFile :: FilePath -> Integer -> ConfigFile.TextConfig -> IO HashWithContentType
 hashAndClassifyFile filePath size config = do
     let ext = map toLower (takeExtension filePath)
     
@@ -6673,7 +7039,7 @@ hashAndClassifyFile filePath size config = do
     if size >= ConfigFile.textSizeLimit config || ext `elem` binaryExtensions
         then do
             h <- streamHash filePath
-            pure (h, BinaryContent)
+            pure (HashWithContentType h BinaryContent)
         else
             -- Single-pass: read first 8KB for classification, continue streaming for hash
             withFile filePath ReadMode $ \handle -> do
@@ -6694,7 +7060,7 @@ hashAndClassifyFile filePath size config = do
                 
                 -- Start with first chunk already included
                 h <- loop (MD5.update MD5.init firstChunk)
-                pure (h, contentType)
+                pure (HashWithContentType h contentType)
   where
     -- Stream hash for files we're not classifying
     streamHash fp = withFile fp ReadMode $ \h -> do
@@ -6884,12 +7250,12 @@ scanWorkingDir root = do
                       }
                 _ -> do
                   -- Cache miss: hash the file, save cache entry
-                  (h, contentType) <- hashAndClassifyFile fullPath (fromIntegral size) config
-                  saveCacheEntry root rel (CacheEntry mtimeInt (fromIntegral size) h contentType)
+                  hwc <- hashAndClassifyFile fullPath (fromIntegral size) config
+                  saveCacheEntry root rel (CacheEntry mtimeInt (fromIntegral size) (hwcHash hwc) (hwcContentType hwc))
                   atomicModifyIORef' counter (\n -> (n + 1, ()))
                   pure $ FileEntry
                       { path = Path rel
-                      , kind = File { fHash = h, fSize = fromIntegral size, fContentType = contentType }
+                      , kind = File { fHash = hwcHash hwc, fSize = fromIntegral size, fContentType = hwcContentType hwc }
                       }
     
       -- Wrap hashing with progress reporter
@@ -7052,8 +7418,8 @@ shouldWriteFile root metaPath entry fHash fSize fContentType = do
 -- | Parse a metadata file (hash/size lines) or read a text file and compute hash/size.
 -- Returns Nothing if file is missing or invalid.
 -- Text files in .rgit/index/ contain actual content; binary files contain metadata.
-readMetadataFile :: FilePath -> IO (Maybe (Hash 'MD5, Integer))
-readMetadataFile fp = fmap (\mc -> (metaHash mc, metaSize mc)) <$> readMetadataOrComputeHash fp
+readMetadataFile :: FilePath -> IO (Maybe MetaContent)
+readMetadataFile = readMetadataOrComputeHash
 
 -- | List all metadata file paths under index dir, relative to index root. Excludes .gitattributes.
 listMetadataPaths :: FilePath -> IO [FilePath]
@@ -7073,7 +7439,7 @@ listMetadataPaths indexRoot = go indexRoot ""
           pure (if isFile then [rel] else [])
 
 -- | Get hash and size of a file. Returns Nothing if file is missing or not a regular file.
-getFileHashAndSize :: FilePath -> FilePath -> IO (Maybe (Hash 'MD5, Integer))
+getFileHashAndSize :: FilePath -> FilePath -> IO (Maybe MetaContent)
 getFileHashAndSize root relPath = do
   let full = root </> relPath
   exists <- doesFileExist full
@@ -7081,7 +7447,7 @@ getFileHashAndSize root relPath = do
   else do
     h <- hashFile full
     sz <- getFileSize full
-    pure (Just (h, fromIntegral sz))
+    pure (Just (MetaContent h (fromIntegral sz)))
 ```
 
 ---
@@ -7285,6 +7651,7 @@ module Bit.Verify
   , verifyLocalAt
   , verifyRemote
   , VerifyIssue(..)
+  , VerifyResult(..)
   , BinaryFileMeta(..)
   , loadBinaryMetadata
   , loadCommittedBinaryMetadata
@@ -7328,6 +7695,14 @@ import qualified Bit.Scan as Scan
 data VerifyIssue
   = HashMismatch Path String String Integer Integer  -- path, expectedHash, actualHash, expectedSize, actualSize
   | Missing Path                                      -- path (in metadata but no actual file)
+  deriving (Show, Eq)
+
+-- | Result of a verification run: count of files checked and list of issues.
+-- Replaces bare (Int, [VerifyIssue]) tuple to prevent transposition.
+data VerifyResult = VerifyResult
+  { vrCount :: Int
+  , vrIssues :: [VerifyIssue]
+  }
   deriving (Show, Eq)
 
 -- | A metadata entry loaded from any source.
@@ -7469,7 +7844,7 @@ loadCommittedBinaryMetadata indexDir = do
 -- git diff to find files whose metadata changed from the committed state.
 -- Returns (number of files checked, list of issues).
 -- If an IORef counter is provided, it will be incremented after each file is checked.
-verifyLocalAt :: FilePath -> Maybe (IORef Int) -> Concurrency -> IO (Int, [VerifyIssue])
+verifyLocalAt :: FilePath -> Maybe (IORef Int) -> Concurrency -> IO VerifyResult
 verifyLocalAt root mCounter _concurrency = do
   let indexDir = root </> bitIndexPath
 
@@ -7511,7 +7886,7 @@ verifyLocalAt root mCounter _concurrency = do
   -- Update counter
   traverse_ (\ref -> atomicModifyIORef' ref (\_ -> (totalChecked, ()))) mCounter
 
-  pure (totalChecked, allIssues)
+  pure (VerifyResult totalChecked allIssues)
   where
     checkChanged indexDir relPath = do
       (showCode, committedContent, _) <- Git.runGitAt indexDir ["show", "HEAD:" ++ relPath]
@@ -7554,7 +7929,7 @@ verifyLocalAt root mCounter _concurrency = do
 -- | Verify local working tree against committed metadata in .bit/index.
 -- Returns (number of files checked, list of issues).
 -- If an IORef counter is provided, it will be incremented after each file is checked.
-verifyLocal :: FilePath -> Maybe (IORef Int) -> Concurrency -> IO (Int, [VerifyIssue])
+verifyLocal :: FilePath -> Maybe (IORef Int) -> Concurrency -> IO VerifyResult
 verifyLocal cwd = verifyLocalAt cwd
 
 -- | Extract metadata from a bundle's HEAD commit.
@@ -7590,7 +7965,7 @@ loadMetadataFromBundle bundleName = do
 -- git diff to find all mismatches.
 -- Returns (number of files checked, list of issues).
 -- If an IORef counter is provided, it will be incremented after each file is checked.
-verifyRemote :: FilePath -> Bit.Remote.Remote -> Maybe (IORef Int) -> Concurrency -> IO (Int, [VerifyIssue])
+verifyRemote :: FilePath -> Bit.Remote.Remote -> Maybe (IORef Int) -> Concurrency -> IO VerifyResult
 verifyRemote cwd remote mCounter _concurrency = do
   -- 1. Fetch the remote bundle if needed
   let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
@@ -7608,7 +7983,7 @@ verifyRemote cwd remote mCounter _concurrency = do
 
   bundleExistsNow <- doesFileExist fetchedPath
   if not bundleExistsNow
-    then pure (0, [])
+    then pure (VerifyResult 0 [])
     else do
       -- 2. Load metadata from bundle (classifies entries; fetches bundle into .bit/index)
       entries <- loadMetadataFromBundle fetchedBundle
@@ -7616,7 +7991,7 @@ verifyRemote cwd remote mCounter _concurrency = do
 
       -- 3. Fetch remote file list via rclone ls
       Remote.Scan.fetchRemoteFiles remote >>= either
-        (const $ hPutStrLn stderr "Error: Could not fetch remote file list." >> pure (0, []))
+        (const $ hPutStrLn stderr "Error: Could not fetch remote file list." >> pure (VerifyResult 0 []))
         (\remoteFiles -> do
           let filteredRemoteFiles = filterOutBitPaths remoteFiles
               remoteFileMap = Map.fromList
@@ -7671,7 +8046,7 @@ verifyRemote cwd remote mCounter _concurrency = do
           -- 8. Clean up (.git/objects are read-only, need forceRemoveDir)
           forceRemoveDir vremoteDir
 
-          pure (length entries, issues ++ extraIssues))
+          pure (VerifyResult (length entries) (issues ++ extraIssues)))
   where
     parseDiffLine entryMap remoteFileMap line =
       let (status, rest) = break (== '\t') line
@@ -8762,6 +9137,7 @@ executable bit
         -Wall
     other-modules:    Bit.AtomicWrite,
                       Bit.Commands,
+                      Bit.Help,
                       Bit.Concurrency,
                       Bit.Conflict,
                       Bit.ConcurrentIO,
