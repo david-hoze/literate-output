@@ -1124,8 +1124,8 @@ cd test\cli\output\work & set BIT_USE_STDIN=1 & echo test_device| bit remote add
 >>> /Remote.*origin|Device.*registered/
 >>>= 0
 
-# --- Verify remote was stored: either device name or fallback (local:) ---
-findstr /C:"device:" test\cli\output\work\.bit\remotes\origin >nul || findstr /C:"local:" test\cli\output\work\.bit\remotes\origin >nul
+# --- Verify remote was stored: typed format (filesystem or device) or legacy (device:/local:) ---
+findstr /C:"type: " test\cli\output\work\.bit\remotes\origin >nul || findstr /C:"device:" test\cli\output\work\.bit\remotes\origin >nul || findstr /C:"local:" test\cli\output\work\.bit\remotes\origin >nul
 <<<
 >>>
 >>>= 0

@@ -2166,6 +2166,9 @@ bit/Commands.hs → Bit.hs → Internal/Transport.hs → rclone (only here!)
 | `DeletedSide` | `bit.Conflict` | DeletedInOurs or DeletedInTheirs — which side deleted in modify/delete conflict |
 | `ConflictInfo` | `bit.Conflict` | ContentConflict, ModifyDelete path DeletedSide, AddAdd — conflict type from git ls-files -u |
 | `NameStatusChange` | `Internal.Git` | Added, Deleted, Modified, Renamed, Copied — parsed `git diff --name-status` output (replaces bare `(Char, FilePath, Maybe FilePath)` tuple) |
+| `DivergentFile` | `bit.Core.Pull` | Record for remote divergence: path, expected/actual hash and size (replaces bare 5-tuple) |
+| `ScannedEntry` | `bit.Scan` | ScannedFile / ScannedDir — internal type for scan pass, replaces (FilePath, Bool) |
+| `FileToSync` | `bit.Core.Transport` | TextToSync / BinaryToSync — text has no size, binary carries byte count |
 | `VerifyTarget` | `bit.Core.Verify` | VerifyLocal or VerifyRemote — whether verify checks local or remote |
 | `DeviceInfo` | `bit.Device` | UUID + storage type + optional hardware serial |
 | `RemoteType` | `bit.Device` | RemoteFilesystem, RemoteDevice, RemoteCloud |
