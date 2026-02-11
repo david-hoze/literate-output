@@ -15,7 +15,8 @@ file for the bit project, presented in literate-programming style.
 {-# LANGUAGE ScopedTypeVariables #-}
 
 import Bit.Commands
-import System.IO (hSetEncoding, stdout, stderr, utf8, hIsTerminalDevice)
+import GHC.IO.Encoding (setLocaleEncoding, utf8)
+import System.IO (hSetEncoding, stdout, stderr, hIsTerminalDevice)
 import System.Info (os)
 import System.Process (callCommand)
 import Control.Exception (catch, SomeException)
@@ -29,7 +30,9 @@ main = do
     when (os == "mingw32" && isTerminal) $
         callCommand "chcp 65001 > nul 2>&1" `catch` \(_ :: SomeException) -> pure ()
     
-    -- Set UTF-8 for stdout/stderr to properly display Unicode characters
+    -- Set UTF-8 for all IO (stdout, stderr, and subprocess pipes)
+    -- This ensures readProcessWithExitCode decodes git output as UTF-8
+    setLocaleEncoding utf8
     hSetEncoding stdout utf8
     hSetEncoding stderr utf8
     Bit.Commands.run
@@ -101,7 +104,7 @@ atomicWriteFile target content = do
     (openTempFile tempDir ".bit-tmp")
     (\(tempPath, handle) -> do
         hClose handle
-        removeFile tempPath `catch` \(_ :: IOException) -> return ())
+        removeFile tempPath `catch` \(_ :: IOException) -> pure ())
     (\(tempPath, handle) -> do
         BS.hPut handle content
         hClose handle
@@ -114,12 +117,12 @@ atomicWriteFile target content = do
 renameWithRetry :: FilePath -> FilePath -> Int -> IO ()
 renameWithRetry src dest 0 = do
   -- Final attempt: try to remove target first, then rename
-  removeFile dest `catch` \(_ :: IOException) -> return ()
+  removeFile dest `catch` \(_ :: IOException) -> pure ()
   renameFile src dest
 renameWithRetry src dest n = do
   result <- try (renameFile src dest)
   case result of
-    Right () -> return ()
+    Right () -> pure ()
     Left (_ :: IOException) -> do
       -- Try to remove the locked target file
       void (try (removeFile dest) :: IO (Either IOException ()))
@@ -219,298 +222,273 @@ withLockedDir (LockRegistry mvar) path action = do
 *Source file.*
 
 ```haskell
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-
-module Bit.Commands (run) where
-
-import qualified Bit.Core as Bit
-import Bit.Types (BitEnv(..), runBitM)
-import qualified Bit.Scan as Scan  -- Only for the pre-scan in runCommand
-import Bit.Remote (getDefaultRemote, resolveRemote)
-import Bit.Utils (atomicWriteFileStr)
-import Bit.Concurrency (Concurrency(..))
-import qualified Bit.RemoteWorkspace as RemoteWorkspace
-import System.Environment (getArgs)
-import System.Exit (ExitCode(..), exitWith)
-import System.FilePath ((</>))
-import System.IO (hPutStrLn, stderr)
-import System.Process (rawSystem)
-import Control.Monad (when, unless, void)
-import qualified System.Directory as Dir
-import qualified Internal.Git as Git
-import qualified Internal.Transport as Transport
-import Data.List (dropWhileEnd)
-import Control.Exception (catch, SomeException)
--- Strict IO imports to avoid Windows file locking issues
-import qualified Data.ByteString as BS
-import qualified Data.Text as T
-import Data.Text.Encoding (decodeUtf8')
-
-run :: IO ()
-run = do
-    args <- getArgs
-    case args of
-        [] -> hPutStrLn stderr $ unlines
-            [ "Usage: bit <command> [options]"
-            , ""
-            , "Commands:"
-            , "  init                           Initialize a new bit repository"
-            , "  status                         Show working tree status"
-            , "  add <path>                     Add file contents to metadata"
-            , "  commit -m <msg>                Record changes to the repository"
-            , "  log                            Show commit history"
-            , "  diff                           Show changes"
-            , "  restore [options] [--] <path>  Restore working tree files"
-            , "  checkout [options] -- <path>   Checkout files from index"
-            , ""
-            , "  push [-u|--set-upstream] [<remote>] [--skip-verify]"
-            , "                                 Push to remote"
-            , "  pull [<remote>] [options]      Pull from remote"
-            , "      --accept-remote            Accept remote state as truth"
-            , "      --manual-merge             Manual conflict resolution"
-            , "      --skip-verify              Skip proof of possession check"
-            , "  fetch [<remote>]               Fetch metadata from remote"
-            , ""
-            , "  remote add <name> <url>        Add a remote"
-            , "  remote show [<name>]           Show remote information"
-            , "  remote check [<name>]          Check remote connectivity"
-            , ""
-            , "  verify [--remote]              Verify file integrity"
-            , "  fsck                           Full integrity check"
-            , "  merge --continue|--abort       Continue or abort merge"
-            , "  branch --unset-upstream        Unset upstream tracking"
-            , ""
-            , "Remote-targeted commands:"
-            , "  @<remote> init                 Scan remote and build metadata workspace"
-            , "  @<remote> add <path>           Stage files in remote workspace"
-            , "  @<remote> commit -m <msg>      Commit and push metadata bundle to remote"
-            , "  @<remote> status               Show remote workspace status"
-            , "  @<remote> log                  Show remote workspace history"
-            ]
-        _  -> do
-            -- Check for @<remote> prefix
-            let (mRemoteTarget, remainingArgs) = extractRemoteTarget args
-            case mRemoteTarget of
-                Nothing -> runCommand remainingArgs       -- normal local execution
-                Just remoteName -> runRemoteCommand remoteName remainingArgs
-
--- | Extract @<remote> from args. Returns (Just remoteName, rest) or (Nothing, args).
-extractRemoteTarget :: [String] -> (Maybe String, [String])
-extractRemoteTarget [] = (Nothing, [])
-extractRemoteTarget (arg:rest)
-    | ('@':remoteName@(_:_)) <- arg = (Just remoteName, rest)
-    | otherwise = (Nothing, arg:rest)
-
--- | Execute a command in the context of a remote workspace
-runRemoteCommand :: String -> [String] -> IO ()
-runRemoteCommand remoteName args = do
-    cwd <- Dir.getCurrentDirectory
-    bitExists <- Dir.doesDirectoryExist (cwd </> ".bit")
-    unless bitExists $ do
-        hPutStrLn stderr "fatal: not a bit repository (or any of the parent directories): .bit"
-        exitWith (ExitFailure 1)
-
-    -- Resolve the remote
-    mRemote <- resolveRemote cwd remoteName
-    case mRemote of
-        Nothing -> do
-            hPutStrLn stderr $ "fatal: remote '" ++ remoteName ++ "' not found."
-            exitWith (ExitFailure 1)
-        Just remote -> do
-            let wsPath = RemoteWorkspace.remoteWorkspacePath cwd remoteName
-
-            case args of
-                ["init"] ->
-                    RemoteWorkspace.initRemoteWorkspace cwd remote remoteName
-
-                ("add":paths) -> do
-                    -- Stage files in the remote workspace git repo
-                    wsExists <- Dir.doesDirectoryExist (wsPath </> ".git")
-                    unless wsExists $ do
-                        hPutStrLn stderr $ "fatal: remote workspace not initialized. Run 'bit @" ++ remoteName ++ " init' first."
-                        exitWith (ExitFailure 1)
-                    -- git add in the workspace
-                    code <- rawSystem "git" (["-C", wsPath, "add"] ++ paths)
-                    exitWith code
-
-                ("commit":commitArgs) -> do
-                    wsExists <- Dir.doesDirectoryExist (wsPath </> ".git")
-                    unless wsExists $ do
-                        hPutStrLn stderr $ "fatal: remote workspace not initialized."
-                        exitWith (ExitFailure 1)
-                    -- git commit in the workspace
-                    code <- rawSystem "git" (["-C", wsPath, "commit"] ++ commitArgs)
-                    when (code == ExitSuccess) $ do
-                        -- Create bundle and push to remote
-                        putStrLn "Pushing metadata bundle to remote..."
-                        let bundlePath = wsPath </> ".git" </> "bit.bundle"
-                        bCode <- rawSystem "git" ["-C", wsPath, "bundle", "create", bundlePath, "main"]
-                        when (bCode == ExitSuccess) $ do
-                            rCode <- Transport.copyToRemote bundlePath remote ".bit/bit.bundle"
-                            if rCode == ExitSuccess
-                                then putStrLn "Remote is now a bit repository."
-                                else hPutStrLn stderr "Error uploading bundle to remote."
-                            -- Cleanup bundle
-                            Dir.removeFile bundlePath `catch` (\(_ :: SomeException) -> pure ())
-                    exitWith code
-
-                ("status":rest) -> do
-                    wsExists <- Dir.doesDirectoryExist (wsPath </> ".git")
-                    unless wsExists $ do
-                        hPutStrLn stderr $ "fatal: remote workspace not initialized."
-                        exitWith (ExitFailure 1)
-                    void $ rawSystem "git" (["-C", wsPath, "status"] ++ rest)
-
-                ("log":rest) -> do
-                    wsExists <- Dir.doesDirectoryExist (wsPath </> ".git")
-                    unless wsExists $ do
-                        hPutStrLn stderr $ "fatal: remote workspace not initialized."
-                        exitWith (ExitFailure 1)
-                    void $ rawSystem "git" (["-C", wsPath, "log"] ++ rest)
-
-                _ -> do
-                    hPutStrLn stderr $ "error: command not supported in remote context: " ++ unwords args
-                    hPutStrLn stderr "Supported: init, add, commit, status, log"
-                    exitWith (ExitFailure 1)
-
--- | Helper function to push with upstream tracking
-pushWithUpstream :: BitEnv -> FilePath -> String -> IO ()
-pushWithUpstream env cwd name = do
-    mNamedRemote <- resolveRemote cwd name
-    let envWithRemote = env { envRemote = mNamedRemote }
-    runBitM envWithRemote Bit.push
-    -- After successful push, set upstream tracking
-    void $ Git.setupBranchTrackingFor name
-    putStrLn $ "branch 'main' set up to track '" ++ name ++ "/main'."
-
--- | Sync .bitignore to .bit/index/.gitignore with normalization
-syncBitignoreToIndex :: FilePath -> IO ()
-syncBitignoreToIndex cwd = do
-    let bitignoreSrc = cwd </> ".bitignore"
-        bitignoreDest = cwd </> ".bit" </> "index" </> ".gitignore"
-    bitignoreExists <- Dir.doesFileExist bitignoreSrc
-    if bitignoreExists
-        then writeBitignore bitignoreSrc bitignoreDest
-        else removeStaleGitignore bitignoreDest
-  where
-    writeBitignore :: FilePath -> FilePath -> IO ()
-    writeBitignore src dest = do
-        bs <- BS.readFile src
-        let content = case decodeUtf8' bs of
-              Left _ -> ""
-              Right txt -> T.unpack txt
-            normalizedLines = filter (not . null) $
-              map (trim . filter (/= '\r')) (lines content)
-        atomicWriteFileStr dest (unlines normalizedLines)
-    
-    removeStaleGitignore :: FilePath -> IO ()
-    removeStaleGitignore dest = do
-        destExists <- Dir.doesFileExist dest
-        when destExists $ Dir.removeFile dest
-    
-    trim :: String -> String
-    trim = dropWhile (== ' ') . dropWhileEnd (== ' ')
-
-runCommand :: [String] -> IO ()
-runCommand args = do
-    let isForce = "--force" `elem` args || "-f" `elem` args
-    let isForceWithLease = "--force-with-lease" `elem` args
-    let isSequential = "--sequential" `elem` args
-    let isSkipVerify = "--skip-verify" `elem` args
-    when (isForce && isForceWithLease) $ do
-        hPutStrLn stderr "fatal: Cannot use both --force and --force-with-lease"
-        exitWith (ExitFailure 1)
-    let cmd = filter (`notElem` ["--force", "-f", "--force-with-lease", "--sequential", "--skip-verify"]) args
-
-    cwd <- Dir.getCurrentDirectory
-    bitExists <- Dir.doesDirectoryExist (cwd </> ".bit")
-
-    -- Lightweight env (no scan) — for read-only commands
-    let baseEnv = do
-            mRemote <- getDefaultRemote cwd
-            pure $ BitEnv cwd [] mRemote isForce isForceWithLease isSkipVerify
-
-    -- Full env (scan + bitignore sync + metadata write) — for write commands
-    let scannedEnv = do
-            syncBitignoreToIndex cwd
-            localFiles <- Scan.scanWorkingDir cwd
-            Scan.writeMetadataFiles cwd localFiles
-            mRemote <- getDefaultRemote cwd
-            pure $ BitEnv cwd localFiles mRemote isForce isForceWithLease isSkipVerify
-
-    -- Repo existence check (skip for init)
-    let needsRepo = cmd /= ["init"]
-    when (needsRepo && not bitExists) $ do
-        hPutStrLn stderr "fatal: not a bit repository (or any of the parent directories): .bit"
-        exitWith (ExitFailure 1)
-
-    -- Helper functions for running commands
-    let runScanned action = scannedEnv >>= \env -> runBitM env action
-    let runBase action = baseEnv >>= \env -> runBitM env action
-    let runScannedWithRemote name action = do
-            env <- scannedEnv
-            mNamedRemote <- resolveRemote cwd name
-            runBitM env { envRemote = mNamedRemote } action
-    let runBaseWithRemote name action = do
-            env <- baseEnv
-            mNamedRemote <- resolveRemote cwd name
-            runBitM env { envRemote = mNamedRemote } action
-
-    case cmd of
-        -- ── No env needed ────────────────────────────────────
-        ["init"]                        -> Bit.init
-        ["remote", "add", name, url]    -> Bit.remoteAdd name url
-        ["fsck"]                        -> Bit.fsck cwd (if isSequential then Sequential else Parallel 0)
-        ["merge", "--abort"]            -> Bit.mergeAbort
-        ["branch", "--unset-upstream"]  -> Bit.unsetUpstream
-
-        -- ── Lightweight env (no scan) ────────────────────────
-        ("log":rest)                    -> Bit.log rest >>= exitWith
-        ("ls-files":rest)               -> Bit.lsFiles rest >>= exitWith
-        ["remote", "show"]              -> runBase $ Bit.remoteShow Nothing
-        ["remote", "show", name]        -> runBaseWithRemote name $ Bit.remoteShow (Just name)
-        ["remote", "check"]             -> runBase $ Bit.remoteCheck Nothing
-        ["remote", "check", name]       -> runBaseWithRemote name $ Bit.remoteCheck (Just name)
-        ["verify"]                      -> runBase $ Bit.verify False (if isSequential then Sequential else Parallel 0)
-        ["verify", "--remote"]          -> runBase $ Bit.verify True (if isSequential then Sequential else Parallel 0)
-
-        -- ── Full scanned env (needs working directory state) ─
-        ("add":rest)                    -> do
-            _ <- scannedEnv
-            Bit.add rest >>= exitWith
-        ("commit":rest)                 -> do
-            _ <- scannedEnv
-            Bit.commit rest >>= exitWith
-        ("diff":rest)                   -> do
-            _ <- scannedEnv
-            Bit.diff rest >>= exitWith
-        ("status":rest)                 -> runScanned (Bit.status rest) >>= exitWith
-        ("restore":rest)                -> runScanned (Bit.restore rest) >>= exitWith
-        ("checkout":rest)               -> runScanned (Bit.checkout rest) >>= exitWith
-        
-        -- push
-        ["push"]                        -> runScanned Bit.push
-        ["push", "-u", name]            -> scannedEnv >>= \env -> pushWithUpstream env cwd name
-        ["push", "--set-upstream", name] -> scannedEnv >>= \env -> pushWithUpstream env cwd name
-        ["push", name]                  -> runScannedWithRemote name Bit.push
-        
-        -- pull
-        ["pull"]                        -> runScanned $ Bit.pull Bit.defaultPullOptions { Bit.pullSkipVerify = isSkipVerify }
-        ["pull", name]                  -> runScannedWithRemote name $ Bit.pull Bit.defaultPullOptions { Bit.pullSkipVerify = isSkipVerify }
-        ["pull", "--accept-remote"]     -> runScanned $ Bit.pull Bit.defaultPullOptions { Bit.pullAcceptRemote = True, Bit.pullSkipVerify = isSkipVerify }
-        ["pull", "--manual-merge"]      -> runScanned $ Bit.pull Bit.defaultPullOptions { Bit.pullManualMerge = True, Bit.pullSkipVerify = isSkipVerify }
-        ["pull", name, "--accept-remote"] -> runScannedWithRemote name $ Bit.pull Bit.defaultPullOptions { Bit.pullAcceptRemote = True, Bit.pullSkipVerify = isSkipVerify }
-        ["pull", "--accept-remote", name] -> runScannedWithRemote name $ Bit.pull Bit.defaultPullOptions { Bit.pullAcceptRemote = True, Bit.pullSkipVerify = isSkipVerify }
-        ["pull", name, "--manual-merge"] -> runScannedWithRemote name $ Bit.pull Bit.defaultPullOptions { Bit.pullManualMerge = True, Bit.pullSkipVerify = isSkipVerify }
-        ["pull", "--manual-merge", name] -> runScannedWithRemote name $ Bit.pull Bit.defaultPullOptions { Bit.pullManualMerge = True, Bit.pullSkipVerify = isSkipVerify }
-        
-        -- fetch
-        ["fetch"]                       -> runScanned Bit.fetch
-        ["fetch", name]                 -> runScannedWithRemote name Bit.fetch
-        
-        ["merge", "--continue"]         -> runScanned Bit.mergeContinue
-        _                               -> hPutStrLn stderr "Unknown command."
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+
+module Bit.Commands (run) where
+
+import qualified Bit.Core as Bit
+import Bit.Types (BitEnv(..), ForceMode(..), runBitM)
+import qualified Bit.Scan as Scan  -- Only for the pre-scan in runCommand
+import Bit.Remote (getDefaultRemote, resolveRemote)
+import Bit.Utils (atomicWriteFileStr)
+import Bit.Concurrency (Concurrency(..))
+import qualified Bit.RemoteWorkspace as RemoteWorkspace
+import System.Environment (getArgs)
+import System.Exit (ExitCode(..), exitWith)
+import System.FilePath ((</>))
+import System.IO (hPutStrLn, stderr)
+import Control.Monad (when, unless, void)
+import qualified System.Directory as Dir
+import qualified Internal.Git as Git
+import Data.List (dropWhileEnd)
+-- Strict IO imports to avoid Windows file locking issues
+import qualified Data.ByteString as BS
+import qualified Data.Text as T
+import Data.Text.Encoding (decodeUtf8')
+
+run :: IO ()
+run = do
+    args <- getArgs
+    case args of
+        [] -> hPutStrLn stderr $ unlines
+            [ "Usage: bit <command> [options]"
+            , ""
+            , "Commands:"
+            , "  init                           Initialize a new bit repository"
+            , "  status                         Show working tree status"
+            , "  add <path>                     Add file contents to metadata"
+            , "  commit -m <msg>                Record changes to the repository"
+            , "  log                            Show commit history"
+            , "  diff                           Show changes"
+            , "  rm [options] <path>            Remove files from tracking"
+            , "  restore [options] [--] <path>  Restore working tree files"
+            , "  checkout [options] -- <path>   Checkout files from index"
+            , ""
+            , "  push [-u|--set-upstream] [<remote>]"
+            , "                                 Push to remote"
+            , "  pull [<remote>] [options]      Pull from remote"
+            , "      --accept-remote            Accept remote state as truth"
+            , "      --manual-merge             Manual conflict resolution"
+            , "  fetch [<remote>]               Fetch metadata from remote"
+            , ""
+            , "  remote add <name> <url>        Add a remote"
+            , "  remote show [<name>]           Show remote information"
+            , "  remote repair [<name>]         Verify and repair files against remote"
+            , ""
+            , "  verify [--remote]              Verify files match committed metadata"
+            , "  fsck                           Check metadata repository integrity"
+            , "  merge --continue|--abort       Continue or abort merge"
+            , "  branch --unset-upstream        Unset upstream tracking"
+            , ""
+            , "Remote-targeted commands:"
+            , "  --remote <name> <cmd>          Target a remote workspace (portable)"
+            , "  @<remote> <cmd>                Shorthand (needs quoting in PowerShell)"
+            , ""
+            , "  Supported: init, add <path>, commit -m <msg>, status, log, ls-files"
+            ]
+        _  -> case extractRemoteTarget args of
+            RemoteError msg -> do
+                hPutStrLn stderr $ "fatal: " ++ msg
+                exitWith (ExitFailure 1)
+            NoRemote remaining -> runCommand remaining
+            RemoteFound remoteName remaining ->
+                runRemoteCommand remoteName remaining
+
+-- | Result of extracting a remote target from CLI args.
+data RemoteExtract
+    = NoRemote [String]            -- ^ No remote specified; remaining args
+    | RemoteFound String [String]  -- ^ Remote name + remaining args
+    | RemoteError String           -- ^ Error message
+
+-- | Extract @<remote> or --remote <name> from the leading args.
+-- Both forms must appear at the start of the arg list, consistent with
+-- each other and avoiding conflicts with subcommand flags (e.g. verify --remote).
+extractRemoteTarget :: [String] -> RemoteExtract
+extractRemoteTarget [] = NoRemote []
+extractRemoteTarget (('@':name@(_:_)):rest)
+    | "--remote" `elem` rest = RemoteError
+        "Cannot use both @<remote> and --remote <name>."
+    | otherwise = RemoteFound name rest
+extractRemoteTarget ("--remote":name:rest) = RemoteFound name rest
+extractRemoteTarget ["--remote"] = RemoteError
+    "'--remote' requires a remote name argument."
+extractRemoteTarget args = NoRemote args
+
+-- | Execute a command in the context of an ephemeral remote workspace.
+-- Each command fetches the bundle from remote, inflates into a temp workspace,
+-- operates, re-bundles if needed, and pushes back. No persistent workspace.
+runRemoteCommand :: String -> [String] -> IO ()
+runRemoteCommand remoteName args = do
+    cwd <- Dir.getCurrentDirectory
+    bitExists <- Dir.doesDirectoryExist (cwd </> ".bit")
+    unless bitExists $ do
+        hPutStrLn stderr "fatal: not a bit repository (or any of the parent directories): .bit"
+        exitWith (ExitFailure 1)
+
+    mRemote <- resolveRemote cwd remoteName
+    case mRemote of
+        Nothing -> do
+            hPutStrLn stderr $ "fatal: remote '" ++ remoteName ++ "' not found."
+            exitWith (ExitFailure 1)
+        Just remote -> case args of
+            ["init"] ->
+                RemoteWorkspace.initRemote remote remoteName
+            ("add":paths) ->
+                RemoteWorkspace.addRemote remote paths >>= exitWith
+            ("commit":commitArgs) ->
+                RemoteWorkspace.commitRemote remote commitArgs >>= exitWith
+            ("status":rest) ->
+                RemoteWorkspace.statusRemote remote rest >>= exitWith
+            ("log":rest) ->
+                RemoteWorkspace.logRemote remote rest >>= exitWith
+            ("ls-files":rest) ->
+                RemoteWorkspace.lsFilesRemote remote rest >>= exitWith
+            _ -> do
+                hPutStrLn stderr $ "error: command not supported in remote context: " ++ unwords args
+                hPutStrLn stderr "Supported: init, add, commit, status, log, ls-files"
+                exitWith (ExitFailure 1)
+
+-- | Helper function to push with upstream tracking
+pushWithUpstream :: BitEnv -> FilePath -> String -> IO ()
+pushWithUpstream env cwd name = do
+    mNamedRemote <- resolveRemote cwd name
+    let envWithRemote = env { envRemote = mNamedRemote }
+    runBitM envWithRemote Bit.push
+    -- After successful push, set upstream tracking
+    void $ Git.setupBranchTrackingFor name
+    putStrLn $ "branch 'main' set up to track '" ++ name ++ "/main'."
+
+-- | Sync .bitignore to .bit/index/.gitignore with normalization
+syncBitignoreToIndex :: FilePath -> IO ()
+syncBitignoreToIndex cwd = do
+    let bitignoreSrc = cwd </> ".bitignore"
+        bitignoreDest = cwd </> ".bit" </> "index" </> ".gitignore"
+    bitignoreExists <- Dir.doesFileExist bitignoreSrc
+    if bitignoreExists
+        then writeBitignore bitignoreSrc bitignoreDest
+        else removeStaleGitignore bitignoreDest
+  where
+    writeBitignore :: FilePath -> FilePath -> IO ()
+    writeBitignore src dest = do
+        bs <- BS.readFile src
+        let content = either (const "") T.unpack (decodeUtf8' bs)
+            normalizedLines = filter (not . null) $
+              map (trim . filter (/= '\r')) (lines content)
+        atomicWriteFileStr dest (unlines normalizedLines)
+    
+    removeStaleGitignore :: FilePath -> IO ()
+    removeStaleGitignore dest = do
+        destExists <- Dir.doesFileExist dest
+        when destExists $ Dir.removeFile dest
+    
+    trim :: String -> String
+    trim = dropWhile (== ' ') . dropWhileEnd (== ' ')
+
+runCommand :: [String] -> IO ()
+runCommand args = do
+    let hasForce = "--force" `elem` args || "-f" `elem` args
+    let hasForceWithLease = "--force-with-lease" `elem` args
+    let isSequential = "--sequential" `elem` args
+    when (hasForce && hasForceWithLease) $ do
+        hPutStrLn stderr "fatal: Cannot use both --force and --force-with-lease"
+        exitWith (ExitFailure 1)
+    let forceMode
+          | hasForce          = Force
+          | hasForceWithLease = ForceWithLease
+          | otherwise         = NoForce
+    let cmd = filter (`notElem` ["--force", "-f", "--force-with-lease", "--sequential"]) args
+
+    cwd <- Dir.getCurrentDirectory
+    bitExists <- Dir.doesDirectoryExist (cwd </> ".bit")
+
+    -- Lightweight env (no scan) — for read-only commands
+    let baseEnv = do
+            mRemote <- getDefaultRemote cwd
+            pure $ BitEnv cwd [] mRemote forceMode
+
+    -- Full env (scan + bitignore sync + metadata write) — for write commands
+    let scannedEnv = do
+            syncBitignoreToIndex cwd
+            localFiles <- Scan.scanWorkingDir cwd
+            Scan.writeMetadataFiles cwd localFiles
+            mRemote <- getDefaultRemote cwd
+            pure $ BitEnv cwd localFiles mRemote forceMode
+
+    -- Repo existence check (skip for init)
+    let needsRepo = cmd /= ["init"]
+    when (needsRepo && not bitExists) $ do
+        hPutStrLn stderr "fatal: not a bit repository (or any of the parent directories): .bit"
+        exitWith (ExitFailure 1)
+
+    -- Helper functions for running commands
+    let runScanned action = scannedEnv >>= \env -> runBitM env action
+    let runBase action = baseEnv >>= \env -> runBitM env action
+    let runScannedWithRemote name action = do
+            env <- scannedEnv
+            mNamedRemote <- resolveRemote cwd name
+            runBitM env { envRemote = mNamedRemote } action
+    let runBaseWithRemote name action = do
+            env <- baseEnv
+            mNamedRemote <- resolveRemote cwd name
+            runBitM env { envRemote = mNamedRemote } action
+
+    case cmd of
+        -- ── No env needed ────────────────────────────────────
+        ["init"]                        -> Bit.init
+        ["remote", "add", name, url]    -> Bit.remoteAdd name url
+        ["fsck"]                        -> Bit.fsck cwd
+        ["merge", "--abort"]            -> Bit.mergeAbort
+        ["branch", "--unset-upstream"]  -> Bit.unsetUpstream
+
+        -- ── Lightweight env (no scan) ────────────────────────
+        ("log":rest)                    -> Bit.log rest >>= exitWith
+        ("ls-files":rest)               -> Bit.lsFiles rest >>= exitWith
+        ["remote", "show"]              -> runBase $ Bit.remoteShow Nothing
+        ["remote", "show", name]        -> runBaseWithRemote name $ Bit.remoteShow (Just name)
+        ["remote", "repair"]             -> runBase $ Bit.remoteRepair Nothing (if isSequential then Sequential else Parallel 0)
+        ["remote", "repair", name]      -> runBaseWithRemote name $ Bit.remoteRepair (Just name) (if isSequential then Sequential else Parallel 0)
+        ["verify"]                      -> runBase $ Bit.verify Bit.VerifyLocal (if isSequential then Sequential else Parallel 0)
+        ["verify", "--remote"]          -> runBase $ Bit.verify Bit.VerifyRemote (if isSequential then Sequential else Parallel 0)
+
+        ("rm":rest)                     -> runBase (Bit.rm rest) >>= exitWith
+
+        -- ── Full scanned env (needs working directory state) ─
+        ("add":rest)                    -> do
+            void scannedEnv
+            Bit.add rest >>= exitWith
+        ("commit":rest)                 -> do
+            void scannedEnv
+            Bit.commit rest >>= exitWith
+        ("diff":rest)                   -> do
+            void scannedEnv
+            Bit.diff rest >>= exitWith
+        ("status":rest)                 -> runScanned (Bit.status rest) >>= exitWith
+        ("restore":rest)                -> runScanned (Bit.restore rest) >>= exitWith
+        ("checkout":rest)               -> runScanned (Bit.checkout rest) >>= exitWith
+        
+        -- push
+        ["push"]                        -> runScanned Bit.push
+        ["push", "-u", name]            -> scannedEnv >>= \env -> pushWithUpstream env cwd name
+        ["push", "--set-upstream", name] -> scannedEnv >>= \env -> pushWithUpstream env cwd name
+        ["push", name]                  -> runScannedWithRemote name Bit.push
+        
+        -- pull
+        ["pull"]                        -> runScanned $ Bit.pull Bit.defaultPullOptions
+        ["pull", name]                  -> runScannedWithRemote name $ Bit.pull Bit.defaultPullOptions
+        ["pull", "--accept-remote"]     -> runScanned $ Bit.pull (Bit.PullOptions Bit.PullAcceptRemote)
+        ["pull", "--manual-merge"]      -> runScanned $ Bit.pull (Bit.PullOptions Bit.PullManualMerge)
+        ["pull", name, "--accept-remote"] -> runScannedWithRemote name $ Bit.pull (Bit.PullOptions Bit.PullAcceptRemote)
+        ["pull", "--accept-remote", name] -> runScannedWithRemote name $ Bit.pull (Bit.PullOptions Bit.PullAcceptRemote)
+        ["pull", name, "--manual-merge"] -> runScannedWithRemote name $ Bit.pull (Bit.PullOptions Bit.PullManualMerge)
+        ["pull", "--manual-merge", name] -> runScannedWithRemote name $ Bit.pull (Bit.PullOptions Bit.PullManualMerge)
+        
+        -- fetch
+        ["fetch"]                       -> runScanned Bit.fetch
+        ["fetch", name]                 -> runScannedWithRemote name Bit.fetch
+        
+        ["merge", "--continue"]         -> runScanned Bit.mergeContinue
+        _                               -> hPutStrLn stderr "Unknown command."
 ```
 
 ---
@@ -567,9 +545,7 @@ data Concurrency
 --
 -- Minimum of 4 ensures reasonable performance even on single-core systems.
 ioConcurrency :: IO Int
-ioConcurrency = do
-    caps <- getNumCapabilities
-    pure (max 4 (caps * 4))
+ioConcurrency = max 4 . (* 4) <$> getNumCapabilities
 
 -- | Lower concurrency for network/subprocess operations.
 --
@@ -581,9 +557,7 @@ ioConcurrency = do
 -- We use a lower multiplier (2× cores) and cap at 8 to avoid overwhelming
 -- remote services or the network stack.
 networkConcurrency :: IO Int
-networkConcurrency = do
-    caps <- getNumCapabilities
-    pure (min 8 (max 2 (caps * 2)))
+networkConcurrency = min 8 . max 2 . (* 2) <$> getNumCapabilities
 
 -- | Run an action over a list with the specified concurrency level.
 --
@@ -655,7 +629,7 @@ module Bit.ConcurrentFileIO
   , T.Text
   ) where
 
-import Prelude (FilePath, Maybe(..), Either(..), pure, ($), (.))
+import Prelude (FilePath, Maybe(..), Either(..), pure, ($), (.), const, either)
 import Control.Exception (try, SomeException, throwIO)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import qualified Data.ByteString as BS
@@ -692,20 +666,14 @@ readFileUtf8Strict path = liftIO $ do
 -- avoiding TOCTOU race conditions.
 readFileMaybe :: MonadIO m => FilePath -> m (Maybe BS.ByteString)
 readFileMaybe path = liftIO $ do
-  result <- try (BS.readFile path)
-  pure $ case result of
-    Left (_ :: SomeException) -> Nothing
-    Right bs -> Just bs
+  (result :: Either SomeException BS.ByteString) <- try (BS.readFile path)
+  pure $ either (const Nothing) Just result
 
 -- | Read file as UTF-8, returning 'Nothing' on any error (including invalid UTF-8).
 readFileUtf8Maybe :: MonadIO m => FilePath -> m (Maybe T.Text)
 readFileUtf8Maybe path = liftIO $ do
-  result <- try (BS.readFile path)
-  pure $ case result of
-    Left (_ :: SomeException) -> Nothing
-    Right bs -> case T.decodeUtf8' bs of
-      Left _ -> Nothing
-      Right t -> Just t
+  (result :: Either SomeException BS.ByteString) <- try (BS.readFile path)
+  pure $ either (const Nothing) (either (const Nothing) Just . T.decodeUtf8') result
 
 -- ============================================================================
 -- Writing (strict)
@@ -827,11 +795,8 @@ writeFileStrict path = UnsafeConcurrentIO . BS.writeFile path
 -- | Read file, returning 'Nothing' on any error.
 -- Useful for "check if exists and read" patterns.
 readFileMaybeC :: FilePath -> ConcurrentIO (Maybe BS.ByteString)
-readFileMaybeC path = UnsafeConcurrentIO $ do
-  result <- try (BS.readFile path)
-  pure $ case result of
-    Left (_ :: SomeException) -> Nothing
-    Right bs -> Just bs
+readFileMaybeC path = UnsafeConcurrentIO $
+  either (const Nothing) Just <$> (try (BS.readFile path) :: IO (Either SomeException BS.ByteString))
 
 -- ============================================================================
 -- Concurrency primitives
@@ -914,9 +879,11 @@ finallyC action cleanup = UnsafeConcurrentIO $
 
 ```haskell
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE MultiWayIf #-}
 
 module Bit.Conflict
   ( Resolution(..)
+  , DeletedSide(..)
   , ConflictInfo(..)
   , resolveConflict
   , resolveAll
@@ -938,18 +905,26 @@ import Bit.Internal.Metadata (MetaContent(..), parseMetadata, displayHash)
 data Resolution = KeepLocal | TakeRemote
   deriving (Show, Eq)
 
+-- | Which side deleted the file in a modify/delete conflict.
+data DeletedSide
+  = DeletedInOurs   -- ^ Deleted in HEAD (ours); modified in origin/main (theirs)
+  | DeletedInTheirs -- ^ Deleted in origin/main (theirs); modified in HEAD (ours)
+  deriving (Show, Eq)
+
 -- | Conflict type (mirrors Internal.Git.ConflictType but doesn't depend on IO module).
 data ConflictInfo
-  = ContentConflict FilePath   -- both modified
-  | ModifyDelete FilePath Bool -- True = deleted in HEAD (ours)
-  | AddAdd FilePath            -- both added different
+  = ContentConflict FilePath
+  | ModifyDelete FilePath DeletedSide
+  | AddAdd FilePath
   deriving (Show, Eq)
 
 -- | Get list of conflicted files
 getConflictedFilesE :: IO [FilePath]
 getConflictedFilesE = do
   (code, out, _) <- Git.runGitWithOutput ["diff", "--name-only", "--diff-filter=U"]
-  pure $ if code /= ExitSuccess then [] else filter (not . null) (lines out)
+  pure $ case code of
+    ExitSuccess -> filter (not . null) (lines out)
+    _ -> []
 
 -- | Detect conflict type
 getConflictInfoE :: FilePath -> IO ConflictInfo
@@ -967,19 +942,19 @@ parseConflictInfo path out =
       has1 = 1 `elem` stageNums
       has2 = 2 `elem` stageNums
       has3 = 3 `elem` stageNums
-  in if has2 && has3 && has1 then ContentConflict path
-     else if has2 && has3 && not has1 then AddAdd path
-     else if has2 && not has3 then ModifyDelete path False
-     else if has3 && not has2 then ModifyDelete path True
-     else ContentConflict path
+  in if | has2 && has3 && has1     -> ContentConflict path
+        | has2 && has3 && not has1 -> AddAdd path
+        | has2 && not has3         -> ModifyDelete path DeletedInTheirs
+        | has3 && not has2         -> ModifyDelete path DeletedInOurs
+        | otherwise                -> ContentConflict path
 
 -- | Print a conflict type announcement (git-style message).
 announceConflict :: ConflictInfo -> IO ()
 announceConflict (ContentConflict path) =
   putStrLn $ "CONFLICT (content): Merge conflict in " ++ path
-announceConflict (ModifyDelete path True) =
+announceConflict (ModifyDelete path DeletedInOurs) =
   putStrLn $ "CONFLICT (modify/delete): " ++ path ++ " deleted in HEAD and modified in origin/main"
-announceConflict (ModifyDelete path False) =
+announceConflict (ModifyDelete path DeletedInTheirs) =
   putStrLn $ "CONFLICT (modify/delete): " ++ path ++ " deleted in origin/main and modified in HEAD"
 announceConflict (AddAdd path) =
   putStrLn $ "CONFLICT (add/add): Merge conflict in " ++ path
@@ -1153,7 +1128,7 @@ copyFileChunked src dest _expectedSize bytesRef = do
 withSyncProgressReporter :: SyncProgress -> IO a -> IO a
 withSyncProgressReporter progress action = do
     isTTY <- hIsTerminalDevice stderr
-    let shouldShowProgress = isTTY && spFilesTotal progress > 5
+    let shouldShowProgress = isTTY && spFilesTotal progress > 0
     if shouldShowProgress
         then do
             reporterThread <- forkIO (syncProgressLoop progress)
@@ -1180,15 +1155,18 @@ syncProgressLoop progress = go
         totalBytes <- readIORef (spBytesTotal progress)
         _currentFile <- readIORef (spCurrentFile progress)
         
-        let filesPct = if spFilesTotal progress > 0
+        -- Use bytes for percentage when available, fall back to file count
+        let pct = if totalBytes > 0
+                  then fromIntegral ((bytesCopied * 100) `div` totalBytes) :: Int
+                  else if spFilesTotal progress > 0
                        then (filesCompleted * 100) `div` spFilesTotal progress
                        else 0
-        
+
         -- Show aggregate progress
-        let progressLine = "Syncing files: " ++ show filesCompleted ++ "/" ++ show (spFilesTotal progress) 
+        let progressLine = "Syncing files: " ++ show filesCompleted ++ "/" ++ show (spFilesTotal progress)
                          ++ " files, " ++ formatBytes bytesCopied
                          ++ if totalBytes > 0
-                            then " / " ++ formatBytes totalBytes ++ " (" ++ show filesPct ++ "%)"
+                            then " / " ++ formatBytes totalBytes ++ " (" ++ show pct ++ "%)"
                             else ""
         
         reportProgress progressLine
@@ -1243,13 +1221,14 @@ module Bit.Core
     , fetch
 
       -- Verification
+    , VerifyTarget(..)
     , verify
     , fsck
 
       -- Remote management
     , remoteAdd
     , remoteShow
-    , remoteCheck
+    , remoteRepair
 
       -- Merge management
     , mergeContinue
@@ -1259,12 +1238,13 @@ module Bit.Core
     , unsetUpstream
 
       -- Types re-exported for Commands.hs
+    , PullMode(..)
     , PullOptions(..)
     , defaultPullOptions
     ) where
 
 import Prelude hiding (init, log)
-import Bit.Core.Helpers (PullOptions(..), defaultPullOptions)
+import Bit.Core.Helpers (PullMode(..), PullOptions(..), defaultPullOptions)
 import Bit.Core.Init (init, initializeRepoAt)
 import Bit.Core.GitPassthrough
     ( add
@@ -1287,8 +1267,8 @@ import Bit.Core.GitPassthrough
 import Bit.Core.Push (push)
 import Bit.Core.Pull (pull)
 import Bit.Core.Fetch (fetch)
-import Bit.Core.RemoteManagement (remoteAdd, remoteShow, remoteCheck)
-import Bit.Core.Verify (verify, fsck)
+import Bit.Core.RemoteManagement (remoteAdd, remoteShow, remoteRepair)
+import Bit.Core.Verify (VerifyTarget(..), verify, fsck)
 
 ```
 
@@ -1318,7 +1298,7 @@ module Bit.Core.Fetch
 
 import qualified System.Directory as Dir
 import System.FilePath ((</>))
-import Control.Monad (when, unless)
+import Control.Monad (when)
 import System.Exit (ExitCode(..), exitWith)
 import qualified Internal.Git as Git
 import qualified Internal.Transport as Transport
@@ -1328,7 +1308,7 @@ import Bit.Types (BitM, BitEnv(..))
 import Control.Monad.Trans.Reader (asks)
 import Control.Monad.IO.Class (liftIO)
 import Internal.Config (fromCwdPath, bundleCwdPath, fetchedBundle)
-import Bit.Core.Helpers (getRemoteTargetType, withRemote, safeRemove)
+import Bit.Core.Helpers (getRemoteTargetType, withRemote, safeRemove, checkFilesystemRemoteIsRepo)
 import qualified Bit.Device as Device
 import System.Directory (copyFile)
 import Control.Monad (void)
@@ -1355,8 +1335,7 @@ fetch = withRemote $ \remote -> do
     -- Determine if this is a filesystem or cloud remote
     mTarget <- liftIO $ getRemoteTargetType cwd (remoteName remote)
     case mTarget of
-        Just (Device.TargetDevice _ _) -> liftIO $ filesystemFetch cwd remote
-        Just (Device.TargetLocalPath _) -> liftIO $ filesystemFetch cwd remote
+        Just t | Device.isFilesystemTarget t -> liftIO $ filesystemFetch cwd remote
         _ -> cloudFetch remote  -- Cloud remote or no target info (use cloud flow)
 
 -- | Fetch from a cloud remote (original flow, unchanged).
@@ -1373,11 +1352,7 @@ filesystemFetch _cwd remote = do
     putStrLn $ "Fetching from filesystem remote: " ++ remotePath
     
     -- Check if remote has .bit/ directory
-    let remoteBitDir = remotePath </> ".bit"
-    remoteHasBit <- Dir.doesDirectoryExist remoteBitDir
-    unless remoteHasBit $ do
-        hPutStrLn stderr "error: Remote is not a bit repository."
-        exitWith (ExitFailure 1)
+    checkFilesystemRemoteIsRepo remotePath
     
     -- Fetch remote into local
     let remoteIndexGit = remotePath </> ".bit" </> "index" </> ".git"
@@ -1393,7 +1368,7 @@ filesystemFetch _cwd remote = do
     -- Output fetch results similar to cloud fetch
     hPutStrLn stderr $ "From " ++ remoteName remote
     hPutStrLn stderr $ " * [new branch]      main       -> origin/main"
-    
+
     putStrLn "Fetch complete."
 
 -- ============================================================================
@@ -1403,11 +1378,8 @@ filesystemFetch _cwd remote = do
 -- | Classify remote state (empty, valid bit, non-bit, corrupted, network error)
 -- This is domain logic: it knows what .bit/ means and interprets remote contents
 classifyRemoteState :: Remote -> IO RemoteState
-classifyRemoteState remote = do
-    result <- Transport.listRemoteItems remote 1
-    case result of
-        Left err -> pure (StateNetworkError err)
-        Right items -> pure (interpretRemoteItems items)
+classifyRemoteState remote =
+    either StateNetworkError interpretRemoteItems <$> Transport.listRemoteItems remote 1
 
 -- | Pure interpretation of remote items into domain state
 interpretRemoteItems :: [Transport.TransportItem] -> RemoteState
@@ -1538,6 +1510,7 @@ renderFetchOutcome _remote (FetchError err) = do
 ```haskell
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE MultiWayIf #-}
 
 module Bit.Core.GitPassthrough
     ( -- Git passthrough
@@ -1566,23 +1539,24 @@ module Bit.Core.GitPassthrough
 
 import Prelude hiding (log)
 import qualified System.Directory as Dir
-import System.FilePath ((</>), takeDirectory)
+import System.FilePath ((</>), takeDirectory, equalFilePath)
 import Control.Monad (when, unless, void, forM_)
+import Data.Foldable (traverse_)
 import Control.Monad.Trans.Class (lift)
 import System.Exit (ExitCode(..), exitWith)
-import Control.Exception (throwIO)
+import Control.Exception (throwIO, IOException, catch)
 import qualified Internal.Git as Git
 import Internal.Config (bitIndexPath)
-import System.IO (stderr, hPutStrLn)
+import System.IO (stderr, hPutStrLn, hPutStr)
 import Bit.Types (BitM, BitEnv(..))
 import Control.Monad.Trans.Reader (asks)
 import qualified Data.List
 import Control.Monad.IO.Class (liftIO)
-import Data.List (isPrefixOf)
+import Data.List (isPrefixOf, foldl')
 import qualified Bit.Conflict as Conflict
 import qualified Bit.Device as Device
 import qualified Bit.Internal.Metadata as Metadata
-import Bit.Remote (Remote, remoteName, remoteUrl)
+import Bit.Remote (remoteName, remoteUrl)
 import qualified Bit.Core.Transport as Transport
 import Bit.Core.Helpers
     ( fileExistsE
@@ -1618,8 +1592,37 @@ lsFiles args = Git.runGitRaw ("ls-files" : args)
 reset :: [String] -> IO ExitCode
 reset args = Git.runGitRaw ("reset" : args)
 
-rm :: [String] -> IO ExitCode
-rm args = Git.runGitRaw ("rm" : args)
+rm :: [String] -> BitM ExitCode
+rm args = do
+    cwd <- asks envCwd
+    let flags = parseRmFlags args
+        -- Strip quiet flags so git always outputs the file list for parsing
+        gitArgs = stripQuiet args
+    (code, out, err) <- liftIO $ Git.runGitWithOutput ("rm" : gitArgs)
+
+    -- Remove actual files from working directory
+    when (code == ExitSuccess && not (rmCached flags) && not (rmDryRun flags)) $ liftIO $ do
+        let paths = parseRmOutput out
+        forM_ paths $ \path -> do
+            let actualPath = cwd </> path
+            exists <- Dir.doesFileExist actualPath
+            when exists $
+                Dir.removeFile actualPath `catch` \(e :: IOException) ->
+                    hPutStrLn stderr $ "warning: failed to remove " ++ path ++ ": " ++ show e
+        -- Clean up empty parent directories
+        forM_ paths $ \path ->
+            removeEmptyParents cwd (takeDirectory (cwd </> path))
+
+    -- Print output
+    liftIO $ do
+        unless (rmQuiet flags) $
+            putStr (Git.rewriteGitHints out)
+        hPutStr stderr (Git.rewriteGitHints err)
+        case code of
+            ExitSuccess -> pure ()
+            ExitFailure n -> hPutStrLn stderr ("bit: git exited with code " ++ show n)
+
+    pure code
 
 mv :: [String] -> IO ExitCode
 mv args = Git.runGitRaw ("mv" : args)
@@ -1657,33 +1660,30 @@ mergeContinue = do
 
     gitConflicts <- liftIO Conflict.getConflictedFilesE
 
-    if not (null gitConflicts)
-        then liftIO $ hPutStrLn stderr "error: you have not resolved your conflicts yet."
-        else if not conflictsExist
-            then do
-                (code, _, _) <- liftIO $ Git.runGitWithOutput ["rev-parse", "--verify", "MERGE_HEAD"]
-                if code == ExitSuccess
-                    then do
-                        oldHead <- liftIO getLocalHeadE
-                        liftIO $ void $ Git.runGitRaw ["commit", "-m", "Merge remote"]
-                        liftIO $ putStrLn "Merge complete."
-                        case mRemote of
-                            Nothing -> pure ()
-                            Just remote -> do
-                                mTarget <- liftIO $ getRemoteTargetType cwd (remoteName remote)
-                                let transport = case mTarget of
-                                      Just (Device.TargetDevice _ _) -> Transport.mkFilesystemTransport (remoteUrl remote)
-                                      Just (Device.TargetLocalPath _) -> Transport.mkFilesystemTransport (remoteUrl remote)
-                                      _ -> Transport.mkCloudTransport remote
-                                Transport.syncBinariesAfterMerge transport remote oldHead
-                    else do
-                        liftIO $ hPutStrLn stderr "error: no merge in progress."
-                        liftIO $ exitWith (ExitFailure 1)
-            else do
+    if | not (null gitConflicts) ->
+            liftIO $ hPutStrLn stderr "error: you have not resolved your conflicts yet."
+       | not conflictsExist -> do
+            (code, _, _) <- liftIO $ Git.runGitWithOutput ["rev-parse", "--verify", "MERGE_HEAD"]
+            case code of
+                ExitSuccess -> do
+                    oldHead <- liftIO getLocalHeadE
+                    liftIO $ do
+                        void $ Git.runGitRaw ["commit", "-m", "Merge remote"]
+                        putStrLn "Merge complete."
+                    traverse_ (\remote -> do
+                            mTarget <- liftIO $ getRemoteTargetType cwd (remoteName remote)
+                            let transport = case mTarget of
+                                  Just t | Device.isFilesystemTarget t -> Transport.mkFilesystemTransport (remoteUrl remote)
+                                  _ -> Transport.mkCloudTransport remote
+                            Transport.syncBinariesAfterMerge transport remote oldHead) mRemote
+                _ -> liftIO $ do
+                    hPutStrLn stderr "error: no merge in progress."
+                    exitWith (ExitFailure 1)
+       | otherwise -> do
                 invalid <- liftIO $ Metadata.validateMetadataDir (cwd </> bitIndexPath)
-                unless (null invalid) $ do
-                    liftIO $ hPutStrLn stderr "fatal: Metadata files contain conflict markers. Merge aborted."
-                    liftIO $ throwIO (userError "Invalid metadata")
+                unless (null invalid) $ liftIO $ do
+                    hPutStrLn stderr "fatal: Metadata files contain conflict markers. Merge aborted."
+                    throwIO (userError "Invalid metadata")
 
                 oldHead <- liftIO getLocalHeadE
                 (code, _, _) <- liftIO $ Git.runGitWithOutput ["rev-parse", "--verify", "MERGE_HEAD"]
@@ -1692,21 +1692,18 @@ mergeContinue = do
                     when (mergeCode /= ExitSuccess) $
                         liftIO $ hPutStrLn stderr "warning: Could not start merge. Proceeding anyway."
 
-                liftIO $ void $ Git.runGitRaw ["commit", "-m", "Merge remote (manual merge resolved)"]
-                liftIO $ putStrLn "Merge complete."
+                liftIO $ do
+                    void $ Git.runGitRaw ["commit", "-m", "Merge remote (manual merge resolved)"]
+                    putStrLn "Merge complete."
+                    removeDirectoryRecursive conflictsDir
+                    putStrLn "Conflict directories cleaned up."
 
-                liftIO $ removeDirectoryRecursive conflictsDir
-                liftIO $ putStrLn "Conflict directories cleaned up."
-
-                case mRemote of
-                    Nothing -> pure ()
-                    Just remote -> do
+                traverse_ (\remote -> do
                         mTarget <- liftIO $ getRemoteTargetType cwd (remoteName remote)
                         let transport = case mTarget of
-                              Just (Device.TargetDevice _ _) -> Transport.mkFilesystemTransport (remoteUrl remote)
-                              Just (Device.TargetLocalPath _) -> Transport.mkFilesystemTransport (remoteUrl remote)
+                              Just t | Device.isFilesystemTarget t -> Transport.mkFilesystemTransport (remoteUrl remote)
                               _ -> Transport.mkCloudTransport remote
-                        Transport.syncBinariesAfterMerge transport remote oldHead
+                        Transport.syncBinariesAfterMerge transport remote oldHead) mRemote
 
 mergeAbort :: IO ()
 mergeAbort = doMergeAbort
@@ -1718,11 +1715,8 @@ doMergeAbort = do
     
     -- Abort git merge
     code <- Git.mergeAbort
-    if code /= ExitSuccess
-        then do
-            hPutStrLn stderr "error: no merge in progress."
-            exitWith (ExitFailure 1)
-        else do
+    case code of
+        ExitSuccess -> do
             putStrLn "Merge aborted. Your working tree is unchanged."
             
             -- Clean up conflict directories
@@ -1730,6 +1724,9 @@ doMergeAbort = do
             when conflictsExist $ do
                 removeDirectoryRecursive conflictsDir
                 putStrLn "Conflict directories cleaned up."
+        _ -> do
+            hPutStrLn stderr "error: no merge in progress."
+            exitWith (ExitFailure 1)
 
 unsetUpstream :: IO ()
 unsetUpstream = void Git.unsetBranchUpstream
@@ -1745,19 +1742,8 @@ doRestore args = do
     when (code == ExitSuccess) $ do
         let stagedOnly = ("--staged" `elem` args || "-S" `elem` args) &&
                          not ("--worktree" `elem` args || "-W" `elem` args)
-        unless stagedOnly $ do
-            let rawPaths = restoreCheckoutPaths args
-            paths <- lift $ expandPathsToFiles cwd rawPaths
-            forM_ paths $ \filePath -> do
-                let metaPath = cwd </> bitIndexPath </> filePath
-                let workPath = cwd </> filePath
-                metaExists <- lift $ fileExistsE metaPath
-                when metaExists $ do
-                    mcontent <- lift $ readFileE metaPath
-                    let isBinaryMetadata = maybe True (\content -> any ("hash: " `isPrefixOf`) (lines content)) mcontent
-                    unless isBinaryMetadata $ do
-                        lift $ createDirE (takeDirectory workPath)
-                        lift $ copyFileE metaPath workPath
+        unless stagedOnly $
+            syncTextFilesFromIndex cwd (restoreCheckoutPaths args)
     pure code
 
 doCheckout :: [String] -> BitM ExitCode
@@ -1769,19 +1755,85 @@ doCheckout args = do
     code <- lift $ Git.runGitRaw ("checkout" : args')
     when (code == ExitSuccess) $ do
         cwd <- asks envCwd
-        let rawPaths = restoreCheckoutPaths args'
-        paths <- lift $ expandPathsToFiles cwd rawPaths
-        forM_ paths $ \filePath -> do
-            let metaPath = cwd </> bitIndexPath </> filePath
-            let workPath = cwd </> filePath
-            metaExists <- lift $ fileExistsE metaPath
-            when metaExists $ do
-                mcontent <- lift $ readFileE metaPath
-                let isBinaryMetadata = maybe True (\content -> any ("hash: " `isPrefixOf`) (lines content)) mcontent
-                unless isBinaryMetadata $ do
-                    lift $ createDirE (takeDirectory workPath)
-                    lift $ copyFileE metaPath workPath
+        syncTextFilesFromIndex cwd (restoreCheckoutPaths args')
     pure code
+
+-- | After a successful restore/checkout, copy text files from .bit/index/ back
+-- to the working directory. Binary metadata files are left alone.
+syncTextFilesFromIndex :: FilePath -> [FilePath] -> BitM ()
+syncTextFilesFromIndex cwd rawPaths = do
+    paths <- lift $ expandPathsToFiles cwd rawPaths
+    forM_ paths $ \filePath -> do
+        let metaPath = cwd </> bitIndexPath </> filePath
+        let workPath = cwd </> filePath
+        metaExists <- lift $ fileExistsE metaPath
+        when metaExists $ do
+            mcontent <- lift $ readFileE metaPath
+            let isBinaryMetadata = maybe True (\content -> any ("hash: " `isPrefixOf`) (lines content)) mcontent
+            unless isBinaryMetadata $ lift $ do
+                createDirE (takeDirectory workPath)
+                copyFileE metaPath workPath
+
+-- ============================================================================
+-- rm helpers
+-- ============================================================================
+
+data RmFlags = RmFlags
+    { rmCached :: Bool
+    , rmDryRun :: Bool
+    , rmQuiet  :: Bool
+    }
+
+-- | Parse rm-relevant flags from args, respecting @--@ separator.
+parseRmFlags :: [String] -> RmFlags
+parseRmFlags args =
+    let (flagPart, _) = break (== "--") args
+    in foldl' checkArg (RmFlags False False False) flagPart
+  where
+    checkArg flags "--cached"  = flags { rmCached = True }
+    checkArg flags "--dry-run" = flags { rmDryRun = True }
+    checkArg flags "--quiet"   = flags { rmQuiet = True }
+    checkArg flags arg
+        | "-" `isPrefixOf` arg && not ("--" `isPrefixOf` arg) =
+            flags { rmDryRun = rmDryRun flags || 'n' `elem` drop 1 arg
+                  , rmQuiet  = rmQuiet flags || 'q' `elem` drop 1 arg
+                  }
+    checkArg flags _ = flags
+
+-- | Strip @-q@/@--quiet@ from args (before @--@) so git always outputs file list.
+stripQuiet :: [String] -> [String]
+stripQuiet args =
+    let (before, after) = break (== "--") args
+    in concatMap stripArg before ++ after
+  where
+    stripArg "--quiet" = []
+    stripArg arg
+        | "-" `isPrefixOf` arg && not ("--" `isPrefixOf` arg) =
+            let stripped = filter (/= 'q') (drop 1 arg)
+            in if null stripped then [] else ['-' : stripped]
+    stripArg arg = [arg]
+
+-- | Parse @rm 'path'@ lines from git rm output.
+parseRmOutput :: String -> [FilePath]
+parseRmOutput out =
+    [ take (length path - 1) path
+    | line <- lines out
+    , "rm '" `isPrefixOf` line
+    , let path = drop 4 line
+    , not (null path)
+    ]
+
+-- | Remove empty parent directories up to (but not including) @stopAt@.
+removeEmptyParents :: FilePath -> FilePath -> IO ()
+removeEmptyParents stopAt dir = go dir `catch` \(_ :: IOException) -> pure ()
+  where
+    go d | equalFilePath d stopAt = pure ()
+         | equalFilePath d (takeDirectory d) = pure ()
+         | otherwise = do
+              contents <- Dir.listDirectory d
+              when (null contents) $ do
+                  Dir.removeDirectory d
+                  go (takeDirectory d)
 ```
 
 ---
@@ -1796,16 +1848,19 @@ doCheckout args = do
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
 
 module Bit.Core.Helpers
     ( -- Types
-      PullOptions(..)
+      PullMode(..)
+    , PullOptions(..)
     , defaultPullOptions
       -- Git helpers
     , getLocalHeadE
     , checkIsAheadE
     , hasStagedChangesE
     , getRemoteTargetType
+    , checkFilesystemRemoteIsRepo
       -- Monadic helpers
     , withRemote
     , gitQuery
@@ -1821,7 +1876,6 @@ module Bit.Core.Helpers
     , safeRemove
     , formatPathList
     , printVerifyIssue
-    , parseFilesystemDiffOutput
     , readFileMaybe
     , removeDirectoryRecursive
     , restoreCheckoutPaths
@@ -1831,19 +1885,17 @@ module Bit.Core.Helpers
 import qualified System.Directory as Dir
 import System.Directory (copyFile, removeFile, createDirectoryIfMissing, removeDirectory, listDirectory, doesDirectoryExist)
 import System.FilePath ((</>), normalise)
-import Control.Monad (when, forM_)
+import Control.Monad (when, unless, forM_)
 import System.Exit (ExitCode(..), exitWith)
 import qualified Internal.Git as Git
 import qualified Bit.Device as Device
 import Bit.Remote (Remote)
-import Data.Char (isSpace)
 import Data.List (isPrefixOf, foldl')
 import System.IO (stderr, hPutStrLn)
-import Data.Maybe (mapMaybe)
 import Bit.Types (BitM, BitEnv(..), unPath)
 import Control.Monad.Trans.Reader (asks)
 import Control.Monad.IO.Class (liftIO)
-import Bit.Utils (toPosix, atomicWriteFileStr)
+import Bit.Utils (toPosix, atomicWriteFileStr, trimGitOutput)
 import qualified Bit.Verify as Verify
 import qualified Bit.Scan as Scan
 import Internal.Config (bitIndexPath)
@@ -1851,20 +1903,24 @@ import Internal.Config (bitIndexPath)
 import qualified Data.ByteString as BS
 import qualified Data.Text as T
 import Data.Text.Encoding (decodeUtf8')
-import Bit.Internal.Metadata (displayHash)
 
 -- ============================================================================
 -- Types
 -- ============================================================================
 
-data PullOptions = PullOptions
-    { pullAcceptRemote :: Bool
-    , pullManualMerge :: Bool
-    , pullSkipVerify :: Bool
+-- | How to handle the merge during pull.
+data PullMode
+    = PullNormal        -- ^ Normal merge (fast-forward or three-way)
+    | PullAcceptRemote  -- ^ Force-checkout remote branch
+    | PullManualMerge   -- ^ Interactive per-file conflict resolution
+    deriving (Show, Eq)
+
+newtype PullOptions = PullOptions
+    { pullMode       :: PullMode
     } deriving (Show)
 
 defaultPullOptions :: PullOptions
-defaultPullOptions = PullOptions False False False
+defaultPullOptions = PullOptions PullNormal
 
 -- ============================================================================
 -- Git helpers via effect layer
@@ -1873,22 +1929,36 @@ defaultPullOptions = PullOptions False False False
 getLocalHeadE :: IO (Maybe String)
 getLocalHeadE = do
     (code, out, _) <- Git.runGitWithOutput ["rev-parse", "HEAD"]
-    pure $ if code == ExitSuccess then Just (filter (not . isSpace) out) else Nothing
+    pure $ case code of
+        ExitSuccess -> Just (trimGitOutput out)
+        _ -> Nothing
 
+-- | Check if @localHash@ is ahead of @remoteHash@ (i.e., remote is an ancestor of local).
+-- Parameter order: remote hash first, local hash second — matching @git merge-base --is-ancestor@.
 checkIsAheadE :: String -> String -> IO Bool
-checkIsAheadE rHash lHash = do
-    (code, _, _) <- Git.runGitWithOutput ["merge-base", "--is-ancestor", rHash, lHash]
-    pure (code == ExitSuccess)
+checkIsAheadE remoteHash localHash =
+    (\(code, _, _) -> code == ExitSuccess) <$>
+    Git.runGitWithOutput ["merge-base", "--is-ancestor", remoteHash, localHash]
 
 hasStagedChangesE :: IO Bool
-hasStagedChangesE = do
-    (code, _, _) <- Git.runGitWithOutput ["diff", "--cached", "--quiet"]
-    pure (code == ExitFailure 1)
+hasStagedChangesE =
+    (\(code, _, _) -> code == ExitFailure 1) <$>
+    Git.runGitWithOutput ["diff", "--cached", "--quiet"]
 
 -- | Determine the remote target type from a remote name.
 -- Returns the RemoteTarget if the remote is configured, Nothing otherwise.
 getRemoteTargetType :: FilePath -> String -> IO (Maybe Device.RemoteTarget)
 getRemoteTargetType cwd remName = Device.readRemoteFile cwd remName
+
+-- | Check if a filesystem path is a bit repository. Exits with error if not.
+-- Used by filesystem push, pull, and fetch operations to validate the remote.
+checkFilesystemRemoteIsRepo :: FilePath -> IO ()
+checkFilesystemRemoteIsRepo remotePath = do
+    let remoteBitDir = remotePath </> ".bit"
+    remoteHasBit <- Dir.doesDirectoryExist remoteBitDir
+    unless remoteHasBit $ do
+        hPutStrLn stderr "error: Remote is not a bit repository."
+        exitWith (ExitFailure 1)
 
 -- ============================================================================
 -- Compatibility helpers (effect system removal)
@@ -1957,31 +2027,13 @@ printVerifyIssue fmtHash = \case
   Verify.Missing filePath ->
     hPutStrLn stderr $ "[ERROR] Missing: " ++ toPosix (unPath filePath)
 
-parseFilesystemDiffOutput :: String -> [(Char, FilePath, Maybe FilePath)]
-parseFilesystemDiffOutput = mapMaybe parseLine . lines
-  where
-    parseLine line = case line of
-        (fileStatus:rest)
-            | fileStatus == 'R' || fileStatus == 'C' ->
-                case words (dropWhile (\c -> c /= '\t' && c /= ' ') rest) of
-                    (old:new:_) -> Just (fileStatus, old, Just new)
-                    _ -> Nothing
-            | fileStatus `elem` ("ADM" :: String) ->
-                case words rest of
-                    (filePath:_) -> Just (fileStatus, filePath, Nothing)
-                    _ -> Nothing
-            | otherwise -> Nothing
-        _ -> Nothing
-
 readFileMaybe :: FilePath -> IO (Maybe String)
 readFileMaybe filePath = do
     exists <- Dir.doesFileExist filePath
     if exists
         then do
             bs <- BS.readFile filePath
-            pure $ case decodeUtf8' bs of
-                Left _ -> Nothing
-                Right txt -> Just (T.unpack txt)
+            pure $ either (const Nothing) (Just . T.unpack) (decodeUtf8' bs)
         else pure Nothing
 
 removeDirectoryRecursive :: FilePath -> IO ()
@@ -2014,10 +2066,10 @@ restoreCheckoutPaths args =
                      "--unified=" `isPrefixOf` arg ||
                      "-U" `isPrefixOf` arg
         (_, paths) = foldl' (\(afterDash, acc) arg ->
-            if arg == "--" then (True, acc)
-            else if afterDash then (True, arg:acc)
-            else if isFlag arg then (False, acc)
-            else (False, arg:acc)
+            if | arg == "--" -> (True, acc)
+               | afterDash   -> (True, arg:acc)
+               | isFlag arg  -> (False, acc)
+               | otherwise   -> (False, arg:acc)
             ) (False, []) args
     in reverse paths
 
@@ -2056,11 +2108,10 @@ module Bit.Core.Init
 import Prelude hiding (init)
 import qualified System.Directory as Dir
 import System.FilePath ((</>))
-import Control.Monad (when, unless, void)
-import System.Exit (ExitCode(..))
+import Control.Monad (unless, void)
 import qualified Internal.Git as Git
 import System.Process (readProcessWithExitCode)
-import Bit.Utils (atomicWriteFileStr)
+import Bit.Utils (atomicWriteFileStr, toPosix)
 
 init :: IO ()
 init = initializeRepo
@@ -2097,7 +2148,7 @@ initializeRepoAt targetDir = do
         -- Fix for Windows external/USB drives: add to safe.directory
         -- git 2.35.2+ rejects directories with different ownership
         absIndex <- Dir.makeAbsolute targetBitIndexPath
-        let safePath = map (\c -> if c == '\\' then '/' else c) absIndex
+        let safePath = toPosix absIndex
         void $ readProcessWithExitCode "git" ["config", "--global", "--add", "safe.directory", safePath] ""
 
     -- 3a. Create .git/bundles directory for storing bundle files
@@ -2110,9 +2161,7 @@ initializeRepoAt targetDir = do
     void $ Git.runGitAt targetBitIndexPath ["config", "core.quotePath", "false"]
     
     -- 5. Rename the initial branch to "main" if it's "master"
-    (code, _, _) <- Git.runGitAt targetBitIndexPath ["branch", "-m", "master", "main"]
-    when (code /= ExitSuccess) $
-        pure ()
+    void $ Git.runGitAt targetBitIndexPath ["branch", "-m", "master", "main"]
 
     -- 6. Create other .bit subdirectories
     Dir.createDirectoryIfMissing True targetBitDevicesDir
@@ -2169,14 +2218,13 @@ module Bit.Core.Pull
     ) where
 
 import Prelude hiding (log)
-import qualified System.Directory as Dir
 import System.FilePath ((</>), normalise, takeDirectory)
 import Control.Monad (when, unless, void, forM_)
+import Data.Foldable (traverse_)
 import System.Exit (ExitCode(..), exitWith)
 import qualified Internal.Git as Git
 import qualified Internal.Transport as Transport
 import Internal.Config (bitIndexPath, fetchedBundle)
-import Data.Char (isSpace)
 import qualified Bit.Scan as Scan
 import qualified Bit.Verify as Verify
 import qualified Bit.Conflict as Conflict
@@ -2185,10 +2233,10 @@ import qualified Data.List as List
 import qualified Data.Map as Map
 import System.IO (stderr, hPutStrLn)
 import Control.Exception (try, SomeException, throwIO)
-import Bit.Utils (toPosix, filterOutBitPaths)
+import Bit.Utils (toPosix, filterOutBitPaths, trimGitOutput)
 import Data.Maybe (maybeToList)
 import Bit.Remote (Remote, remoteName, remoteUrl)
-import Bit.Types (BitM, BitEnv(..), Hash, HashAlgo(..), EntryKind(..), syncHash, runBitM, unPath)
+import Bit.Types (BitM, BitEnv(..), ForceMode(..), Hash, HashAlgo(..), EntryKind(..), syncHash, runBitM, unPath)
 import Control.Monad.Trans.Reader (asks)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Class (lift)
@@ -2196,7 +2244,8 @@ import Bit.Internal.Metadata (MetaContent(..), serializeMetadata, displayHash, v
 import Bit.Concurrency (Concurrency(..))
 import qualified Bit.Device as Device
 import Bit.Core.Helpers
-    ( PullOptions(..)
+    ( PullMode(..)
+    , PullOptions(..)
     , defaultPullOptions
     , getRemoteTargetType
     , withRemote
@@ -2211,6 +2260,7 @@ import Bit.Core.Helpers
     , copyFileE
     , writeFileAtomicE
     , printVerifyIssue
+    , checkFilesystemRemoteIsRepo
     )
 import Bit.Core.Transport
     ( FileTransport
@@ -2232,19 +2282,17 @@ pull opts = withRemote $ \remote -> do
     -- Determine if this is a filesystem or cloud remote
     mTarget <- liftIO $ getRemoteTargetType cwd (remoteName remote)
     case mTarget of
-        Just (Device.TargetDevice _ _) -> liftIO $ filesystemPull cwd remote opts
-        Just (Device.TargetLocalPath _) -> liftIO $ filesystemPull cwd remote opts
+        Just t | Device.isFilesystemTarget t -> liftIO $ filesystemPull cwd remote opts
         _ -> cloudPull remote opts  -- Cloud remote or no target info (use cloud flow)
 
 -- | Pull from a cloud remote (uses unified transport abstraction).
 cloudPull :: Remote -> PullOptions -> BitM ()
 cloudPull remote opts =
     let transport = mkCloudTransport remote
-    in if pullAcceptRemote opts
-        then pullAcceptRemoteImpl transport remote
-        else if pullManualMerge opts
-            then pullManualMergeImpl remote
-            else pullWithCleanup transport remote opts
+    in case pullMode opts of
+        PullAcceptRemote -> pullAcceptRemoteImpl transport remote
+        PullManualMerge  -> pullManualMergeImpl remote
+        PullNormal       -> pullWithCleanup transport remote opts
 
 -- | Pull from a filesystem remote. Fetches directly from the remote's .bit/index/.git.
 filesystemPull :: FilePath -> Remote -> PullOptions -> IO ()
@@ -2253,11 +2301,7 @@ filesystemPull cwd remote opts = do
     putStrLn $ "Pulling from filesystem remote: " ++ remotePath
     
     -- Check if remote has .bit/ directory
-    let remoteBitDir = remotePath </> ".bit"
-    remoteHasBit <- Dir.doesDirectoryExist remoteBitDir
-    unless remoteHasBit $ do
-        hPutStrLn stderr "error: Remote is not a bit repository."
-        exitWith (ExitFailure 1)
+    checkFilesystemRemoteIsRepo remotePath
     
     -- 1. Fetch remote into local
     let remoteIndexGit = remotePath </> ".bit" </> "index" </> ".git"
@@ -2280,10 +2324,10 @@ filesystemPull cwd remote opts = do
         hPutStrLn stderr "Error: Could not get remote HEAD"
         exitWith (ExitFailure 1)
     
-    let remoteHash = filter (not . isSpace) remoteHeadOut
+    let remoteHash = trimGitOutput remoteHeadOut
     
-    -- NEW: Proof of possession — verify filesystem remote before pulling
-    unless (pullAcceptRemote opts || pullSkipVerify opts) $ do
+    -- Proof of possession — always verify filesystem remote before pulling
+    unless (pullMode opts == PullAcceptRemote) $ do
         putStrLn "Verifying remote repository..."
         (remoteCount, remoteIssues) <- Verify.verifyLocalAt remotePath Nothing (Parallel 0)
         if null remoteIssues
@@ -2293,7 +2337,6 @@ filesystemPull cwd remote opts = do
                 mapM_ (printVerifyIssue id) remoteIssues
                 hPutStrLn stderr "hint: Run 'bit verify' in the remote repo to see all mismatches."
                 hPutStrLn stderr "hint: Run 'bit pull --accept-remote' to accept the remote's actual state."
-                hPutStrLn stderr "hint: Run 'bit push --force' to overwrite remote with local state."
                 exitWith (ExitFailure 1)
     
     -- 4. Build transport and delegate to unified pull logic
@@ -2301,12 +2344,12 @@ filesystemPull cwd remote opts = do
     
     -- Create a minimal BitEnv to call the shared logic
     localFiles <- Scan.scanWorkingDir cwd
-    let env = BitEnv cwd localFiles (Just remote) False False (pullSkipVerify opts)
+    let env = BitEnv cwd localFiles (Just remote) NoForce
     
     -- Delegate to the unified path
-    if pullAcceptRemote opts
-        then runBitM env (filesystemPullAcceptRemoteImpl transport remoteHash)
-        else runBitM env (filesystemPullLogicImpl transport remote remoteHash)
+    case pullMode opts of
+        PullAcceptRemote -> runBitM env (filesystemPullAcceptRemoteImpl transport remoteHash)
+        _                -> runBitM env (filesystemPullLogicImpl transport remote remoteHash)
 
 -- | Filesystem pull logic (simplified - no bundle fetching, just merge + sync)
 filesystemPullLogicImpl :: FileTransport -> Remote -> String -> BitM ()
@@ -2318,12 +2361,12 @@ filesystemPullLogicImpl transport _remote remoteHash = do
         Nothing -> do
             lift $ putStrLn $ "Checking out " ++ take 7 remoteHash ++ " (first pull)"
             checkoutCode <- lift $ Git.checkoutRemoteAsMain
-            if checkoutCode == ExitSuccess
-                then do
-                    lift $ transportSyncAllFiles transport cwd
-                    lift $ putStrLn "Syncing binaries... done."
-                    lift $ void $ Git.updateRemoteTrackingBranchToHash remoteHash
-                else lift $ hPutStrLn stderr "Error: Failed to checkout remote branch."
+            case checkoutCode of
+                ExitSuccess -> lift $ do
+                    transportSyncAllFiles transport cwd
+                    putStrLn "Syncing binaries... done."
+                    void $ Git.updateRemoteTrackingBranchToHash remoteHash
+                _ -> lift $ hPutStrLn stderr "Error: Failed to checkout remote branch."
         
         Just localHash -> do
             (mergeCode, mergeOut, mergeErr) <- lift $ Git.runGitWithOutput 
@@ -2336,8 +2379,8 @@ filesystemPullLogicImpl transport _remote remoteHash = do
                     Git.runGitWithOutput ["merge", "--no-commit", "--no-ff", "--allow-unrelated-histories", "refs/remotes/origin/main"]
                 else pure (mergeCode, mergeOut, mergeErr)
             
-            if finalMergeCode == ExitSuccess
-                then do
+            case finalMergeCode of
+                ExitSuccess -> do
                     lift $ putStrLn $ "Updating " ++ take 7 localHash ++ ".." ++ take 7 remoteHash
                     lift $ putStrLn "Merge made by the 'recursive' strategy."
                     hasChanges <- lift hasStagedChangesE
@@ -2346,34 +2389,33 @@ filesystemPullLogicImpl transport _remote remoteHash = do
                     lift $ applyMergeToWorkingDir transport cwd localHash
                     lift $ putStrLn "Syncing binaries... done."
                     lift $ void $ Git.updateRemoteTrackingBranchToHash remoteHash
-                else do
-                    lift $ putStrLn finalMergeOut
-                    lift $ hPutStrLn stderr finalMergeErr
-                    lift $ putStrLn "Automatic merge failed."
-                    lift $ putStrLn "bit requires you to pick a version for each conflict."
-                    lift $ putStrLn ""
-                    lift $ putStrLn "Resolving conflicts..."
+                _ -> do
+                    lift $ do
+                        putStrLn finalMergeOut
+                        hPutStrLn stderr finalMergeErr
+                        putStrLn "Automatic merge failed."
+                        putStrLn "bit requires you to pick a version for each conflict."
+                        putStrLn ""
+                        putStrLn "Resolving conflicts..."
                     
                     conflicts <- lift Conflict.getConflictedFilesE
                     resolutions <- lift $ Conflict.resolveAll conflicts
                     let total = length resolutions
                     
                     invalid <- lift $ validateMetadataDir (cwd </> bitIndexPath)
-                    unless (null invalid) $ do
-                        lift $ void $ Git.runGitRaw ["merge", "--abort"]
-                        lift $ hPutStrLn stderr "fatal: Metadata files contain conflict markers. Merge aborted."
-                        lift $ throwIO (userError "Invalid metadata")
+                    unless (null invalid) $ lift $ do
+                        void $ Git.runGitRaw ["merge", "--abort"]
+                        hPutStrLn stderr "fatal: Metadata files contain conflict markers. Merge aborted."
+                        throwIO (userError "Invalid metadata")
                     
                     conflictsNow <- lift Conflict.getConflictedFilesE
-                    if null conflictsNow
-                        then do
-                            lift $ void $ Git.runGitRaw ["commit", "-m", "Merge remote (resolved " ++ show total ++ " conflict(s))"]
-                            lift $ putStrLn $ "Merge complete. " ++ show total ++ " conflict(s) resolved."
-                            -- CRITICAL: Always read actual HEAD after merge, never use remoteHash
-                            lift $ applyMergeToWorkingDir transport cwd localHash
-                            lift $ putStrLn "Syncing binaries... done."
-                            lift $ void $ Git.updateRemoteTrackingBranchToHash remoteHash
-                        else pure ()
+                    when (null conflictsNow) $ lift $ do
+                        void $ Git.runGitRaw ["commit", "-m", "Merge remote (resolved " ++ show total ++ " conflict(s))"]
+                        putStrLn $ "Merge complete. " ++ show total ++ " conflict(s) resolved."
+                        -- CRITICAL: Always read actual HEAD after merge, never use remoteHash
+                        applyMergeToWorkingDir transport cwd localHash
+                        putStrLn "Syncing binaries... done."
+                        void $ Git.updateRemoteTrackingBranchToHash remoteHash
 
 -- | Filesystem pull --accept-remote implementation
 filesystemPullAcceptRemoteImpl :: FileTransport -> String -> BitM ()
@@ -2386,17 +2428,17 @@ filesystemPullAcceptRemoteImpl transport remoteHash = do
     
     -- Force-checkout the remote branch
     checkoutCode <- lift Git.checkoutRemoteAsMain
-    if checkoutCode /= ExitSuccess
-        then lift $ hPutStrLn stderr "Error: Failed to checkout remote state."
-        else do
+    case checkoutCode of
+        ExitSuccess -> do
             -- Sync actual files based on what changed
-            case oldHead of
-                Just oh -> lift $ applyMergeToWorkingDir transport cwd oh
-                Nothing -> lift $ transportSyncAllFiles transport cwd
+            maybe (lift $ transportSyncAllFiles transport cwd)
+                  (\oh -> lift $ applyMergeToWorkingDir transport cwd oh) oldHead
             
             -- Update tracking ref
-            lift $ void $ Git.updateRemoteTrackingBranchToHash remoteHash
-            lift $ putStrLn "Pull with --accept-remote completed."
+            lift $ do
+                void $ Git.updateRemoteTrackingBranchToHash remoteHash
+                putStrLn "Pull with --accept-remote completed."
+        _ -> lift $ hPutStrLn stderr "Error: Failed to checkout remote state."
 
 -- | Pull with --accept-remote: force-checkout the remote branch, then sync files.
 -- Git manages .bit/index/ (the metadata); we only sync actual files to the working tree.
@@ -2423,23 +2465,20 @@ pullAcceptRemoteImpl transport remote = do
             --    text files get actual content, binary files get hash/size.
             lift $ tell "Scanning remote files..."
             checkoutCode <- lift Git.checkoutRemoteAsMain
-            if checkoutCode /= ExitSuccess
-                then lift $ tellErr "Error: Failed to checkout remote state."
-                else do
+            case checkoutCode of
+                ExitSuccess -> do
                     -- 4. Sync actual files to working tree based on what changed in git
                     (_remoteCode, remoteOut, _) <- lift $ gitQuery ["rev-parse", "refs/remotes/origin/main"]
                     let _newHash = takeWhile (/= '\n') remoteOut
-                    case oldHead of
-                        Just oh -> lift $ applyMergeToWorkingDir transport cwd oh
-                        Nothing -> lift $ transportSyncAllFiles transport cwd  -- First time, no diff available
+                    maybe (lift $ transportSyncAllFiles transport cwd)  -- First time, no diff available
+                          (\oh -> lift $ applyMergeToWorkingDir transport cwd oh) oldHead
 
                     -- 5. Update tracking ref
                     maybeRemoteHash <- lift $ Git.getHashFromBundle fetchedBundle
-                    case maybeRemoteHash of
-                        Just rHash -> lift $ void $ Git.updateRemoteTrackingBranchToHash rHash
-                        Nothing    -> pure ()
+                    lift $ traverse_ (void . Git.updateRemoteTrackingBranchToHash) maybeRemoteHash
 
                     lift $ tell "Pull with --accept-remote completed."
+                _ -> lift $ tellErr "Error: Failed to checkout remote state."
 
 -- | Pull with --manual-merge: detect remote divergence and create conflict directories.
 pullManualMergeImpl :: Remote -> BitM ()
@@ -2456,7 +2495,8 @@ pullManualMergeImpl remote = do
                 FetchError err -> lift $ tellErr $ "Error: " ++ err
                 _ -> pure ()  -- No need to render fetch output during pull
 
-            (remoteMeta, _allBundlePaths) <- lift $ Verify.loadMetadataFromBundle fetchedBundle
+            entries <- lift $ Verify.loadMetadataFromBundle fetchedBundle
+            let remoteMeta = Verify.binaryEntries entries
             lift $ tell "Scanning remote files... done."
             result <- lift $ Remote.Scan.fetchRemoteFiles remote
             case result of
@@ -2509,18 +2549,17 @@ pullWithCleanup :: FileTransport -> Remote -> PullOptions -> BitM ()
 pullWithCleanup transport remote opts = do
     env <- asks id
     result <- liftIO $ try @SomeException (runBitM env (pullLogic transport remote opts))
-    case result of
-        Left ex -> do
+    either (\ex -> do
             inProgress <- lift $ Git.isMergeInProgress
             if inProgress
-                then do
-                    lift $ void $ gitRaw ["merge", "--abort"]
-                    lift $ tell "Merge aborted. Your working tree is unchanged."
-                else lift $ throwIO ex
-        Right _ -> pure ()
+                then lift $ do
+                    void $ gitRaw ["merge", "--abort"]
+                    tell "Merge aborted. Your working tree is unchanged."
+                else lift $ throwIO ex)
+        (const $ pure ()) result
 
 pullLogic :: FileTransport -> Remote -> PullOptions -> BitM ()
-pullLogic transport remote opts = do
+pullLogic transport remote _opts = do
     cwd <- asks envCwd
     maybeBundlePath <- lift $ fetchRemoteBundle remote
     case maybeBundlePath of
@@ -2534,19 +2573,17 @@ pullLogic transport remote opts = do
             let n = takeWhile (`elem` ['0'..'9']) (filter (/= '\n') countOut)
             lift $ tell $ "remote: Counting objects: " ++ (if null n then "0" else n) ++ ", done."
 
-            -- NEW: Proof of possession — verify remote before pulling
-            unless (pullSkipVerify opts) $ do
-                lift $ putStrLn "Verifying remote files..."
-                (remoteFileCount, remoteIssues) <- lift $ Verify.verifyRemote cwd remote Nothing (Parallel 0)
-                if null remoteIssues
-                    then lift $ putStrLn $ "Verified " ++ show remoteFileCount ++ " remote files."
-                    else do
-                        lift $ hPutStrLn stderr $ "error: Remote files do not match remote metadata (" ++ show (length remoteIssues) ++ " issues)."
-                        lift $ mapM_ (printVerifyIssue id) remoteIssues
-                        lift $ hPutStrLn stderr "hint: Run 'bit verify --remote' to see all mismatches."
-                        lift $ hPutStrLn stderr "hint: Run 'bit pull --accept-remote' to accept the remote's actual state."
-                        lift $ hPutStrLn stderr "hint: Run 'bit push --force' to overwrite remote with local state."
-                        lift $ exitWith (ExitFailure 1)
+            -- Proof of possession — always verify remote before pulling
+            lift $ putStrLn "Verifying remote files..."
+            (remoteFileCount, remoteIssues) <- lift $ Verify.verifyRemote cwd remote Nothing (Parallel 0)
+            if null remoteIssues
+                then lift $ putStrLn $ "Verified " ++ show remoteFileCount ++ " remote files."
+                else lift $ do
+                    hPutStrLn stderr $ "error: Remote files do not match remote metadata (" ++ show (length remoteIssues) ++ " issues)."
+                    mapM_ (printVerifyIssue id) remoteIssues
+                    hPutStrLn stderr "hint: Run 'bit verify --remote' to see all mismatches."
+                    hPutStrLn stderr "hint: Run 'bit pull --accept-remote' to accept the remote's actual state."
+                    exitWith (ExitFailure 1)
 
             oldHash <- lift getLocalHeadE
             (_remoteCode, remoteOut, _) <- lift $ gitQuery ["rev-parse", "refs/remotes/origin/main"]
@@ -2556,11 +2593,11 @@ pullLogic transport remote opts = do
                 Nothing -> do
                     lift $ tell $ "Checking out " ++ take 7 newHash ++ " (first pull)"
                     checkoutCode <- lift $ Git.checkoutRemoteAsMain
-                    if checkoutCode == ExitSuccess
-                        then do
-                            lift $ transportSyncAllFiles transport cwd
-                            lift $ tell "Syncing binaries... done."
-                        else lift $ tellErr "Error: Failed to checkout remote branch."
+                    case checkoutCode of
+                        ExitSuccess -> lift $ do
+                            transportSyncAllFiles transport cwd
+                            tell "Syncing binaries... done."
+                        _ -> lift $ tellErr "Error: Failed to checkout remote branch."
 
                 Just localHead -> do
                     (mergeCode, mergeOut, mergeErr) <- lift $ gitQuery ["merge", "--no-commit", "--no-ff", "refs/remotes/origin/main"]
@@ -2570,45 +2607,44 @@ pullLogic transport remote opts = do
                         then do tell "Merging unrelated histories..."; gitQuery ["merge", "--no-commit", "--no-ff", "--allow-unrelated-histories", "refs/remotes/origin/main"]
                         else pure (mergeCode, mergeOut, mergeErr)
 
-                    if finalMergeCode == ExitSuccess
-                    then do
-                        lift $ tell $ "Updating " ++ take 7 localHead ++ ".." ++ take 7 newHash
-                        lift $ tell "Merge made by the 'recursive' strategy."
+                    case finalMergeCode of
+                      ExitSuccess -> do
+                        lift $ do
+                            tell $ "Updating " ++ take 7 localHead ++ ".." ++ take 7 newHash
+                            tell "Merge made by the 'recursive' strategy."
                         hasChanges <- lift hasStagedChangesE
                         when hasChanges $ lift $ void $ gitRaw ["commit", "-m", "Merge remote"]
-                        lift $ applyMergeToWorkingDir transport cwd localHead
-                        lift $ tell "Syncing binaries... done."
+                        lift $ do
+                            applyMergeToWorkingDir transport cwd localHead
+                            tell "Syncing binaries... done."
                         maybeRemoteHash <- lift $ Git.getHashFromBundle fetchedBundle
-                        case maybeRemoteHash of
-                            Just rHash -> lift $ void $ Git.updateRemoteTrackingBranchToHash rHash
-                            Nothing    -> pure ()
-                    else do
-                        lift $ tell finalMergeOut
-                        lift $ tellErr finalMergeErr
-                        lift $ tell "Automatic merge failed."
-                        lift $ tell "bit requires you to pick a version for each conflict."
-                        lift $ tell ""
-                        lift $ tell "Resolving conflicts..."
+                        lift $ traverse_ (void . Git.updateRemoteTrackingBranchToHash) maybeRemoteHash
+                      _ -> do
+                        lift $ do
+                            tell finalMergeOut
+                            tellErr finalMergeErr
+                            tell "Automatic merge failed."
+                            tell "bit requires you to pick a version for each conflict."
+                            tell ""
+                            tell "Resolving conflicts..."
 
                         conflicts <- lift Conflict.getConflictedFilesE
                         resolutions <- lift $ Conflict.resolveAll conflicts
                         let total = length resolutions
 
                         invalid <- lift $ validateMetadataDir (cwd </> bitIndexPath)
-                        unless (null invalid) $ do
-                            lift $ void $ gitRaw ["merge", "--abort"]
-                            lift $ tellErr "fatal: Metadata files contain conflict markers. Merge aborted."
-                            lift $ throwIO (userError "Invalid metadata")
+                        unless (null invalid) $ lift $ do
+                            void $ gitRaw ["merge", "--abort"]
+                            tellErr "fatal: Metadata files contain conflict markers. Merge aborted."
+                            throwIO (userError "Invalid metadata")
 
                         conflictsNow <- lift Conflict.getConflictedFilesE
-                        if null conflictsNow
-                            then do
-                                lift $ void $ gitRaw ["commit", "-m", "Merge remote (resolved " ++ show total ++ " conflict(s))"]
-                                lift $ tell $ "Merge complete. " ++ show total ++ " conflict(s) resolved."
-                                lift $ applyMergeToWorkingDir transport cwd localHead
-                                lift $ tell "Syncing binaries... done."
-                                lift $ void $ Git.updateRemoteTrackingBranchToHash newHash
-                            else pure ()
+                        when (null conflictsNow) $ lift $ do
+                            void $ gitRaw ["commit", "-m", "Merge remote (resolved " ++ show total ++ " conflict(s))"]
+                            tell $ "Merge complete. " ++ show total ++ " conflict(s) resolved."
+                            applyMergeToWorkingDir transport cwd localHead
+                            tell "Syncing binaries... done."
+                            void $ Git.updateRemoteTrackingBranchToHash newHash
 
 -- ============================================================================
 -- Helper functions
@@ -2696,6 +2732,7 @@ printConflictList divergentFiles _remoteFileMap _remoteMetaMap localMetaMap = do
 ```haskell
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE LambdaCase #-}
 
 module Bit.Core.Push
     ( push
@@ -2713,11 +2750,12 @@ module Bit.Core.Push
 import qualified System.Directory as Dir
 import System.FilePath ((</>))
 import Control.Monad (when, unless, void)
+import Data.Foldable (traverse_)
 import System.Exit (ExitCode(..), exitWith)
 import qualified Internal.Git as Git
 import qualified Internal.Transport as Transport
 import Internal.Config (fetchedBundle, BundleName(..), bundleCwdPath, fromCwdPath)
-import Data.Char (isSpace)
+import Bit.Utils (trimGitOutput)
 import qualified Bit.Pipeline as Pipeline
 import qualified Bit.Remote.Scan as Remote.Scan
 import qualified Data.List as List
@@ -2726,7 +2764,7 @@ import Control.Concurrent (getNumCapabilities)
 import System.IO (stderr, hPutStrLn)
 import Control.Exception (bracket)
 import Bit.Remote (Remote, remoteName, remoteUrl, RemoteState(..), FetchResult(..), displayRemote)
-import Bit.Types (BitM, BitEnv(..))
+import Bit.Types (BitM, BitEnv(..), ForceMode(..))
 import Control.Monad.Trans.Reader (asks)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Class (lift)
@@ -2757,36 +2795,32 @@ import Bit.Core.Fetch (classifyRemoteState, fetchBundle)
 push :: BitM ()
 push = withRemote $ \remote -> do
     cwd <- asks envCwd
-    force <- asks envForce
-    skipVerify <- asks envSkipVerify
-    
-    -- NEW: Proof of possession — verify local before pushing
-    unless (force || skipVerify) $ do
-        liftIO $ putStrLn "Verifying local files..."
-        (fileCount, issues) <- liftIO $ Verify.verifyLocal cwd Nothing (Parallel 0)
-        if null issues
-            then liftIO $ putStrLn $ "Verified " ++ show fileCount ++ " files. All match metadata."
-            else do
-                liftIO $ hPutStrLn stderr $ "error: Working tree does not match metadata (" ++ show (length issues) ++ " issues)."
-                liftIO $ mapM_ (printVerifyIssue id) issues  -- full hash, no truncation
-                liftIO $ hPutStrLn stderr "hint: Run 'bit verify' to see all mismatches."
-                liftIO $ hPutStrLn stderr "hint: Run 'bit add' to update metadata, or 'bit restore' to restore files."
-                liftIO $ hPutStrLn stderr "hint: Run 'bit push --force' to push anyway (unsafe)."
-                liftIO $ exitWith (ExitFailure 1)
-    
+
+    -- Proof of possession — always verify local before pushing
+    liftIO $ putStrLn "Verifying local files..."
+    (fileCount, issues) <- liftIO $ Verify.verifyLocal cwd Nothing (Parallel 0)
+    if null issues
+        then liftIO $ putStrLn $ "Verified " ++ show fileCount ++ " files. All match metadata."
+        else liftIO $ do
+            hPutStrLn stderr $ "error: Working tree does not match metadata (" ++ show (length issues) ++ " issues)."
+            mapM_ (printVerifyIssue id) issues  -- full hash, no truncation
+            hPutStrLn stderr "hint: Run 'bit verify' to see all mismatches."
+            hPutStrLn stderr "hint: Run 'bit add' to update metadata, or 'bit restore' to restore files."
+            exitWith (ExitFailure 1)
+
     -- Determine if this is a filesystem or cloud remote
     mTarget <- liftIO $ getRemoteTargetType cwd (remoteName remote)
     case mTarget of
-        Just (Device.TargetDevice _ _) -> liftIO $ filesystemPush cwd remote
-        Just (Device.TargetLocalPath _) -> liftIO $ filesystemPush cwd remote
+        Just t | Device.isFilesystemTarget t -> liftIO $ filesystemPush cwd remote
         _ -> cloudPush remote  -- Cloud remote or no target info (use cloud flow)
 
 -- | Push to a cloud remote (original flow, unchanged).
 cloudPush :: Remote -> BitM ()
 cloudPush remote = do
-    force <- asks envForce
-    liftIO $ putStrLn $ "Inspecting remote: " ++ displayRemote remote
-    state <- liftIO $ classifyRemoteState remote
+    fMode <- asks envForceMode
+    state <- liftIO $ do
+        putStrLn $ "Inspecting remote: " ++ displayRemote remote
+        classifyRemoteState remote
 
     case state of
         StateEmpty -> do
@@ -2796,29 +2830,31 @@ cloudPush remote = do
             updateLocalBundleAfterPush
 
         StateValidRgit -> do
-            liftIO $ putStrLn "Remote is a bit repo. Checking history..."
-            fetchResult <- liftIO $ fetchBundle remote
+            fetchResult <- liftIO $ do
+                putStrLn "Remote is a bit repo. Checking history..."
+                fetchBundle remote
             case fetchResult of
                 BundleFound bPath -> do
                     let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
-                    liftIO $ copyFile bPath fetchedPath
-                    liftIO $ safeRemove bPath
+                    liftIO $ do
+                        copyFile bPath fetchedPath
+                        safeRemove bPath
                     processExistingRemote
                 _ -> liftIO $ hPutStrLn stderr "Error: Remote .bit found but metadata is missing."
 
-        StateNonRgitOccupied samples -> do
-            if force
-                then do
+        StateNonRgitOccupied samples ->
+            case fMode of
+                Force -> do
                     liftIO $ hPutStrLn stderr "Warning: --force used. Overwriting non-bit remote..."
                     syncRemoteFiles
                     liftIO $ pushBundle remote
                     updateLocalBundleAfterPush
-                else do
-                    liftIO $ hPutStrLn stderr "-------------------------------------------------------"
-                    liftIO $ hPutStrLn stderr "[!] STOP: Remote is NOT a bit repository!"
-                    liftIO $ hPutStrLn stderr $ "Found existing files: " ++ List.intercalate ", " samples
-                    liftIO $ hPutStrLn stderr "To initialize anyway (destructive): bit init --force"
-                    liftIO $ hPutStrLn stderr "-------------------------------------------------------"
+                _ -> liftIO $ do
+                    hPutStrLn stderr "-------------------------------------------------------"
+                    hPutStrLn stderr "[!] STOP: Remote is NOT a bit repository!"
+                    hPutStrLn stderr $ "Found existing files: " ++ List.intercalate ", " samples
+                    hPutStrLn stderr "To initialize anyway (destructive): bit init --force"
+                    hPutStrLn stderr "-------------------------------------------------------"
 
         StateNetworkError err ->
             liftIO $ hPutStrLn stderr $ "Aborting: Network error -> " ++ err
@@ -2854,38 +2890,34 @@ filesystemPush cwd remote = do
     
     -- 3. Capture remote HEAD before merge
     (oldHeadCode, oldHeadOut, _) <- Git.runGitAt remoteIndex ["rev-parse", "HEAD"]
-    let mOldHead = if oldHeadCode == ExitSuccess 
-                   then Just (filter (not . isSpace) oldHeadOut)
-                   else Nothing
+    let mOldHead = case oldHeadCode of
+            ExitSuccess -> Just (trimGitOutput oldHeadOut)
+            _ -> Nothing
     
     -- 4. Check if remote HEAD is ancestor of what we're pushing (fast-forward check)
-    case mOldHead of
-        Just _oldHead -> do
-            (checkCode, _, _) <- Git.runGitAt remoteIndex 
-                ["merge-base", "--is-ancestor", "HEAD", "refs/remotes/origin/main"]
-            when (checkCode /= ExitSuccess) $ do
-                hPutStrLn stderr "error: Remote has local commits that you don't have."
-                hPutStrLn stderr "hint: Run 'bit pull' to merge remote changes first, then push again."
-                exitWith (ExitFailure 1)
-        Nothing -> pure ()  -- First push, no check needed
+    traverse_ (const $ do
+        (checkCode, _, _) <- Git.runGitAt remoteIndex 
+            ["merge-base", "--is-ancestor", "HEAD", "refs/remotes/origin/main"]
+        when (checkCode /= ExitSuccess) $ do
+            hPutStrLn stderr "error: Remote has local commits that you don't have."
+            hPutStrLn stderr "hint: Run 'bit pull' to merge remote changes first, then push again."
+            exitWith (ExitFailure 1)
+        ) mOldHead
     
     -- 5. Merge at remote (ff-only)
     putStrLn "Merging at remote (fast-forward only)..."
     (mergeCode, _mergeOut, mergeErr) <- Git.runGitAt remoteIndex 
         ["merge", "--ff-only", "refs/remotes/origin/main"]
     
-    if mergeCode /= ExitSuccess
-        then do
-            hPutStrLn stderr $ "error: Failed to merge at remote: " ++ mergeErr
-            exitWith (ExitFailure 1)
-        else do
+    case mergeCode of
+        ExitSuccess -> do
             -- 6. Get new HEAD at remote
             (newHeadCode, newHeadOut, _) <- Git.runGitAt remoteIndex ["rev-parse", "HEAD"]
             when (newHeadCode /= ExitSuccess) $ do
                 hPutStrLn stderr "Error: Could not get remote HEAD after merge"
                 exitWith (ExitFailure 1)
             
-            let newHead = filter (not . isSpace) newHeadOut
+            let newHead = trimGitOutput newHeadOut
             
             -- 7. Sync actual files based on what changed
             case mOldHead of
@@ -2901,8 +2933,11 @@ filesystemPush cwd remote = do
             -- 8. Update local tracking ref
             putStrLn "Updating local tracking ref..."
             void $ Git.updateRemoteTrackingBranchToHead
-            
+
             putStrLn "Push complete."
+        _ -> do
+            hPutStrLn stderr $ "error: Failed to merge at remote: " ++ mergeErr
+            exitWith (ExitFailure 1)
 
 -- ============================================================================
 -- Push helper functions
@@ -2916,12 +2951,11 @@ pushBundle remote = do
 
     -- bracket <setup> <cleanup> <action>
     bracket
-        (Git.createBundle tempBundle) -- 1. Acquire
-        (\_ -> cleanupTemp tempBundleCwdPath) -- 2. Release (Always runs)
-        (\gCode -> do                 -- 3. Work
-            if gCode /= ExitSuccess
-                then hPutStrLn stderr "Error creating bundle"
-                else uploadToRemote tempBundleCwdPath remote
+        (Git.createBundle tempBundle)              -- 1. Acquire
+        (const $ cleanupTemp tempBundleCwdPath)    -- 2. Release (Always runs)
+        (\case                                     -- 3. Work
+            ExitSuccess -> uploadToRemote tempBundleCwdPath remote
+            _ -> hPutStrLn stderr "Error creating bundle"
         )
 
 -- Helper for the upload logic to keep the bracket clean
@@ -2929,9 +2963,9 @@ uploadToRemote :: FilePath -> Remote -> IO ()
 uploadToRemote src remote = do
     putStrLn "Uploading bundle to remote..."
     rCode <- Transport.copyToRemote src remote ".bit/bit.bundle"
-    if rCode == ExitSuccess
-        then putStrLn "Metadata push complete."
-        else hPutStrLn stderr "Error uploading bundle."
+    case rCode of
+        ExitSuccess -> putStrLn "Metadata push complete."
+        _ -> hPutStrLn stderr "Error uploading bundle."
 
 -- Helper for cleanup that doesn't crash if the file was never made
 cleanupTemp :: FilePath -> IO ()
@@ -2951,8 +2985,9 @@ pushToRemote remote = do
 updateLocalBundleAfterPush :: BitM ()
 updateLocalBundleAfterPush = do
     code <- liftIO $ Git.createBundle fetchedBundle
-    when (code == ExitSuccess) $ do
-        void $ liftIO $ Git.updateRemoteTrackingBranch fetchedBundle
+    case code of
+        ExitSuccess -> void $ liftIO $ Git.updateRemoteTrackingBranch fetchedBundle
+        _ -> pure ()
 
 syncRemoteFiles :: BitM ()
 syncRemoteFiles = withRemote $ \remote -> do
@@ -2960,7 +2995,7 @@ syncRemoteFiles = withRemote $ \remote -> do
     localFiles <- asks envLocalFiles
     remoteResult <- liftIO $ Remote.Scan.fetchRemoteFiles remote
     either
-        (\_ -> liftIO $ hPutStrLn stderr "Error: Failed to fetch remote file list.")
+        (const $ liftIO $ hPutStrLn stderr "Error: Failed to fetch remote file list.")
         (\remoteFiles -> do
             let actions = Pipeline.pushSyncFiles localFiles remoteFiles
             liftIO $ putStrLn "--- Pushing Changes to Remote ---"
@@ -2981,18 +3016,13 @@ syncRemoteFiles = withRemote $ \remote -> do
 
 processExistingRemote :: BitM ()
 processExistingRemote = do
-    force <- asks envForce
-    forceWithLease <- asks envForceWithLease
+    fMode <- asks envForceMode
     mRemote <- asks envRemote
-    -- Handle --force: skip all checks and push anyway
-    if force
-        then do
+    case fMode of
+      Force -> do
             lift $ tellErr "Warning: --force used. Overwriting remote history..."
             maybe (lift $ tellErr "Error: No remote configured.") pushToRemote mRemote
-        else do
-            -- Handle --force-with-lease: compare remote bundle hash against fetched_remote.bundle
-            if forceWithLease
-                then do
+      ForceWithLease -> do
                     maybeRemoteHash <- liftIO $ Git.getHashFromBundle fetchedBundle
                     let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
                     hasFetchedBundle <- lift $ fileExistsE fetchedPath
@@ -3015,7 +3045,7 @@ processExistingRemote = do
                             lift $ tellErr "Warning: No local fetched bundle found. Proceeding with push (--force-with-lease)..."
                             maybe (lift $ tellErr "Error: No remote configured.") pushToRemote mRemote
                         (Nothing, _) -> lift $ tellErr "Error: Could not extract hash from remote bundle."
-                else do
+      NoForce -> do
                     maybeRemoteHash <- liftIO $ Git.getHashFromBundle fetchedBundle
                     maybeLocalHash <- lift getLocalHeadE
 
@@ -3048,6 +3078,9 @@ processExistingRemote = do
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE DataKinds #-}
 
 module Bit.Core.RemoteManagement
     ( remoteAdd
@@ -3055,34 +3088,37 @@ module Bit.Core.RemoteManagement
     , addRemoteFilesystem
     , promptDeviceName
     , remoteShow
-    , remoteCheck
+    , remoteRepair
     , formatRemoteDisplay
     , showRemoteStatusFromBundle
     ) where
 
 import qualified System.Directory as Dir
-import System.FilePath ((</>))
+import System.FilePath ((</>), takeDirectory)
 import Control.Monad (unless, void, when, forM_)
 import System.Exit (ExitCode(..), exitWith)
 import qualified Internal.Git as Git
 import qualified Internal.Transport as Transport
 import qualified Bit.Device as Device
 import qualified Bit.DevicePrompt as DevicePrompt
+import Data.UUID (UUID)
 import System.IO (stderr, hPutStrLn)
 import Control.Exception (try, IOException)
-import Control.Concurrent (forkIO, threadDelay, killThread)
-import Data.IORef (IORef, newIORef, readIORef)
-import System.IO (hIsTerminalDevice)
-import Data.Maybe (fromMaybe, isNothing)
-import Internal.Config (bitDevicesDir, bitRemotesDir, bitDir, fetchedBundle, bundleCwdPath, fromCwdPath, BundleName(..))
-import Bit.Types (BitM, BitEnv(..))
+import Data.Maybe (fromMaybe)
+import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
+import qualified Data.Text as T
+import Internal.Config (bitDevicesDir, bitRemotesDir, fetchedBundle, bundleCwdPath, fromCwdPath, BundleName(..), bitIndexPath)
+import Bit.Types (BitM, BitEnv(..), Path(..), Hash(..), HashAlgo(..), hashToText)
 import Control.Monad.Trans.Reader (asks)
 import Control.Monad.IO.Class (liftIO)
-import Bit.Progress (reportProgress, clearProgress)
-import Bit.Remote (Remote, remoteUrl, displayRemote, resolveRemote)
-import Bit.Core.Helpers (formatPathList)
+import Bit.Remote (Remote, remoteUrl, remoteName, displayRemote, resolveRemote)
+import Bit.Core.Helpers (getRemoteTargetType)
 import qualified Bit.Core.Fetch as Fetch
-import Bit.Utils (atomicWriteFileStr)
+import qualified Bit.Verify as Verify
+import Bit.Concurrency (Concurrency(..))
+import Bit.Utils (toPosix, atomicWriteFileStr)
+import Bit.Internal.Metadata (MetaContent(..), serializeMetadata)
 
 -- ============================================================================
 -- Remote Management
@@ -3118,9 +3154,7 @@ addRemoteFilesystem cwd name filePath = do
     volRoot <- Device.getVolumeRoot absPath
     let relPath = Device.getRelativePath volRoot absPath
     mStoreUuid <- Device.readBitStore volRoot
-    mExistingDevice <- case mStoreUuid of
-        Just u -> Device.findDeviceByUuid cwd u
-        Nothing -> pure Nothing
+    mExistingDevice <- maybe (pure Nothing) (Device.findDeviceByUuid cwd) mStoreUuid
     result <- try @IOException $ case (mStoreUuid, mExistingDevice) of
         (Just _u, Just dev) -> do
             putStrLn $ "Using existing device '" ++ dev ++ "'."
@@ -3132,29 +3166,13 @@ addRemoteFilesystem cwd name filePath = do
         (Just u, Nothing) -> do
             mLabel <- Device.getVolumeLabel volRoot
             deviceName' <- promptDeviceName cwd volRoot mLabel
-            storeType' <- Device.detectStorageType volRoot
-            mSerial <- case storeType' of
-                Device.Physical -> Device.getHardwareSerial volRoot
-                Device.Network -> pure Nothing
-            Device.writeDeviceFile cwd deviceName' (Device.DeviceInfo u storeType' mSerial)
-            Device.writeRemoteFile cwd name (Device.TargetDevice deviceName' relPath)
-            putStrLn $ "Remote '" ++ name ++ "' → " ++ deviceName' ++ ":" ++ relPath
-            putStrLn $ "Device '" ++ deviceName' ++ "' registered (" ++ (case storeType' of Device.Physical -> "physical"; Device.Network -> "network") ++ ")."
-            pure ()
+            registerDevice cwd name volRoot deviceName' relPath u
         (Nothing, _) -> do
             mLabel <- Device.getVolumeLabel volRoot
             deviceName' <- promptDeviceName cwd volRoot mLabel
             u <- Device.generateStoreUuid
             Device.writeBitStore volRoot u
-            storeType' <- Device.detectStorageType volRoot
-            mSerial <- case storeType' of
-                Device.Physical -> Device.getHardwareSerial volRoot
-                Device.Network -> pure Nothing
-            Device.writeDeviceFile cwd deviceName' (Device.DeviceInfo u storeType' mSerial)
-            Device.writeRemoteFile cwd name (Device.TargetDevice deviceName' relPath)
-            putStrLn $ "Remote '" ++ name ++ "' → " ++ deviceName' ++ ":" ++ relPath
-            putStrLn $ "Device '" ++ deviceName' ++ "' registered (" ++ (case storeType' of Device.Physical -> "physical"; Device.Network -> "network") ++ ")."
-            pure ()
+            registerDevice cwd name volRoot deviceName' relPath u
     case result of
         Right () -> pure ()
         Left _err -> do
@@ -3164,20 +3182,26 @@ addRemoteFilesystem cwd name filePath = do
             void $ Git.addRemote name absPath
             putStrLn $ "Remote '" ++ name ++ "' added (" ++ absPath ++ ")."
 
--- ============================================================================
--- Remote show / check
--- ============================================================================
+-- | Detect storage type, get serial, write device + remote files, and print confirmation.
+-- Shared between the "existing UUID / no device" and "no UUID" branches.
+registerDevice :: FilePath -> String -> FilePath -> String -> FilePath -> UUID -> IO ()
+registerDevice cwd name volRoot deviceName' relPath u = do
+    storeType' <- Device.detectStorageType volRoot
+    mSerial <- case storeType' of
+        Device.Physical -> Device.getHardwareSerial volRoot
+        Device.Network -> pure Nothing
+    Device.writeDeviceFile cwd deviceName' (Device.DeviceInfo u storeType' mSerial)
+    Device.writeRemoteFile cwd name (Device.TargetDevice deviceName' relPath)
+    putStrLn $ "Remote '" ++ name ++ "' → " ++ deviceName' ++ ":" ++ relPath
+    putStrLn $ "Device '" ++ deviceName' ++ "' registered (" ++ displayStorageType storeType' ++ ")."
 
--- | Progress reporter loop for remote check operations
-checkProgressLoop :: IORef Int -> Int -> IO ()
-checkProgressLoop counter total = go
-  where
-    go = do
-      n <- readIORef counter
-      let pct = (n * 100) `div` max 1 total
-      reportProgress $ "Checking files: " ++ show n ++ "/" ++ show total ++ " (" ++ show pct ++ "%)"
-      threadDelay 100000  -- 100ms
-      when (n < total) go
+displayStorageType :: Device.StorageType -> String
+displayStorageType Device.Physical = "physical"
+displayStorageType Device.Network  = "network"
+
+-- ============================================================================
+-- Remote show / repair
+-- ============================================================================
 
 remoteShow :: Maybe String -> BitM ()
 remoteShow mRemoteName = do
@@ -3197,16 +3221,16 @@ remoteShow mRemoteName = do
                             display <- formatRemoteDisplay cwd name mTarget
                             putStrLn display
         Just name -> do
-            mRemote <- liftIO $ resolveRemote cwd name
-            mTarget <- liftIO $ Device.readRemoteFile cwd name
+            (mRemote, mTarget) <- liftIO $ (,) <$> resolveRemote cwd name <*> Device.readRemoteFile cwd name
             display <- liftIO $ case mTarget of
                 Just _ -> formatRemoteDisplay cwd name mTarget
                 Nothing -> pure (name ++ " → " ++ maybe "(not configured)" displayRemote mRemote)
             case mRemote of
                 Nothing -> liftIO $ putStrLn "No remotes configured. Use 'bit remote add <name> <url>' to add one."
                 Just remote -> do
-                    liftIO $ putStrLn display
-                    liftIO $ putStrLn ""
+                    liftIO $ do
+                        putStrLn display
+                        putStrLn ""
                     let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
                     hasBundle <- liftIO $ Dir.doesFileExist fetchedPath
                     if hasBundle
@@ -3232,115 +3256,277 @@ remoteShow mRemoteName = do
                                     putStrLn "  Local refs configured for 'bit push':"
                                     putStrLn "    main pushes to main (unknown)"
 
-remoteCheck :: Maybe String -> BitM ()
-remoteCheck mName = do
+-- ============================================================================
+-- Remote repair
+-- ============================================================================
+
+-- | Repair action: copy a file from one side to repair the other.
+-- Carries the expected hash+size so metadata can be restored.
+data RepairAction
+    = RepairLocal  Path Path (Hash 'MD5) Integer  -- ^ Copy from remote sourcePath to fix local destPath, with expected hash+size
+    | RepairRemote Path Path (Hash 'MD5) Integer  -- ^ Copy from local sourcePath to fix remote destPath, with expected hash+size
+    deriving (Show)
+
+-- | Result of executing a single repair action.
+data RepairResult = Repaired Path | RepairFailed Path String
+    deriving (Show)
+
+remoteRepair :: Maybe String -> Concurrency -> BitM ()
+remoteRepair mName concurrency = do
     cwd <- asks envCwd
-    (mRemote, _name) <- liftIO $ case mName of
-        Nothing -> do
-            name <- Git.getTrackedRemoteName
-            mRemote <- resolveRemote cwd name
-            pure (mRemote, name)
-        Just name -> do
-            mRemote <- resolveRemote cwd name
-            pure (mRemote, name)
+    -- Resolve remote
+    (mRemote, _resolvedName) <- liftIO $ do
+        name <- maybe Git.getTrackedRemoteName pure mName
+        mRemote <- resolveRemote cwd name
+        pure (mRemote, name)
     case mRemote of
+        Nothing -> liftIO $ do
+            maybe
+                (hPutStrLn stderr "fatal: No remote configured.")
+                (\n -> hPutStrLn stderr $ "fatal: '" ++ n ++ "' does not appear to be a git remote.")
+                mName
+            hPutStrLn stderr "hint: Set remote with 'bit remote add <name> <url>'"
+            exitWith (ExitFailure 1)
+        Just remote -> liftIO $ do
+            putStrLn $ "Repairing against remote: " ++ displayRemote remote
+            putStrLn ""
+
+            -- Determine if filesystem or cloud remote
+            mTarget <- getRemoteTargetType cwd (remoteName remote)
+            let isFilesystem = maybe False Device.isFilesystemTarget mTarget
+                remotePath = remoteUrl remote
+
+            if isFilesystem
+                then repairFilesystem cwd remote remotePath concurrency
+                else repairCloud cwd remote concurrency
+
+-- | Repair against a filesystem remote (direct file access, no rclone).
+repairFilesystem :: FilePath -> Remote -> FilePath -> Concurrency -> IO ()
+repairFilesystem cwd _remote remotePath concurrency = do
+    -- Load committed metadata from both sides (immune to scan updates)
+    let localIndexDir = cwd </> bitIndexPath
+        remoteIndexDir = remotePath </> bitIndexPath
+    localMeta <- Verify.loadCommittedBinaryMetadata localIndexDir
+    remoteMeta <- Verify.loadCommittedBinaryMetadata remoteIndexDir
+
+    -- Verify both sides
+    putStrLn "Verifying local files..."
+    (localCount, localIssues) <- Verify.verifyLocal cwd Nothing concurrency
+    putStrLn $ "  " ++ show localCount ++ " files checked, " ++ show (length localIssues) ++ " issues"
+
+    putStrLn "Verifying remote files..."
+    (remoteCount, remoteIssues) <- Verify.verifyLocalAt remotePath Nothing concurrency
+    putStrLn $ "  " ++ show remoteCount ++ " files checked, " ++ show (length remoteIssues) ++ " issues"
+
+    runRepairLogic localMeta remoteMeta localIssues remoteIssues
+        (executeFilesystemRepair cwd remotePath)
+
+-- | Repair against a cloud remote (bundle-based, uses rclone).
+repairCloud :: FilePath -> Remote -> Concurrency -> IO ()
+repairCloud cwd remote concurrency = do
+    -- Fetch bundle
+    maybeBundlePath <- Fetch.fetchRemoteBundle remote
+    case maybeBundlePath of
         Nothing -> do
-            liftIO $ if isNothing mName
-                then hPutStrLn stderr "fatal: No remote configured."
-                else hPutStrLn stderr $ "fatal: '" ++ fromMaybe "" mName ++ "' does not appear to be a git remote."
-            liftIO $ hPutStrLn stderr "hint: Set remote with 'bit remote add <name> <url>'"
-            liftIO $ exitWith (ExitFailure 1)
-        Just remote -> do
-            liftIO $ putStrLn $ "Checking local against remote: " ++ displayRemote remote
-            liftIO $ putStrLn ""
+            hPutStrLn stderr "fatal: Could not fetch remote bundle."
+            exitWith (ExitFailure 1)
+        Just bPath -> do
+            outcome <- Fetch.saveFetchedBundle remote (Just bPath)
+            case outcome of
+                Fetch.FetchError err -> do
+                    hPutStrLn stderr $ "fatal: " ++ err
+                    exitWith (ExitFailure 1)
+                _ -> pure ()
 
-            (_, filesOutput, _) <- liftIO $ Git.runGitWithOutput ["ls-files"]
-            let fileCount = length . filter (not . null) . lines $ filesOutput
+    -- Load committed metadata (immune to scan updates)
+    let localIndexDir = cwd </> bitIndexPath
+    localMeta <- Verify.loadCommittedBinaryMetadata localIndexDir
+    entries <- Verify.loadMetadataFromBundle fetchedBundle
+    let remoteMeta = Verify.binaryEntries entries
 
-            if fileCount > 5
-                then liftIO $ do
-                    isTTY <- hIsTerminalDevice stderr
-                    counter <- newIORef (0 :: Int)
-                    let shouldShowProgress = isTTY
+    -- Verify both sides
+    putStrLn "Verifying local files..."
+    (localCount, localIssues) <- Verify.verifyLocal cwd Nothing concurrency
+    putStrLn $ "  " ++ show localCount ++ " files checked, " ++ show (length localIssues) ++ " issues"
 
-                    reporterThread <- if shouldShowProgress
-                        then do
-                            putStrLn "Running remote check..."
-                            Just <$> forkIO (checkProgressLoop counter fileCount)
-                        else do
-                            putStrLn "Running remote check..."
-                            pure Nothing
+    putStrLn "Verifying remote files..."
+    (remoteCount, remoteIssues) <- Verify.verifyRemote cwd remote Nothing concurrency
+    putStrLn $ "  " ++ show remoteCount ++ " files checked, " ++ show (length remoteIssues) ++ " issues"
 
-                    res <- try @IOException (Transport.checkRemote cwd remote (Just counter))
+    runRepairLogic localMeta remoteMeta localIssues remoteIssues
+        (executeRepair cwd remote)
 
-                    maybe (pure ()) killThread reporterThread
-                    when shouldShowProgress clearProgress
+-- | Common repair logic shared between filesystem and cloud remotes.
+runRepairLogic :: [(Path, Hash 'MD5, Integer)]    -- local metadata
+              -> [(Path, Hash 'MD5, Integer)]    -- remote metadata
+              -> [Verify.VerifyIssue]             -- local issues
+              -> [Verify.VerifyIssue]             -- remote issues
+              -> (RepairAction -> IO RepairResult) -- repair executor
+              -> IO ()
+runRepairLogic localMeta remoteMeta localIssues remoteIssues executeAction =
+    if null localIssues && null remoteIssues
+        then putStrLn "\nAll files verified. Nothing to repair."
+        else do
+            putStrLn ""
 
-                    case res of
-                        Left _ -> do
-                            hPutStrLn stderr "fatal: rclone not found. Install rclone: https://rclone.org/install/"
-                            exitWith (ExitFailure 1)
-                        Right cr -> processCheckResult cwd cr
-                else liftIO $ do
-                    putStrLn "Running remote check..."
-                    res <- try @IOException (Transport.checkRemote cwd remote Nothing)
-                    case res of
-                        Left _ -> do
-                            hPutStrLn stderr "fatal: rclone not found. Install rclone: https://rclone.org/install/"
-                            exitWith (ExitFailure 1)
-                        Right cr -> processCheckResult cwd cr
+            -- Build sets of broken paths
+            let localIssueSet = Set.fromList (map issuePath localIssues)
+                remoteIssueSet = Set.fromList (map issuePath remoteIssues)
+
+            -- Build content indexes from VERIFIED files
+            let remoteVerified = buildContentIndex remoteMeta remoteIssueSet
+                localVerified  = buildContentIndex localMeta localIssueSet
+
+            -- Build metadata maps for lookup
+            let localMetaMap = Map.fromList [(p, (h, s)) | (p, h, s) <- localMeta]
+                remoteMetaMap = Map.fromList [(p, (h, s)) | (p, h, s) <- remoteMeta]
+
+            -- Plan repairs: use the OTHER side's metadata as source of truth
+            -- (local metadata may reflect corrupted state after a scan)
+            let (localRepairs, localUnrepairable) =
+                    planRepairs localIssues remoteMetaMap remoteVerified RepairLocal
+                (remoteRepairs, remoteUnrepairable) =
+                    planRepairs remoteIssues localMetaMap localVerified RepairRemote
+                allRepairs = localRepairs ++ remoteRepairs
+                allUnrepairable = localUnrepairable ++ remoteUnrepairable
+
+            when (null allRepairs && null allUnrepairable) $
+                putStrLn "No repairable issues found (issues may be in text files or untracked files)."
+
+            -- Execute repairs
+            unless (null allRepairs) $ do
+                putStrLn $ "Repairing " ++ show (length allRepairs) ++ " file(s)..."
+                results <- mapM executeAction allRepairs
+
+                let repaired = [p | Repaired p <- results]
+                    failed   = [(p, e) | RepairFailed p e <- results]
+
+                forM_ repaired $ \p ->
+                    putStrLn $ "  [REPAIRED] " ++ toPosix (unPath p)
+                forM_ failed $ \(p, e) ->
+                    hPutStrLn stderr $ "  [FAILED]   " ++ toPosix (unPath p) ++ " (" ++ e ++ ")"
+
+                -- Summary
+                putStrLn ""
+                putStrLn $ show (length repaired) ++ " repaired, "
+                    ++ show (length failed) ++ " failed, "
+                    ++ show (length allUnrepairable) ++ " unrepairable."
+
+                unless (null failed && null allUnrepairable) $
+                    exitWith (ExitFailure 1)
+
+            unless (null allUnrepairable) $ do
+                when (null allRepairs) $ do
+                    forM_ allUnrepairable $ \p ->
+                        hPutStrLn stderr $ "  [UNREPAIRABLE] " ++ toPosix (unPath p)
+                    putStrLn ""
+                    putStrLn $ "0 repaired, 0 failed, " ++ show (length allUnrepairable) ++ " unrepairable."
+                    exitWith (ExitFailure 1)
+
+-- | Extract the path from a VerifyIssue.
+issuePath :: Verify.VerifyIssue -> Path
+issuePath (Verify.HashMismatch p _ _ _ _) = p
+issuePath (Verify.Missing p) = p
+
+-- | Build a content-addressable index from verified metadata entries.
+-- Maps (hashString, size) to a Path that is known to be good.
+-- Excludes any paths that are in the issue set (those are broken).
+buildContentIndex :: [(Path, Hash 'MD5, Integer)] -> Set.Set Path -> Map.Map (String, Integer) Path
+buildContentIndex entries issueSet =
+    Map.fromList
+        [ ((T.unpack (hashToText h), sz), p)
+        | (p, h, sz) <- entries
+        , not (Set.member p issueSet)
+        ]
+
+-- | Plan repair actions for a list of issues.
+-- For each issue, looks up the expected (hash, size) in the opposite side's content index.
+-- Returns (repair actions, unrepairable paths).
+planRepairs :: [Verify.VerifyIssue]
+            -> Map.Map Path (Hash 'MD5, Integer)
+            -> Map.Map (String, Integer) Path
+            -> (Path -> Path -> Hash 'MD5 -> Integer -> RepairAction)
+            -> ([RepairAction], [Path])
+planRepairs issues metaMap contentIndex mkAction = foldr go ([], []) issues
   where
-    processCheckResult cwd cr = do
-        let reportPath = cwd </> bitDir </> "last-check.txt"
-        Dir.createDirectoryIfMissing True (cwd </> bitDir)
-        atomicWriteFileStr reportPath (Transport.checkRawOutput cr)
-        let matches = Transport.checkMatches cr
-            differs = Transport.checkDiffers cr
-            missingDest = Transport.checkMissingDest cr
-            missingSrc = Transport.checkMissingSrc cr
-            errs = Transport.checkErrors cr
-            nMatch = length matches
-            hasDiff = not (null differs && null missingDest && null missingSrc && null errs)
-        if not hasDiff && Transport.checkExitCode cr == ExitSuccess
-            then do
-                putStrLn $ show nMatch ++ " files match between local and remote."
-                exitWith ExitSuccess
-            else if Transport.checkExitCode cr /= ExitSuccess && Transport.checkExitCode cr /= ExitFailure 1
-            then do
-                hPutStrLn stderr "fatal: Could not read from remote."
-                hPutStrLn stderr ""
-                hPutStrLn stderr "Please make sure you have the correct access rights"
-                hPutStrLn stderr "and the remote exists."
-                unless (null (Transport.checkStderr cr)) $ hPutStrLn stderr (Transport.checkStderr cr)
-                exitWith (ExitFailure 1)
-            else do
-                putStrLn ""
-                unless (null differs) $ mapM_ putStrLn ("  content differs:" : formatPathList differs)
-                unless (null missingDest) $ mapM_ putStrLn ("  local only (not on remote):" : formatPathList missingDest)
-                unless (null missingSrc) $ mapM_ putStrLn ("  remote only (not in local):" : formatPathList missingSrc)
-                unless (null errs) $ mapM_ putStrLn ("  errors:" : formatPathList errs)
-                let errWord = if length errs == 1 then "1 error" else show (length errs) ++ " errors"
-                putStrLn $ show (length differs + length missingDest + length missingSrc) ++ " differences, "
-                    ++ errWord ++ ". " ++ show nMatch ++ " files matched."
-                putStrLn ""
-                hPutStrLn stderr "hint: Content differences may indicate an incomplete push or pull."
-                hPutStrLn stderr "hint: Run 'bit verify' and 'bit verify --remote' to check metadata consistency."
-                hPutStrLn stderr "hint: Full report saved to .bit/last-check.txt"
-                exitWith (ExitFailure 1)
+    go issue (repairs, unrepairables) =
+        let p = issuePath issue
+        in case Map.lookup p metaMap of
+            Nothing -> (repairs, unrepairables)  -- not in binary metadata, skip
+            Just (expectedHash, expectedSize) ->
+                let key = (T.unpack (hashToText expectedHash), expectedSize)
+                in case Map.lookup key contentIndex of
+                    Just sourcePath -> (mkAction sourcePath p expectedHash expectedSize : repairs, unrepairables)
+                    Nothing -> (repairs, p : unrepairables)
+
+-- | Restore the metadata file in .bit/index/ to match the expected hash+size.
+restoreLocalMetadata :: FilePath -> Path -> Hash 'MD5 -> Integer -> IO ()
+restoreLocalMetadata cwd destPath expectedHash expectedSize = do
+    let metaPath = cwd </> bitIndexPath </> unPath destPath
+    Dir.createDirectoryIfMissing True (takeDirectory metaPath)
+    atomicWriteFileStr metaPath (serializeMetadata (MetaContent expectedHash expectedSize))
+
+-- | Execute a single repair action for cloud remotes (uses rclone).
+executeRepair :: FilePath -> Remote -> RepairAction -> IO RepairResult
+executeRepair cwd remote (RepairLocal sourcePath destPath expectedHash expectedSize) = do
+    -- Copy from remote to fix local
+    let remoteRelPath = toPosix (unPath sourcePath)
+        localFullPath = cwd </> unPath destPath
+    Dir.createDirectoryIfMissing True (takeDirectory localFullPath)
+    code <- Transport.copyFromRemote remote remoteRelPath localFullPath
+    case code of
+        ExitSuccess -> do
+            restoreLocalMetadata cwd destPath expectedHash expectedSize
+            pure (Repaired destPath)
+        _ -> pure (RepairFailed destPath "copy from remote failed")
+executeRepair cwd remote (RepairRemote sourcePath destPath _ _) = do
+    -- Copy from local to fix remote
+    let localFullPath = cwd </> unPath sourcePath
+        remoteRelPath = toPosix (unPath destPath)
+    code <- Transport.copyToRemote localFullPath remote remoteRelPath
+    pure $ case code of
+        ExitSuccess -> Repaired destPath
+        _ -> RepairFailed destPath "copy to remote failed"
+
+-- | Execute a single repair action for filesystem remotes (direct file copy).
+executeFilesystemRepair :: FilePath -> FilePath -> RepairAction -> IO RepairResult
+executeFilesystemRepair cwd remotePath (RepairLocal sourcePath destPath expectedHash expectedSize) = do
+    -- Copy from remote filesystem to fix local
+    let srcFullPath = remotePath </> unPath sourcePath
+        dstFullPath = cwd </> unPath destPath
+    Dir.createDirectoryIfMissing True (takeDirectory dstFullPath)
+    result <- try @IOException $ Dir.copyFile srcFullPath dstFullPath
+    case result of
+        Right () -> do
+            restoreLocalMetadata cwd destPath expectedHash expectedSize
+            pure (Repaired destPath)
+        Left e -> pure (RepairFailed destPath (show e))
+executeFilesystemRepair cwd remotePath (RepairRemote sourcePath destPath expectedHash expectedSize) = do
+    -- Copy from local to fix remote filesystem, also restore remote metadata
+    let srcFullPath = cwd </> unPath sourcePath
+        dstFullPath = remotePath </> unPath destPath
+        remoteMetaPath = remotePath </> bitIndexPath </> unPath destPath
+    Dir.createDirectoryIfMissing True (takeDirectory dstFullPath)
+    Dir.createDirectoryIfMissing True (takeDirectory remoteMetaPath)
+    result <- try @IOException $ do
+        Dir.copyFile srcFullPath dstFullPath
+        atomicWriteFileStr remoteMetaPath (serializeMetadata (MetaContent expectedHash expectedSize))
+    pure $ case result of
+        Right () -> Repaired destPath
+        Left e -> RepairFailed destPath (show e)
 
 -- | Format remote display line (e.g. "origin → black_usb:Backup (physical, connected at E:\)")
 formatRemoteDisplay :: FilePath -> String -> Maybe Device.RemoteTarget -> IO String
-formatRemoteDisplay cwd name mTarget = case mTarget of
-    Just (Device.TargetLocalPath p) -> pure (name ++ " → " ++ p ++ " (local path)")
-    Just (Device.TargetDevice dev devPath) -> do
+formatRemoteDisplay cwd name = maybe (pure (name ++ " → (no target)")) $ \case
+    Device.TargetLocalPath p -> pure (name ++ " → " ++ p ++ " (local path)")
+    Device.TargetDevice dev devPath -> do
         res <- Device.resolveRemoteTarget cwd (Device.TargetDevice dev devPath)
         mInfo <- Device.readDeviceFile cwd dev
-        let typ = maybe "unknown" (\i -> case Device.deviceType i of Device.Physical -> "physical"; Device.Network -> "network") mInfo
+        let typ = maybe "unknown" (displayStorageType . Device.deviceType) mInfo
         case res of
             Device.Resolved mount -> pure (name ++ " → " ++ dev ++ ":" ++ devPath ++ " (" ++ typ ++ ", connected at " ++ mount ++ ")")
             Device.NotConnected _ -> pure (name ++ " → " ++ dev ++ ":" ++ devPath ++ " (" ++ typ ++ ", NOT CONNECTED)")
-    Just (Device.TargetCloud u) -> pure (name ++ " → " ++ u ++ " (cloud)")
-    Nothing -> pure (name ++ " → (no target)")
+    Device.TargetCloud u -> pure (name ++ " → " ++ u ++ " (cloud)")
 
 showRemoteStatusFromBundle :: String -> Maybe String -> IO ()
 showRemoteStatusFromBundle name mUrl = do
@@ -3351,6 +3537,26 @@ showRemoteStatusFromBundle name mUrl = do
     putStrLn $ "  Push  URL: " ++ url
     putStrLn ""
     compareHistory maybeLocal fetchedBundle
+
+-- | Status of local ref relative to remote (for 'bit remote show' push message).
+data PushRefStatus
+  = PushRefUpToDate        -- ^ Same commit
+  | PushRefFastForwardable -- ^ Local ahead of remote
+  | PushRefLocalOutOfDate  -- ^ Remote ahead of local
+  | PushRefDiverged        -- ^ Both have commits the other doesn't; merge/rebase needed
+  deriving (Show, Eq)
+
+-- | Classify push status from local and remote commit hashes. Calls git internally;
+-- callers never see raw boolean ancestry flags.
+classifyPushStatus :: String -> String -> IO PushRefStatus
+classifyPushStatus localHash remoteHash = do
+  localAhead  <- Git.checkIsAhead remoteHash localHash  -- is local ahead of remote?
+  remoteAhead <- Git.checkIsAhead localHash remoteHash  -- is remote ahead of local?
+  pure $ case (localAhead, remoteAhead) of
+    (True, False) -> PushRefFastForwardable
+    (False, True) -> PushRefLocalOutOfDate
+    (False, False) -> PushRefDiverged
+    (True, True)   -> PushRefUpToDate
 
 compareHistory :: Maybe String -> BundleName -> IO ()
 compareHistory maybeLocal bundleName = do
@@ -3376,18 +3582,17 @@ compareHistory maybeLocal bundleName = do
                     putStrLn "  Local refs configured for 'bit push':"
                     putStrLn "    main pushes to main (up to date)"
                 else do
-                    localAhead  <- Git.checkIsAhead rHash lHash
-                    remoteAhead <- Git.checkIsAhead lHash rHash
+                    status <- classifyPushStatus lHash rHash
 
                     putStrLn "  Local branch configured for 'bit pull':"
                     putStrLn "    main merges with remote main"
                     putStrLn ""
                     putStrLn "  Local refs configured for 'bit push':"
-                    case (localAhead, remoteAhead) of
-                        (True, False) -> putStrLn "    main pushes to main (fast-forwardable)"
-                        (False, True) -> putStrLn "    main pushes to main (local out of date)"
-                        (False, False) -> putStrLn "    main pushes to main (local out of date)"
-                        (True, True)   -> putStrLn "    main pushes to main (up to date)"
+                    case status of
+                        PushRefFastForwardable -> putStrLn "    main pushes to main (fast-forwardable)"
+                        PushRefLocalOutOfDate  -> putStrLn "    main pushes to main (local out of date)"
+                        PushRefDiverged       -> putStrLn "    main pushes to main (diverged)"
+                        PushRefUpToDate       -> putStrLn "    main pushes to main (up to date)"
         _ -> pure ()
 ```
 
@@ -3429,12 +3634,13 @@ module Bit.Core.Transport
 import qualified System.Directory as Dir
 import System.Directory (copyFile, createDirectoryIfMissing)
 import System.FilePath ((</>), takeDirectory)
-import Control.Monad (when, unless, void, forM, forM_)
+import Control.Monad (when, void, forM)
+import Data.Foldable (traverse_)
 import System.Exit (ExitCode(..))
 import qualified Internal.Git as Git
+import Internal.Git (NameStatusChange(Added, Deleted, Modified, Renamed, Copied))
 import qualified Internal.Transport as Transport
 import Internal.Config (bitIndexPath, fetchedBundle)
-import Data.Char (isSpace)
 import qualified Bit.Scan as Scan
 import qualified Bit.Pipeline as Pipeline
 import qualified Bit.Remote.Scan as Remote.Scan
@@ -3450,16 +3656,15 @@ import Control.Monad.Trans.Reader (asks)
 import Control.Monad.IO.Class (liftIO)
 import qualified Bit.CopyProgress as CopyProgress
 import Bit.CopyProgress (SyncProgress)
-import Data.IORef (writeIORef)
+import Data.IORef (writeIORef, atomicModifyIORef')
+import qualified Bit.Internal.Metadata as Metadata
 -- Strict IO imports to avoid Windows file locking issues
 import qualified Data.ByteString as BS
 import qualified Data.Text as T
 import Data.Text.Encoding (decodeUtf8')
 import Bit.Core.Helpers
     ( getLocalHeadE
-    , parseFilesystemDiffOutput
     , readFileMaybe
-    , safeRemove
     )
 
 -- ============================================================================
@@ -3481,30 +3686,35 @@ data FileTransport = FileTransport
 -- | Build a cloud transport that uses rclone to copy files.
 mkCloudTransport :: Remote -> FileTransport
 mkCloudTransport remote = FileTransport
-  { transportDownloadFile = \cwd filePath _progress -> downloadOrCopyFromIndex cwd remote filePath
+  { transportDownloadFile = \cwd filePath progress -> downloadOrCopyFromIndex cwd remote filePath progress
   , transportSyncAllFiles = \cwd -> do
       -- Cloud path uses the existing syncRemoteFilesToLocal logic
       -- which scans remote via rclone and syncs to local.
       localFiles <- Scan.scanWorkingDir cwd
       remoteResult <- Remote.Scan.fetchRemoteFiles remote
-      case remoteResult of
-        Left _ -> hPutStrLn stderr "Error: Failed to fetch remote file list."
-        Right remoteFiles -> do
+      either (const $ hPutStrLn stderr "Error: Failed to fetch remote file list.") (\remoteFiles -> do
           let actions = Pipeline.pullSyncFiles localFiles remoteFiles
           putStrLn "--- Pulling changes from remote ---"
           if null actions
             then putStrLn "Working tree already up to date with remote."
             else do
-              -- Create progress tracker for cloud operations (file-count only)
+              -- Gather file sizes from index metadata for byte-level progress
+              sizes <- forM actions $ \a -> case a of
+                  Copy _ dest -> getFileSizeFromIndex cwd (unPath dest)
+                  Move src _  -> getFileSizeFromIndex cwd (unPath src)
+                  _           -> pure 0
+              let totalBytes = sum sizes
+
+              -- Create progress tracker with byte totals
               progress <- CopyProgress.newSyncProgress (length actions)
+              writeIORef (CopyProgress.spBytesTotal progress) totalBytes
               CopyProgress.withSyncProgressReporter progress $ do
                 -- Use lower concurrency for network/subprocess operations
                 caps <- getNumCapabilities
                 let concurrency = min 8 (max 2 (caps * 2))
-                void $ runConcurrentlyBounded concurrency (\a -> do
-                  executePullCommand cwd remote a
-                  CopyProgress.incrementFilesComplete progress
-                  ) actions
+                void $ runConcurrentlyBounded concurrency
+                  (executePullCommand cwd remote progress) actions
+          ) remoteResult
   }
 
 -- | Build a filesystem transport that uses direct file copy.
@@ -3535,59 +3745,57 @@ mkFilesystemTransport remotePath = FileTransport
 applyMergeToWorkingDir :: FileTransport -> FilePath -> String -> IO ()
 applyMergeToWorkingDir transport cwd oldHead = do
     newHead <- getLocalHeadE
-    case newHead of
-        Nothing -> pure ()  -- shouldn't happen after merge commit
-        Just newH -> do
-            changes <- Git.getDiffNameStatus oldHead newH
-            putStrLn "--- Pulling changes from remote ---"
-            if null changes
-                then putStrLn "Working tree already up to date with remote."
-                else do
-                    -- First pass: collect paths that will be copied and their sizes
-                    filesToCopy <- fmap concat $ forM changes $ \(fileStatus, filePath, mNewPath) -> case fileStatus of
-                        'A' -> pure [filePath]
-                        'M' -> pure [filePath]
-                        'R' -> pure (maybe [] (\p -> [p]) mNewPath)
-                        _ -> pure []
-                    
-                    -- Gather file sizes for binary files (for progress tracking)
-                    fileInfo <- forM filesToCopy $ \filePath -> do
-                        fromIndex <- isTextFileInIndex cwd filePath
-                        if fromIndex
-                            then pure (filePath, True, (0 :: Integer))
-                            else do
-                                -- Binary file: try to get size for progress
-                                -- (size might not be available yet, that's ok)
-                                let _destPath = cwd </> filePath
-                                pure (filePath, False, 0)  -- Size will be tracked during copy
-                    
-                    let binaryFiles = [(p, s) | (p, False, s) <- fileInfo]
-                        totalFiles = length binaryFiles
-                    
-                    -- Create progress tracker
-                    progress <- CopyProgress.newSyncProgress totalFiles
-                    
-                    -- Second pass: apply changes with progress (parallelized)
-                    CopyProgress.withSyncProgressReporter progress $ do
-                        -- Use lower concurrency for file operations to avoid thrashing
-                        caps <- getNumCapabilities
-                        let concurrency = max 2 (caps * 2)
-                        void $ runConcurrentlyBounded concurrency (\(fileStatus, filePath, mNewPath) -> case fileStatus of
-                            'A' -> (transportDownloadFile transport) cwd filePath progress
-                            'M' -> (transportDownloadFile transport) cwd filePath progress
-                            'D' -> safeDeleteWorkFile cwd filePath
-                            'R' -> case mNewPath of
-                                Just newPath -> do
-                                    safeDeleteWorkFile cwd filePath
-                                    (transportDownloadFile transport) cwd newPath progress
-                                Nothing -> pure ()
-                            _ -> pure ()
-                            ) changes
+    traverse_ (\newH -> do
+        changes <- Git.getDiffNameStatus oldHead newH
+        putStrLn "--- Pulling changes from remote ---"
+        if null changes
+            then putStrLn "Working tree already up to date with remote."
+            else do
+                -- First pass: collect paths that will be copied and their sizes
+                filesToCopy <- fmap concat $ forM changes $ \change -> case change of
+                    Added p -> pure [p]
+                    Modified p -> pure [p]
+                    Renamed _ newPath -> pure [newPath]
+                    Copied _ newPath -> pure [newPath]
+                    Deleted _ -> pure []
+                
+                -- Gather file sizes for binary files (for progress tracking)
+                fileInfo <- forM filesToCopy $ \filePath -> do
+                    fromIndex <- isTextFileInIndex cwd filePath
+                    if fromIndex
+                        then pure (filePath, True, (0 :: Integer))
+                        else do
+                            size <- getFileSizeFromIndex cwd filePath
+                            pure (filePath, False, size)
+                
+                let binaryFiles = [(p, s) | (p, False, s) <- fileInfo]
+                    totalFiles = length binaryFiles
+                    totalBytes = sum [s | (_, s) <- binaryFiles]
+
+                -- Create progress tracker
+                progress <- CopyProgress.newSyncProgress totalFiles
+                writeIORef (CopyProgress.spBytesTotal progress) totalBytes
+                
+                -- Second pass: apply changes with progress (parallelized)
+                CopyProgress.withSyncProgressReporter progress $ do
+                    -- Use lower concurrency for file operations to avoid thrashing
+                    caps <- getNumCapabilities
+                    let concurrency = max 2 (caps * 2)
+                    void $ runConcurrentlyBounded concurrency (\change -> case change of
+                        Added p -> (transportDownloadFile transport) cwd p progress
+                        Modified p -> (transportDownloadFile transport) cwd p progress
+                        Deleted p -> safeDeleteWorkFile cwd p
+                        Renamed oldPath newPath -> do
+                            safeDeleteWorkFile cwd oldPath
+                            (transportDownloadFile transport) cwd newPath progress
+                        Copied _ newPath -> (transportDownloadFile transport) cwd newPath progress
+                        ) changes
+        ) newHead
 
 -- | Download a file from remote, or copy from index if it's a text file.
--- Used by cloud transport.
-downloadOrCopyFromIndex :: FilePath -> Remote -> FilePath -> IO ()
-downloadOrCopyFromIndex cwd remote filePath = do
+-- Used by cloud transport. Updates progress counters after download.
+downloadOrCopyFromIndex :: FilePath -> Remote -> FilePath -> SyncProgress -> IO ()
+downloadOrCopyFromIndex cwd remote filePath progress = do
     fromIndex <- isTextFileInIndex cwd filePath
     if fromIndex
         then copyFromIndexToWorkTree cwd filePath
@@ -3595,8 +3803,14 @@ downloadOrCopyFromIndex cwd remote filePath = do
             let localPath = cwd </> filePath
             createDirectoryIfMissing True (takeDirectory localPath)
             void $ Transport.copyFromRemote remote (toPosix filePath) (toPosix localPath)
+            exists <- Dir.doesFileExist localPath
+            when exists $ do
+                size <- Dir.getFileSize localPath
+                atomicModifyIORef' (CopyProgress.spBytesCopied progress) (\n -> (n + fromIntegral size, ()))
+            CopyProgress.incrementFilesComplete progress
 
 -- | Download a file from remote or copy from index for filesystem pull.
+-- Parameter order: localRoot, remotePath, filePath (relative), progress.
 filesystemDownloadOrCopyFromIndex :: FilePath -> FilePath -> FilePath -> SyncProgress -> IO ()
 filesystemDownloadOrCopyFromIndex localRoot remotePath filePath progress = do
     fromIndex <- isTextFileInIndex localRoot filePath
@@ -3671,6 +3885,8 @@ filesystemSyncRemoteFilesToLocalFromHEAD localRoot remotePath = do
                 ) fileInfo
 
 -- | Copy a file from local to remote (handles both text and binary).
+-- Parameter order: localRoot, remotePath, remoteIndex, filePath (relative).
+-- TRANSPOSITION NOTE: 4 FilePaths — rely on naming conventions.
 filesystemCopyFileToRemote :: FilePath -> FilePath -> FilePath -> FilePath -> SyncProgress -> IO ()
 filesystemCopyFileToRemote localRoot remotePath remoteIndex filePath progress = do
     -- Check if it's a text file (content in index) or binary (hash/size in index)
@@ -3758,20 +3974,22 @@ filesystemSyncAllFiles localRoot remotePath commitHash = do
         _ -> pure ()
 
 -- | Sync only changed files between two commits.
+-- Parameter order: localRoot, remotePath, oldHead (commit hash), newHead (commit hash).
 filesystemSyncChangedFiles :: FilePath -> FilePath -> String -> String -> IO ()
 filesystemSyncChangedFiles localRoot remotePath oldHead newHead = do
     let remoteIndex = remotePath </> ".bit" </> "index"
     changes <- Git.runGitAt remoteIndex ["diff", "--name-status", oldHead, newHead]
     case changes of
         (ExitSuccess, out, _) -> do
-            let parsedChanges = parseFilesystemDiffOutput out
+            let parsedChanges = Git.parseNameStatusOutput out
             
             -- First pass: collect paths that will be copied and their sizes
-            filesToCopy <- fmap concat $ forM parsedChanges $ \(fileStatus, filePath, mNewPath) -> case fileStatus of
-                'A' -> pure [filePath]
-                'M' -> pure [filePath]
-                'R' -> pure (maybe [] (\p -> [p]) mNewPath)
-                _ -> pure []
+            filesToCopy <- fmap concat $ forM parsedChanges $ \change -> case change of
+                Added p -> pure [p]
+                Modified p -> pure [p]
+                Renamed _ newPath -> pure [newPath]
+                Copied _ newPath -> pure [newPath]
+                Deleted _ -> pure []
             
             -- Gather file sizes for binary files
             fileInfo <- forM filesToCopy $ \p -> do
@@ -3800,16 +4018,14 @@ filesystemSyncChangedFiles localRoot remotePath oldHead newHead = do
                 -- Use lower concurrency for file copies to avoid disk thrashing
                 caps <- getNumCapabilities
                 let concurrency = max 2 (caps * 2)
-                void $ runConcurrentlyBounded concurrency (\(st, p, mNewPath) -> case st of
-                    'A' -> filesystemCopyFileToRemote localRoot remotePath remoteIndex p progress
-                    'M' -> filesystemCopyFileToRemote localRoot remotePath remoteIndex p progress
-                    'D' -> filesystemDeleteFileAtRemote remotePath p
-                    'R' -> case mNewPath of
-                        Just newPath -> do
-                            filesystemDeleteFileAtRemote remotePath p
-                            filesystemCopyFileToRemote localRoot remotePath remoteIndex newPath progress
-                        Nothing -> pure ()
-                    _ -> pure ()
+                void $ runConcurrentlyBounded concurrency (\change -> case change of
+                    Added p -> filesystemCopyFileToRemote localRoot remotePath remoteIndex p progress
+                    Modified p -> filesystemCopyFileToRemote localRoot remotePath remoteIndex p progress
+                    Deleted p -> filesystemDeleteFileAtRemote remotePath p
+                    Renamed oldPath newPath -> do
+                        filesystemDeleteFileAtRemote remotePath oldPath
+                        filesystemCopyFileToRemote localRoot remotePath remoteIndex newPath progress
+                    Copied _ newPath -> filesystemCopyFileToRemote localRoot remotePath remoteIndex newPath progress
                     ) parsedChanges
         _ -> pure ()
 
@@ -3833,9 +4049,7 @@ isTextFileInIndex localRoot filePath = do
     if not exists then pure False
     else do
         mcontent <- readFileMaybe metaPath
-        pure $ case mcontent of
-            Nothing -> False
-            Just content -> not (any ("hash: " `isPrefixOf`) (lines content))
+        pure $ maybe False (\content -> not (any ("hash: " `isPrefixOf`) (lines content))) mcontent
 
 -- | Copy a file from the index to the working tree. Call only when the path
 -- is a text file (content in index). Creates parent dirs as needed.
@@ -3855,25 +4069,26 @@ isTextMetadataFile metaPath = do
     else do
         -- Use strict ByteString reading to avoid Windows file locking issues
         bs <- BS.readFile metaPath
-        let content = case decodeUtf8' bs of
-              Left _ -> ""
-              Right txt -> T.unpack txt
+        let content = either (const "") T.unpack (decodeUtf8' bs)
         pure $ not (any ("hash: " `isPrefixOf`) (lines content))
+
+-- | Read a binary file's size from its index metadata.
+-- Returns 0 for text files or if metadata is missing/unparseable.
+getFileSizeFromIndex :: FilePath -> FilePath -> IO Integer
+getFileSizeFromIndex localRoot filePath = do
+    let metaPath = localRoot </> bitIndexPath </> filePath
+    result <- Metadata.parseMetadataFile metaPath
+    pure $ maybe 0 Metadata.metaSize result
 
 -- | Sync binaries after a successful merge commit
 syncBinariesAfterMerge :: FileTransport -> Remote -> Maybe String -> BitM ()
 syncBinariesAfterMerge transport _remote oldHead = do
     cwd <- asks envCwd
     liftIO $ putStrLn "Syncing binaries... done."
-    case oldHead of
-        Just oh -> liftIO $ applyMergeToWorkingDir transport cwd oh
-        Nothing -> do
-            -- Fallback: use transportSyncAllFiles (syncs from current HEAD)
-            liftIO $ transportSyncAllFiles transport cwd
+    -- Apply diff-based sync or full sync depending on whether we have an old HEAD
+    liftIO $ maybe (transportSyncAllFiles transport cwd) (applyMergeToWorkingDir transport cwd) oldHead
     maybeRemoteHash <- liftIO $ Git.getHashFromBundle fetchedBundle
-    case maybeRemoteHash of
-        Just rHash -> liftIO $ void $ Git.updateRemoteTrackingBranchToHash rHash
-        Nothing    -> pure ()
+    liftIO $ traverse_ (void . Git.updateRemoteTrackingBranchToHash) maybeRemoteHash
 
 -- | Executes/Prints the command to be run in the shell (push: local -> remote).
 executeCommand :: FilePath -> Remote -> RcloneAction -> IO ()
@@ -3892,8 +4107,9 @@ executeCommand localRoot remote action = case action of
 
 -- | Execute a single pull action: copy from remote to local or delete local file.
 -- Text files are already in the git bundle (index); copy from index to work dir instead of rclone.
-executePullCommand :: FilePath -> Remote -> RcloneAction -> IO ()
-executePullCommand localRoot remote action = case action of
+-- Updates progress counters (bytes + files) after each copy.
+executePullCommand :: FilePath -> Remote -> SyncProgress -> RcloneAction -> IO ()
+executePullCommand localRoot remote progress action = case action of
         Copy _src dest -> do
             fromIndex <- isTextFileInIndex localRoot (unPath dest)
             if fromIndex
@@ -3902,6 +4118,11 @@ executePullCommand localRoot remote action = case action of
                 let localPath = toPosix (localRoot </> unPath dest)
                 createDirectoryIfMissing True (takeDirectory (localRoot </> unPath dest))
                 void $ Transport.copyFromRemote remote (toPosix (unPath dest)) localPath
+                exists <- Dir.doesFileExist (localRoot </> unPath dest)
+                when exists $ do
+                    size <- Dir.getFileSize (localRoot </> unPath dest)
+                    atomicModifyIORef' (CopyProgress.spBytesCopied progress) (\n -> (n + fromIntegral size, ()))
+            CopyProgress.incrementFilesComplete progress
         Move src dest -> do
             fromIndex <- isTextFileInIndex localRoot (unPath src)
             if fromIndex
@@ -3910,9 +4131,14 @@ executePullCommand localRoot remote action = case action of
                 let localSrcPath = localRoot </> unPath src
                 createDirectoryIfMissing True (takeDirectory localSrcPath)
                 void $ Transport.copyFromRemote remote (toPosix (unPath src)) (toPosix localSrcPath)
+                exists <- Dir.doesFileExist localSrcPath
+                when exists $ do
+                    size <- Dir.getFileSize localSrcPath
+                    atomicModifyIORef' (CopyProgress.spBytesCopied progress) (\n -> (n + fromIntegral size, ()))
             let localDestPath = localRoot </> unPath dest
-            exists <- Dir.doesFileExist localDestPath
-            when exists $ Dir.removeFile localDestPath
+            destExists <- Dir.doesFileExist localDestPath
+            when destExists $ Dir.removeFile localDestPath
+            CopyProgress.incrementFilesComplete progress
         Delete filePath -> do
             let localPath = localRoot </> unPath filePath
             exists <- Dir.doesFileExist localPath
@@ -3933,13 +4159,14 @@ executePullCommand localRoot remote action = case action of
 {-# LANGUAGE OverloadedStrings #-}
 
 module Bit.Core.Verify
-    ( verify
+    ( VerifyTarget(..)
+    , verify
     , fsck
     ) where
 
-import qualified System.Directory as Dir
 import System.FilePath ((</>))
 import Control.Monad (when)
+import Data.Foldable (traverse_)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Reader (asks)
 import Control.Exception (finally)
@@ -3954,49 +4181,25 @@ import qualified Bit.Fsck as Fsck
 import Internal.Config (fetchedBundle)
 import Bit.Progress (reportProgress, clearProgress)
 
-import Bit.Core.Helpers (withRemote, printVerifyIssue)
+import qualified Bit.Device as Device
+import Bit.Core.Helpers (withRemote, printVerifyIssue, getRemoteTargetType)
+import Bit.Remote (Remote, remoteName, remoteUrl)
 
-verify :: Bool -> Concurrency -> BitM ()
-verify isRemote concurrency
-  | isRemote = withRemote $ \remote -> do
+-- | Whether to verify local working tree or remote.
+data VerifyTarget = VerifyLocal | VerifyRemote
+  deriving (Show, Eq)
+
+verify :: VerifyTarget -> Concurrency -> BitM ()
+verify target concurrency = case target of
+  VerifyRemote -> withRemote $ \remote -> do
       cwd <- asks envCwd
-      liftIO $ putStrLn "Fetching remote metadata..."
-      liftIO $ putStrLn "Scanning remote files..."
+      mTarget <- liftIO $ getRemoteTargetType cwd (remoteName remote)
+      let isFilesystem = maybe False Device.isFilesystemTarget mTarget
+      if isFilesystem
+        then verifyFilesystemRemote (remoteUrl remote) concurrency
+        else verifyCloudRemote cwd remote concurrency
 
-      remoteMeta <- liftIO $ Verify.loadMetadataFromBundle fetchedBundle
-      let fileCount = length remoteMeta
-
-      if fileCount > 5
-        then liftIO $ do
-          isTTY <- hIsTerminalDevice stderr
-          counter <- newIORef (0 :: Int)
-          let shouldShowProgress = isTTY
-
-          reporterThread <- if shouldShowProgress
-            then Just <$> forkIO (verifyProgressLoop counter fileCount)
-            else pure Nothing
-
-          (actualCount, issues) <- finally
-            (Verify.verifyRemote cwd remote (Just counter) concurrency)
-            (do
-              maybe (pure ()) killThread reporterThread
-              when shouldShowProgress clearProgress
-            )
-
-          if null issues
-            then putStrLn $ "[OK] All " ++ show actualCount ++ " files match metadata."
-            else do
-              mapM_ (printVerifyIssue (\s -> take 16 s ++ if length s > 16 then "..." else "")) issues
-              putStrLn $ "Checked " ++ show actualCount ++ " files. " ++ show (length issues) ++ " issues found."
-        else liftIO $ do
-          (actualCount, issues) <- Verify.verifyRemote cwd remote Nothing concurrency
-          if null issues
-            then putStrLn $ "[OK] All " ++ show actualCount ++ " files match metadata."
-            else do
-              mapM_ (printVerifyIssue (\s -> take 16 s ++ if length s > 16 then "..." else "")) issues
-              putStrLn $ "Checked " ++ show actualCount ++ " files. " ++ show (length issues) ++ " issues found."
-
-  | otherwise = do
+  VerifyLocal -> do
       cwd <- asks envCwd
       let indexDir = cwd </> ".bit/index"
       meta <- liftIO $ Verify.loadBinaryMetadata indexDir concurrency
@@ -4015,22 +4218,72 @@ verify isRemote concurrency
           (actualCount, issues) <- finally
             (Verify.verifyLocal cwd (Just counter) concurrency)
             (do
-              maybe (pure ()) killThread reporterThread
+              traverse_ killThread reporterThread
               when shouldShowProgress clearProgress
             )
 
           if null issues
             then putStrLn $ "[OK] All " ++ show actualCount ++ " files match metadata."
             else do
-              mapM_ (printVerifyIssue (\s -> take 16 s ++ if length s > 16 then "..." else "")) issues
+              mapM_ (printVerifyIssue truncateHash) issues
               putStrLn $ "Checked " ++ show actualCount ++ " files. " ++ show (length issues) ++ " issues found. Run 'bit status' for details."
         else liftIO $ do
           (actualCount, issues) <- Verify.verifyLocal cwd Nothing concurrency
           if null issues
             then putStrLn $ "[OK] All " ++ show actualCount ++ " files match metadata."
             else do
-              mapM_ (printVerifyIssue (\s -> take 16 s ++ if length s > 16 then "..." else "")) issues
+              mapM_ (printVerifyIssue truncateHash) issues
               putStrLn $ "Checked " ++ show actualCount ++ " files. " ++ show (length issues) ++ " issues found. Run 'bit status' for details."
+
+-- | Verify a filesystem remote by scanning its working directory.
+verifyFilesystemRemote :: FilePath -> Concurrency -> BitM ()
+verifyFilesystemRemote remotePath concurrency = liftIO $ do
+    putStrLn "Verifying remote files..."
+    (actualCount, issues) <- Verify.verifyLocalAt remotePath Nothing concurrency
+    if null issues
+      then putStrLn $ "[OK] All " ++ show actualCount ++ " files match metadata."
+      else do
+        mapM_ (printVerifyIssue truncateHash) issues
+        putStrLn $ "Checked " ++ show actualCount ++ " files. " ++ show (length issues) ++ " issues found."
+
+-- | Verify a cloud remote using the fetched bundle.
+verifyCloudRemote :: FilePath -> Remote -> Concurrency -> BitM ()
+verifyCloudRemote cwd remote concurrency = liftIO $ do
+    putStrLn "Fetching remote metadata..."
+    putStrLn "Scanning remote files..."
+
+    entries <- Verify.loadMetadataFromBundle fetchedBundle
+    let fileCount = length entries
+
+    if fileCount > 5
+      then do
+        isTTY <- hIsTerminalDevice stderr
+        counter <- newIORef (0 :: Int)
+        let shouldShowProgress = isTTY
+
+        reporterThread <- if shouldShowProgress
+          then Just <$> forkIO (verifyProgressLoop counter fileCount)
+          else pure Nothing
+
+        (actualCount, issues) <- finally
+          (Verify.verifyRemote cwd remote (Just counter) concurrency)
+          (do
+            traverse_ killThread reporterThread
+            when shouldShowProgress clearProgress
+          )
+
+        if null issues
+          then putStrLn $ "[OK] All " ++ show actualCount ++ " files match metadata."
+          else do
+            mapM_ (printVerifyIssue truncateHash) issues
+            putStrLn $ "Checked " ++ show actualCount ++ " files. " ++ show (length issues) ++ " issues found."
+      else do
+        (actualCount, issues) <- Verify.verifyRemote cwd remote Nothing concurrency
+        if null issues
+          then putStrLn $ "[OK] All " ++ show actualCount ++ " files match metadata."
+          else do
+            mapM_ (printVerifyIssue truncateHash) issues
+            putStrLn $ "Checked " ++ show actualCount ++ " files. " ++ show (length issues) ++ " issues found."
 
 verifyProgressLoop :: IORef Int -> Int -> IO ()
 verifyProgressLoop counter total = go
@@ -4042,7 +4295,11 @@ verifyProgressLoop counter total = go
       threadDelay 100000
       when (n < total) go
 
-fsck :: FilePath -> Concurrency -> IO ()
+-- | Truncate a hash string to 16 characters with ellipsis.
+truncateHash :: String -> String
+truncateHash s = take 16 s ++ if length s > 16 then "..." else ""
+
+fsck :: FilePath -> IO ()
 fsck = Fsck.doFsck
 
 ```
@@ -4091,9 +4348,11 @@ module Bit.Device
   , resolveRemoteTarget
   , parseRemoteTarget
   , generateStoreUuid
+    -- Predicates
+  , isFilesystemTarget
   ) where
 
-import Data.List (isPrefixOf, intercalate)
+import Data.List (dropWhileEnd, isPrefixOf, intercalate)
 import Data.Maybe (fromMaybe, listToMaybe)
 import Control.Monad (when, filterM, join)
 import Data.Time (getCurrentTime, formatTime, defaultTimeLocale)
@@ -4138,6 +4397,12 @@ data RemoteTarget
   | TargetLocalPath FilePath     -- Legacy: path when .bit-store at volume root cannot be created
   deriving (Show, Eq)
 
+-- | True for targets that resolve to a local filesystem path (device or direct path).
+isFilesystemTarget :: RemoteTarget -> Bool
+isFilesystemTarget (TargetDevice _ _) = True
+isFilesystemTarget (TargetLocalPath _) = True
+isFilesystemTarget (TargetCloud _) = False
+
 data ResolveResult
   = Resolved FilePath     -- Runtime path (e.g. E:\Backup)
   | NotConnected String   -- Device not found
@@ -4164,13 +4429,14 @@ classifyRemotePath path = do
 getRcloneRemotes :: IO [String]
 getRcloneRemotes = do
   (code, out, _) <- readProcessWithExitCode "rclone" ["listremotes"] ""
-  if code /= ExitSuccess then pure []
-  else pure
-    [ takeWhile (/= ':') (takeWhile (/= '\n') line)
-    | line <- lines out
-    , not (null (trimLine line))
-    ]
-  where trimLine = reverse . dropWhile (== ' ') . reverse . dropWhile (== ' ')
+  pure $ case code of
+    ExitSuccess ->
+      [ takeWhile (/= ':') (takeWhile (/= '\n') line)
+      | line <- lines out
+      , not (null (trimLine line))
+      ]
+    _ -> []
+  where trimLine = dropWhileEnd (== ' ') . dropWhile (== ' ')
 
 -- ---------------------------------------------------------------------------
 -- Volume operations (platform-specific)
@@ -4204,9 +4470,9 @@ winVolumeRoot p
 linuxVolumeRootIO :: FilePath -> IO FilePath
 linuxVolumeRootIO path = do
   (code, out, _) <- readProcessWithExitCode "sh" ["-c", "findmnt -n -o TARGET -T " ++ shellEscape path ++ " 2>/dev/null || echo " ++ shellEscape path] ""
-  if code == ExitSuccess && not (null (trim out))
-    then pure (trim out)
-    else pure path
+  pure $ case code of
+    ExitSuccess | not (null (trim out)) -> trim out
+    _ -> path
   where
     shellEscape s = "'" ++ concatMap (\c -> if c == '\'' then "'\\''" else [c]) s ++ "'"
 
@@ -4254,24 +4520,25 @@ detectStorageTypeWindows volRoot = do
         "try { (Get-PSDrive -Name " ++ [d] ++ " -ErrorAction SilentlyContinue).Root } catch { '' }"] ""
       (code2, out2, _) <- readProcessWithExitCode "powershell" ["-NoProfile", "-Command",
         "[int]([System.IO.DriveInfo]::new('" ++ drive ++ "').DriveType)"] ""
-      if code2 == ExitSuccess
-        then case trim out2 of
-          "4" -> pure Network  -- DriveType.Network
-          _   -> pure Physical
-        else pure Physical
+      pure $ case code2 of
+        ExitSuccess -> case trim out2 of
+          "4" -> Network  -- DriveType.Network
+          _   -> Physical
+        _ -> Physical
 
 detectStorageTypeLinux :: FilePath -> IO StorageType
 detectStorageTypeLinux _ = do
   -- Read /proc/mounts and check mount type for the path's mount point
   (code, out, _) <- readProcessWithExitCode "findmnt" ["-n", "-o", "FSTYPE", "-T", "/"] ""
-  if code == ExitSuccess
-    then let fstype = trim out
-         in pure $ if fstype `elem` ["nfs", "nfs4", "cifs", "smb", "smbfs", "sshfs"]
-                    then Network else Physical
-    else pure Physical
+  pure $ case code of
+    ExitSuccess ->
+      let fstype = trim out
+      in if fstype `elem` ["nfs", "nfs4", "cifs", "smb", "smbfs", "sshfs"]
+            then Network else Physical
+    _ -> Physical
 
 trim :: String -> String
-trim = reverse . dropWhile (== ' ') . reverse . dropWhile (== ' ')
+trim = dropWhileEnd (== ' ') . dropWhile (== ' ')
 
 -- | Get hardware serial for a physical volume
 getHardwareSerial :: FilePath -> IO (Maybe String)
@@ -4286,22 +4553,23 @@ getHardwareSerialWindows volRoot = do
   else do
     -- Map partition to physical disk via partition number, then get disk serial
     (code, out, _) <- readProcessWithExitCode "wmic" ["diskdrive", "get", "SerialNumber,Index"] ""
-    if code /= ExitSuccess then pure Nothing
-    else do
-      (_code2, _out2, _) <- readProcessWithExitCode "wmic" ["path", "win32_logicaldisk", "where", "DeviceID='" ++ drive ++ ":\\'", "get", "VolumeSerialNumber"] ""
-      -- VolumeSerialNumber is the FAT/NTFS serial, not disk serial. Use diskdrive.
-      let lines' = filter (not . null . trim) (lines out)
-          parseSerial = case lines' of
-            _:rest -> listToMaybe [ trim (drop 12 l) | l <- rest, length l > 12 ]
-            _      -> Nothing
-      pure (parseSerial)
+    case code of
+      ExitSuccess -> do
+        (_code2, _out2, _) <- readProcessWithExitCode "wmic" ["path", "win32_logicaldisk", "where", "DeviceID='" ++ drive ++ ":\\'", "get", "VolumeSerialNumber"] ""
+        -- VolumeSerialNumber is the FAT/NTFS serial, not disk serial. Use diskdrive.
+        let lines' = filter (not . null . trim) (lines out)
+            parseSerial = case lines' of
+              _:rest -> listToMaybe [ trim (drop 12 l) | l <- rest, length l > 12 ]
+              _      -> Nothing
+        pure parseSerial
+      _ -> pure Nothing
 
 getHardwareSerialLinux :: FilePath -> IO (Maybe String)
 getHardwareSerialLinux _ = do
   (code, out, _) <- readProcessWithExitCode "sh" ["-c", "lsblk -o SERIAL,MOUNTPOINT -n 2>/dev/null | head -20"] ""
-  if code == ExitSuccess
-    then pure (listToMaybe [ trim (takeWhile (/= ' ') l) | l <- lines out, "/" `isPrefixOf` (drop 20 l) ])
-    else pure Nothing
+  pure $ case code of
+    ExitSuccess -> listToMaybe [ trim (takeWhile (/= ' ') l) | l <- lines out, "/" `isPrefixOf` (drop 20 l) ]
+    _ -> Nothing
 
 -- | Get volume label for device name suggestion
 getVolumeLabel :: FilePath -> IO (Maybe String)
@@ -4316,20 +4584,21 @@ getVolumeLabelWindows volRoot = do
   else do
     -- vol is a cmd built-in, not an executable; run via cmd /c
     (code, out, _) <- readProcessWithExitCode "cmd" ["/c", "vol", drive] ""
-    if code /= ExitSuccess then pure Nothing
-    else
-      let lines' = lines out
-          volLine = listToMaybe [ l | l <- lines', "Volume" `isPrefixOf` l ]
-      in pure $ case volLine of
-        Just l -> let after = dropWhile (/= ' ') (drop 6 l) in Just (trim after)
-        _      -> Nothing
+    pure $ case code of
+      ExitSuccess ->
+        let lines' = lines out
+            volLine = listToMaybe [ l | l <- lines', "Volume" `isPrefixOf` l ]
+        in case volLine of
+          Just l -> let after = dropWhile (/= ' ') (drop 6 l) in Just (trim after)
+          _      -> Nothing
+      _ -> Nothing
 
 getVolumeLabelLinux :: FilePath -> IO (Maybe String)
 getVolumeLabelLinux _ = do
   (code, out, _) <- readProcessWithExitCode "sh" ["-c", "lsblk -o LABEL,MOUNTPOINT -n 2>/dev/null | head -5"] ""
-  if code == ExitSuccess
-    then pure (listToMaybe [ trim (takeWhile (/= ' ') l) | l <- lines out, not (null (trim l)) ])
-    else pure Nothing
+  pure $ case code of
+    ExitSuccess -> listToMaybe [ trim (takeWhile (/= ' ') l) | l <- lines out, not (null (trim l)) ]
+    _ -> Nothing
 
 -- ---------------------------------------------------------------------------
 -- .bit-store (on device at volume root)
@@ -4346,9 +4615,7 @@ readBitStore volumeRoot = do
   else do
     -- Use strict ByteString reading to avoid Windows file locking issues
     bs <- BS.readFile storePath
-    let content = case decodeUtf8' bs of
-          Left _ -> ""
-          Right txt -> T.unpack txt
+    let content = either (const "") T.unpack (decodeUtf8' bs)
     pure (parseBitStoreUuid content)
 
 parseBitStoreUuid :: String -> Maybe UUID
@@ -4400,9 +4667,7 @@ readDeviceFile repoRoot deviceName = do
   else do
     -- Use strict ByteString reading to avoid Windows file locking issues
     bs <- BS.readFile path
-    let content = case decodeUtf8' bs of
-          Left _ -> ""
-          Right txt -> T.unpack txt
+    let content = either (const "") T.unpack (decodeUtf8' bs)
     pure (parseDeviceFile content)
 
 writeDeviceFile :: FilePath -> String -> DeviceInfo -> IO ()
@@ -4460,9 +4725,7 @@ readRemoteFile repoRoot remoteName = do
   else do
     -- Use strict ByteString reading to avoid Windows file locking issues
     bs <- BS.readFile path
-    let content = case decodeUtf8' bs of
-          Left _ -> ""
-          Right txt -> T.unpack txt
+    let content = either (const "") T.unpack (decodeUtf8' bs)
     let raw = parseRemoteFile content
     case raw of
       Nothing -> pure Nothing
@@ -4470,9 +4733,8 @@ readRemoteFile repoRoot remoteName = do
       Just (ParsedCloud url) -> pure (Just (TargetCloud url))
       Just (ParsedDevice device relPath) -> do
         mDev <- readDeviceFile repoRoot device
-        pure $ Just $ case mDev of
-          Just _ -> TargetDevice device relPath
-          Nothing -> TargetCloud (device ++ ":" ++ relPath)
+        pure $ Just $ maybe (TargetCloud (device ++ ":" ++ relPath))
+          (const $ TargetDevice device relPath) mDev
 
 writeRemoteFile :: FilePath -> String -> RemoteTarget -> IO ()
 writeRemoteFile repoRoot remoteName target = do
@@ -4500,15 +4762,13 @@ resolveRemoteTarget _repoRoot (TargetCloud url) = pure (Resolved url)
 resolveRemoteTarget _repoRoot (TargetLocalPath p) = pure (Resolved p)
 resolveRemoteTarget repoRoot (TargetDevice deviceName relPath) = do
   mInfo <- readDeviceFile repoRoot deviceName
-  case mInfo of
-    Nothing -> pure (NotConnected ("Device '" ++ deviceName ++ "' not found in .rgit/devices/"))
-    Just info -> do
+  maybe (pure (NotConnected ("Device '" ++ deviceName ++ "' not found in .rgit/devices/")))
+    (\info -> do
       mMount <- resolveDevice info
-      case mMount of
-        Nothing -> pure (NotConnected ("Device '" ++ deviceName ++ "' is not connected"))
-        Just mountRoot -> do
-          let fullPath = mountRoot </> relPath
-          pure (Resolved fullPath)
+      maybe (pure (NotConnected ("Device '" ++ deviceName ++ "' is not connected")))
+        (\mountRoot -> pure (Resolved (mountRoot </> relPath)))
+        mMount
+    ) mInfo
 
 -- | Search for a device and return its volume root if found
 resolveDevice :: DeviceInfo -> IO (Maybe FilePath)
@@ -4548,36 +4808,39 @@ getLinuxMountPoints :: (String -> Bool) -> IO [FilePath]
 getLinuxMountPoints _typeFilter = do
   -- Parse /proc/mounts for mount points; full impl would filter by fstype
   (code, out, _) <- readProcessWithExitCode "sh" ["-c", "awk '{print $2}' /proc/mounts 2>/dev/null | sort -u"] ""
-  if code /= ExitSuccess then pure ["/"]
-  else pure (filter (not . null) (lines out))
+  pure $ case code of
+    ExitSuccess -> filter (not . null) (lines out)
+    _ -> ["/"]
 
 getWindowsPhysicalMounts :: IO [FilePath]
 getWindowsPhysicalMounts = do
   (code, out, _) <- readProcessWithExitCode "wmic" ["logicaldisk", "where", "DriveType=2 or DriveType=3", "get", "DeviceID"] ""
-  if code /= ExitSuccess then pure []
-  else pure
-    [ trim l ++ "\\"
-    | l <- lines out
-    , let t = trim l
-    , length t == 2
-    , case reverse t of
-        (':':_) -> True
-        _ -> False
-    ]
+  pure $ case code of
+    ExitSuccess ->
+      [ trim l ++ "\\"
+      | l <- lines out
+      , let t = trim l
+      , length t == 2
+      , case reverse t of
+          (':':_) -> True
+          _ -> False
+      ]
+    _ -> []
 
 getWindowsNetworkMounts :: IO [FilePath]
 getWindowsNetworkMounts = do
   (code, out, _) <- readProcessWithExitCode "wmic" ["logicaldisk", "where", "DriveType=4", "get", "DeviceID"] ""
-  if code /= ExitSuccess then pure []
-  else pure
-    [ trim l ++ "\\"
-    | l <- lines out
-    , let t = trim l
-    , length t == 2
-    , case reverse t of
-        (':':_) -> True
-        _ -> False
-    ]
+  pure $ case code of
+    ExitSuccess ->
+      [ trim l ++ "\\"
+      | l <- lines out
+      , let t = trim l
+      , length t == 2
+      , case reverse t of
+          (':':_) -> True
+          _ -> False
+      ]
+    _ -> []
 ```
 
 ---
@@ -4590,6 +4853,7 @@ getWindowsNetworkMounts = do
 
 ```haskell
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
 
 -- | Device name acquisition for filesystem remotes.
 -- Supports injectable I/O for testing the interactive path.
@@ -4669,11 +4933,9 @@ acquireDeviceNameAuto
 acquireDeviceNameAuto mLabel nameExists = do
   isTTY <- hIsTerminalDevice stdin
   useStdin <- (== Just "1") <$> lookupEnv "BIT_USE_STDIN"
-  let src = if isTTY
-            then Interactive getLine
-            else if useStdin
-                 then Interactive getLine  -- For tests: pipe input to stdin
-                 else NonInteractive
+  let src = if | isTTY    -> Interactive getLine
+               | useStdin -> Interactive getLine  -- For tests: pipe input to stdin
+               | otherwise -> NonInteractive
   acquireDeviceName src mLabel nameExists
 ```
 
@@ -4701,7 +4963,6 @@ module Bit.Diff
 
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-import Data.Maybe (listToMaybe)
 import Bit.Types
 
 -- Lightweight identity for planning
@@ -4769,8 +5030,8 @@ computeDiff local remote =
     modified =
       [ Modified (LightFileEntry p lHash)
       | p <- Set.toList (Set.intersection lFilePaths rFilePaths)
-      , let lHash = lFiles Map.! p
-      , let rHash = rFiles Map.! p
+      , Just lHash <- [Map.lookup p lFiles]
+      , Just rHash <- [Map.lookup p rFiles]
       , lHash /= rHash
       ]
 
@@ -4797,7 +5058,7 @@ computeDiff local remote =
       , oldPath <- Set.toList oldPathSet
       , let localPathsWithHash = Set.filter (/= oldPath) (Map.findWithDefault Set.empty hash local.byHash)
       , Set.size localPathsWithHash == 1
-      , newPath <- maybe [] (:[]) (listToMaybe (Set.toList localPathsWithHash))
+      , newPath <- take 1 (Set.toList localPathsWithHash)
       , Map.member newPath lFiles
       ]
 
@@ -4830,6 +5091,7 @@ import Control.Monad.Free (Free(..))
 import Control.Monad.State (State, runState, get, put, modify)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
+import Data.Foldable (traverse_)
 import qualified Data.Map as Map
 import Bit.Effect
 import System.Exit (ExitCode(..))
@@ -4893,9 +5155,8 @@ interpretPure (Free f) = case f of
   CopyFileE src dest next -> do
     trace (TCopy src dest)
     env <- get
-    case Map.lookup src (pureFiles env) of
-      Just content -> modify (\e -> e { pureFiles = Map.insert dest content (pureFiles e) })
-      Nothing -> pure ()
+    traverse_ (\content -> modify (\e -> e { pureFiles = Map.insert dest content (pureFiles e) }))
+      (Map.lookup src (pureFiles env))
     interpretPure next
   FileExistsE path k -> do
     env <- get
@@ -4959,106 +5220,24 @@ interpretPure (Free f) = case f of
 *Source file.*
 
 ```haskell
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE OverloadedStrings #-}
-
 module Bit.Fsck
   ( doFsck
   ) where
 
-import qualified Bit.Verify as Verify
-import qualified Bit.Utils as Utils
 import qualified Internal.Git as Git
-import Bit.Types (unPath)
-import Bit.Concurrency (Concurrency(..))
-import System.FilePath ((</>))
 import System.Exit (ExitCode(..), exitWith)
-import Control.Monad (when, unless)
-import System.IO (hPutStr, hPutStrLn, hFlush, hSetBuffering, BufferMode(..), stderr, hIsTerminalDevice)
-import Data.IORef (newIORef, readIORef, IORef)
-import Control.Concurrent (forkIO, threadDelay, killThread)
-import Control.Exception (finally)
-import Bit.Progress (reportProgress, clearProgress)
+import System.IO (hPutStr, stderr)
+import Control.Monad (unless)
 
--- | Run local-only integrity check in the spirit of git fsck: no network.
--- [1/2] Local working tree vs local metadata (rgit equivalent of checking objects).
--- [2/2] git fsck on .rgit/index/.git (metadata history integrity).
--- Prints one line per problem (git-style: "missing <path>", "hash mismatch <path>")
--- and passes through git fsck output. Exits 1 if any check finds issues.
-doFsck :: FilePath -> Concurrency -> IO ()
-doFsck cwd concurrency = do
-  hSetBuffering stderr NoBuffering
-  
-  -- [1/2] Working tree vs local metadata
-  -- Get file count first
-  let indexDir = cwd </> ".bit/index"
-  meta <- Verify.loadBinaryMetadata indexDir concurrency
-  let fileCount = length meta
-  
-  -- Run verification with progress if enough files
-  (actualCount, localIssues) <- if fileCount > 5
-    then do
-      isTTY <- hIsTerminalDevice stderr
-      counter <- newIORef (0 :: Int)
-      let shouldShowProgress = isTTY
-      
-      -- Start progress reporter thread if in TTY
-      reporterThread <- if shouldShowProgress
-        then Just <$> forkIO (fsckProgressLoop counter fileCount)
-        else pure Nothing
-      
-      -- Run verification with progress
-      result <- finally
-        (Verify.verifyLocal cwd (Just counter) concurrency)
-        (do
-          -- Clean up: kill reporter thread and clear line
-          maybe (pure ()) killThread reporterThread
-          when shouldShowProgress clearProgress
-        )
-      pure result
-    else
-      -- Few files, no progress needed
-      Verify.verifyLocal cwd Nothing concurrency
-  
-  let localOk = null localIssues
-  if localOk
-    then hPutStrLn stderr $ "[1/2] Checked " ++ show actualCount ++ " files. OK."
-    else do
-      hPutStrLn stderr $ "[1/2] Checked " ++ show actualCount ++ " files. Issues found:"
-      mapM_ (printIssue Utils.toPosix) localIssues
-      hFlush stderr
-
-  -- [2/2] Metadata history (git fsck in .rgit/index/.git)
-  hPutStrLn stderr "[2/2] Checking metadata history..."
-  (gitCode, gitOut, gitErr) <- Git.fsck
-  let gitOk = gitCode == ExitSuccess
-  if gitOk
-    then hPutStrLn stderr "[2/2] Metadata history OK."
-    else do
-      putStr gitOut
-      hPutStr stderr gitErr
-
-  unless (localOk && gitOk) $
+-- | Run git fsck on the internal metadata repository (.bit/index).
+-- Passes through git's output and exit code.
+doFsck :: FilePath -> IO ()
+doFsck _cwd = do
+  (code, out, err) <- Git.fsck
+  putStr out
+  hPutStr stderr err
+  unless (code == ExitSuccess) $
     exitWith (ExitFailure 1)
-
-  where
-    printIssue :: (FilePath -> FilePath) -> Verify.VerifyIssue -> IO ()
-    printIssue toP = \case
-      Verify.HashMismatch path _ _ _ _ ->
-        hPutStrLn stderr $ "hash mismatch " ++ toP (unPath path)
-      Verify.Missing path ->
-        hPutStrLn stderr $ "missing " ++ toP (unPath path)
-    
-    -- Progress reporter loop for fsck operation
-    fsckProgressLoop :: IORef Int -> Int -> IO ()
-    fsckProgressLoop counter total = go
-      where
-        go = do
-          n <- readIORef counter
-          let pct = (n * 100) `div` max 1 total
-          reportProgress $ "[1/2] Checking working tree: " ++ show n ++ "/" ++ show total ++ " (" ++ show pct ++ "%)"
-          threadDelay 100000  -- 100ms
-          when (n < total) go
 ```
 
 ---
@@ -5091,7 +5270,7 @@ import Bit.Types (Hash(..), HashAlgo(..), hashToText)
 import System.Directory (doesFileExist, doesDirectoryExist, listDirectory)
 import System.FilePath ((</>))
 import System.IO (withFile, IOMode(ReadMode), hIsEOF)
-import Data.List (isPrefixOf, isInfixOf)
+import Data.List (dropWhileEnd, isPrefixOf, isInfixOf)
 import Data.Maybe (listToMaybe)
 import Control.Monad (filterM)
 import qualified Data.ByteString as BS
@@ -5136,12 +5315,12 @@ parseMetadata content = do
     cleanHash s
       | "Hash \"" `isPrefixOf` s =
           let rest = drop (length ("Hash \"" :: String)) s
-          in if not (null rest) && last rest == '"' then init rest else rest
+          in dropWhileEnd (== '"') rest
       | ('"':rest) <- s = case reverse rest of
           ('"':middle) -> reverse middle
           _ -> s
       | otherwise = s
-    trim = dropWhile isSpaceChar . reverse . dropWhile isSpaceChar . reverse
+    trim = dropWhileEnd isSpaceChar . dropWhile isSpaceChar
     isSpaceChar c = c == ' ' || c == '\t'
     readMaybeInt s = case reads s of
       [(n, "")] -> Just n
@@ -5156,9 +5335,7 @@ parseMetadataFile fp = do
     then pure Nothing
     else do
       bs <- BS.readFile fp
-      case decodeUtf8' bs of
-        Left _ -> pure Nothing  -- Binary file, not valid metadata
-        Right txt -> pure (parseMetadata (T.unpack txt))
+      pure $ either (const Nothing) (parseMetadata . T.unpack) (decodeUtf8' bs)
 
 -- | Read a metadata file OR (if it's a text file whose content is stored directly)
 -- compute hash/size from the file bytes. This is the replacement for the fallback
@@ -5221,9 +5398,7 @@ conflictMarkers = ["<<<<<<<", "=======", ">>>>>>>"]
 hasConflictMarkers :: FilePath -> IO Bool
 hasConflictMarkers path = do
   bs <- BS.readFile path
-  case decodeUtf8' bs of
-    Left _ -> pure False  -- Binary file, no conflict markers possible
-    Right txt -> pure $ any (`isInfixOf` T.unpack txt) conflictMarkers
+  pure $ either (const False) (\txt -> any (`isInfixOf` T.unpack txt) conflictMarkers) (decodeUtf8' bs)
 
 listAllFiles :: FilePath -> IO [FilePath]
 listAllFiles dir = do
@@ -5369,6 +5544,7 @@ module Bit.Process
   ) where
 
 import Prelude (FilePath, IO, String, Maybe(..), Either(..), ($), pure, error)
+import Data.Foldable (traverse_)
 import Control.Concurrent.Async (async, wait)
 import Control.Exception (bracket, try, SomeException)
 import Control.Monad (void)
@@ -5441,18 +5617,10 @@ readProcessStrict cmd args = do
     cleanupProcess (mStdin, mStdout, _mStderr, ph) = do
       -- Try to close any handles that are still open
       -- (BS.hGetContents closes the handle, but we need cleanup for stdin)
-      case mStdin of
-        Just h -> void (try (hClose h) :: IO (Either SomeException ()))
-        Nothing -> pure ()
-      
-      case mStdout of
-        Just h -> void (try (hClose h) :: IO (Either SomeException ()))
-        Nothing -> pure ()
-      
-      case _mStderr of
-        Just h -> void (try (hClose h) :: IO (Either SomeException ()))
-        Nothing -> pure ()
-      
+      let tryClose h = void (try (hClose h) :: IO (Either SomeException ()))
+      traverse_ tryClose mStdin
+      traverse_ tryClose mStdout
+      traverse_ tryClose _mStderr
       -- Ensure process is cleaned up
       void (try (waitForProcess ph) :: IO (Either SomeException ExitCode))
 
@@ -5500,14 +5668,9 @@ readProcessStrictWithStderr cmd args = do
   where
     cleanupProcess (mStdin, mStdout, _mStderr, ph) = do
       -- Try to close any handles that are still open
-      case mStdin of
-        Just h -> void (try (hClose h) :: IO (Either SomeException ()))
-        Nothing -> pure ()
-      
-      case mStdout of
-        Just h -> void (try (hClose h) :: IO (Either SomeException ()))
-        Nothing -> pure ()
-      
+      let tryClose h = void (try (hClose h) :: IO (Either SomeException ()))
+      traverse_ tryClose mStdin
+      traverse_ tryClose mStdout
       -- Ensure process is cleaned up
       void (try (waitForProcess ph) :: IO (Either SomeException ExitCode))
 ```
@@ -5700,44 +5863,173 @@ data FetchResult
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module Bit.RemoteWorkspace
-  ( RemoteWorkspace(..)
-  , initRemoteWorkspace
-  , remoteWorkspacePath
+  ( initRemote
+  , addRemote
+  , commitRemote
+  , statusRemote
+  , logRemote
+  , lsFilesRemote
   ) where
 
 import Bit.Types (FileEntry(..), EntryKind(..), ContentType(..), Path(..))
-import Bit.Remote (Remote, remoteUrl)
+import Bit.Remote (Remote)
 import qualified Bit.Remote.Scan as Remote.Scan
 import Bit.Scan (hashAndClassifyFile, binaryExtensions)
 import qualified Internal.ConfigFile as ConfigFile
 import Internal.ConfigFile (TextConfig)
 import qualified Internal.Transport as Transport
-import Bit.Utils (isBitPath, atomicWriteFileStr)
+import Bit.Utils (isBitPath, atomicWriteFileStr, trimGitOutput)
 import Bit.Internal.Metadata (MetaContent(..), serializeMetadata)
 import System.FilePath ((</>), takeExtension, takeDirectory)
-import System.Directory 
-    ( doesDirectoryExist
-    , createDirectoryIfMissing
+import System.Directory
+    ( createDirectoryIfMissing
+    , doesDirectoryExist
     , getTemporaryDirectory
+    , listDirectory
     , removeDirectoryRecursive
+    , removeFile
     )
 import System.Exit (ExitCode(..), exitWith)
-import System.IO (hPutStrLn, stderr)
-import System.Process (callProcess)
-import Control.Monad (when, forM, forM_)
+import System.IO (hPutStrLn, stderr, stdout, hFlush)
+import qualified Internal.Git as Git
+import Control.Monad (when, unless, forM, forM_, void)
 import Data.Char (toLower)
 import Data.List (partition)
-import Control.Exception (catch, SomeException)
+import Control.Exception (SomeException, bracket, catch)
 
--- | A remote workspace contains metadata and git repo for a remote
-data RemoteWorkspace = RemoteWorkspace
-  { wsPath :: FilePath
-  , wsRemote :: Remote
-  } deriving (Show)
+----------------------------------------------------------------------
+-- Temp directory management
+----------------------------------------------------------------------
 
--- | Path to the remote workspace for a given remote name
-remoteWorkspacePath :: FilePath -> String -> FilePath
-remoteWorkspacePath cwd remName = cwd </> ".bit" </> "remote-workspaces" </> remName
+-- | Create a temp directory and run an action in it.
+-- Cleans up any leftover from a previous run, then cleans up on exit.
+-- Exception-safe via bracket.
+withTempDir :: String -> (FilePath -> IO a) -> IO a
+withTempDir name action = bracket setup cleanup action
+  where
+    setup = do
+        sysTemp <- getTemporaryDirectory
+        let dir = sysTemp </> name
+        -- Remove leftover from a previous run (e.g. if cleanup failed)
+        removeDirectoryRecursive dir `catch` \(_ :: SomeException) -> pure ()
+        createDirectoryIfMissing True dir
+        pure dir
+    cleanup dir =
+        removeDirectoryRecursive dir `catch` \(_ :: SomeException) -> pure ()
+
+----------------------------------------------------------------------
+-- Git helpers
+----------------------------------------------------------------------
+
+-- | Run a git command at a given path; exit with error on failure.
+runOrDie :: FilePath -> [String] -> String -> IO ()
+runOrDie dir args desc = do
+    (code, _, err) <- Git.runGitAt dir args
+    when (code /= ExitSuccess) $ do
+        hPutStrLn stderr $ "fatal: failed to " ++ desc ++ "."
+        unless (null err) $ hPutStrLn stderr err
+        exitWith (ExitFailure 1)
+
+----------------------------------------------------------------------
+-- Bundle operations
+----------------------------------------------------------------------
+
+-- | Inflate a git bundle into a workspace directory.
+-- Uses init + fetch into tracking refs + checkout to avoid:
+--   1. "refusing to fetch into checked out branch" (init+fetch into heads)
+--   2. "directory already exists" on Windows (git clone)
+inflateBundle :: FilePath -> FilePath -> IO ()
+inflateBundle bundlePath wsPath = do
+    createDirectoryIfMissing True wsPath
+    runOrDie wsPath ["init", "--initial-branch=main"] "initialize workspace"
+    void $ Git.runGitAt wsPath ["config", "core.quotePath", "false"]
+    -- Fetch into remote tracking refs (not refs/heads/*) to avoid conflict
+    -- with the checked-out main branch
+    runOrDie wsPath ["fetch", bundlePath, "+refs/heads/*:refs/remotes/bundle/*"] "fetch from bundle"
+    -- Use reset --hard to update the branch pointer, index, AND working tree.
+    -- (checkout -B can skip the working tree update when already on the same branch)
+    runOrDie wsPath ["reset", "--hard", "refs/remotes/bundle/main"] "checkout main branch"
+
+-- | Create a bundle from workspace and push to remote.
+bundleAndPush :: FilePath -> Remote -> FilePath -> IO ()
+bundleAndPush wsPath remote tmpBase = do
+    let newBundle = tmpBase </> "new.bundle"
+    putStrLn "Creating metadata bundle..."
+    (bCode, _, _) <- Git.runGitAt wsPath ["bundle", "create", newBundle, "--all"]
+    when (bCode /= ExitSuccess) $ do
+        hPutStrLn stderr "fatal: failed to create bundle."
+        exitWith (ExitFailure 1)
+    putStrLn "Pushing bundle to remote..."
+    pCode <- Transport.copyToRemote newBundle remote ".bit/bit.bundle"
+    when (pCode /= ExitSuccess) $ do
+        hPutStrLn stderr "fatal: failed to push bundle to remote."
+        exitWith (ExitFailure 1)
+    putStrLn "Changes pushed to remote."
+
+----------------------------------------------------------------------
+-- Ephemeral workspace patterns
+----------------------------------------------------------------------
+
+-- | Run an action in an ephemeral workspace inflated from the remote's bundle.
+-- After the action succeeds and HEAD has changed, re-bundles and pushes.
+-- Workspace is cleaned up on exit (exception-safe).
+withRemoteWorkspace :: Remote -> (FilePath -> IO ExitCode) -> IO ExitCode
+withRemoteWorkspace remote action = withTempDir "bit-remote-ws" $ \tmpBase -> do
+    let bundlePath = tmpBase </> "bit.bundle"
+        wsPath = tmpBase </> "workspace"
+    result <- Transport.copyFromRemoteDetailed remote ".bit/bit.bundle" bundlePath
+    case result of
+        Transport.CopyNotFound -> do
+            hPutStrLn stderr "fatal: no bit repository on remote. Run 'bit @remote init' first."
+            pure (ExitFailure 1)
+        Transport.CopyNetworkError err -> do
+            hPutStrLn stderr $ "fatal: network error: " ++ err
+            pure (ExitFailure 1)
+        Transport.CopyOtherError err -> do
+            hPutStrLn stderr $ "fatal: " ++ err
+            pure (ExitFailure 1)
+        Transport.CopySuccess -> do
+            inflateBundle bundlePath wsPath
+            -- Capture HEAD before action
+            (_, oldHeadRaw, _) <- Git.runGitAt wsPath ["rev-parse", "HEAD"]
+            let oldHead = trimGitOutput oldHeadRaw
+            -- Run action
+            code <- action wsPath
+            case code of
+                ExitSuccess -> do
+                    (_, newHeadRaw, _) <- Git.runGitAt wsPath ["rev-parse", "HEAD"]
+                    let newHead = trimGitOutput newHeadRaw
+                    if oldHead == newHead
+                        then pure ExitSuccess
+                        else do
+                            bundleAndPush wsPath remote tmpBase
+                            pure ExitSuccess
+                _ -> pure code
+
+-- | Read-only: fetches and inflates but never pushes back.
+-- Workspace is cleaned up on exit (exception-safe).
+withRemoteWorkspaceReadOnly :: Remote -> (FilePath -> IO ExitCode) -> IO ExitCode
+withRemoteWorkspaceReadOnly remote action = withTempDir "bit-remote-ro" $ \tmpBase -> do
+    let bundlePath = tmpBase </> "bit.bundle"
+        wsPath = tmpBase </> "workspace"
+    result <- Transport.copyFromRemoteDetailed remote ".bit/bit.bundle" bundlePath
+    case result of
+        Transport.CopyNotFound -> do
+            hPutStrLn stderr "fatal: no bit repository on remote. Run 'bit @remote init' first."
+            pure (ExitFailure 1)
+        Transport.CopyNetworkError err -> do
+            hPutStrLn stderr $ "fatal: network error: " ++ err
+            pure (ExitFailure 1)
+        Transport.CopyOtherError err -> do
+            hPutStrLn stderr $ "fatal: " ++ err
+            pure (ExitFailure 1)
+        Transport.CopySuccess -> do
+            inflateBundle bundlePath wsPath
+            action wsPath
+
+----------------------------------------------------------------------
+-- File classification (preserved from old implementation)
+----------------------------------------------------------------------
 
 -- | Partition remote files into definitely-binary and text-candidates.
 -- A file is definitely binary if:
@@ -5751,126 +6043,225 @@ partitionFiles config = partition isBinary
         File{fSize} ->
             fSize >= ConfigFile.textSizeLimit config
             || map toLower (takeExtension (unPath (path fe))) `elem` binaryExtensions
-        _ -> True  -- directories are not text candidates
+        _ -> True
 
--- | Download text candidate files from remote, classify them, return updated FileEntries.
-classifyRemoteTextCandidates :: Remote -> TextConfig -> [FileEntry] -> IO [FileEntry]
-classifyRemoteTextCandidates remote config candidates = do
-    -- Create temp directory for downloads
+-- | Download text candidate files from remote, classify them.
+classifyTextCandidates :: Remote -> TextConfig -> [FileEntry] -> IO [FileEntry]
+classifyTextCandidates remote config candidates = do
     tempDir <- getTemporaryDirectory >>= \t -> do
         let d = t </> "bit-classify-remote"
         createDirectoryIfMissing True d
         pure d
-
-    -- Download and classify each candidate file
     classifiedEntries <- forM candidates $ \fe -> do
-        let remotePath = path fe  -- Already normalized by rclone
+        let remotePath = path fe
         let localPath = tempDir </> unPath (path fe)
         createDirectoryIfMissing True (takeDirectory localPath)
-
-        -- Download via rclone
         code <- Transport.copyFromRemote remote (unPath remotePath) localPath
         case code of
-            ExitSuccess -> do
-                -- Classify using existing function
+            ExitSuccess ->
                 case kind fe of
                     File{fSize} -> do
-                        (h, isText) <- hashAndClassifyFile localPath fSize config
-                        pure fe { kind = File { fHash = h, fSize = fSize, fContentType = if isText then TextContent else BinaryContent } }
+                        (h, contentType) <- hashAndClassifyFile localPath fSize config
+                        pure fe { kind = File { fHash = h, fSize = fSize, fContentType = contentType } }
                     _ -> pure fe
             _ -> do
-                -- Download failed — treat as binary, keep rclone hash
                 hPutStrLn stderr $ "Warning: Could not download " ++ unPath (path fe) ++ " for classification, treating as binary."
                 pure fe
-
-    -- Cleanup temp dir
     removeDirectoryRecursive tempDir `catch` (\(_ :: SomeException) -> pure ())
-
     pure classifiedEntries
 
--- | Initialize a remote workspace by scanning the remote and building metadata
-initRemoteWorkspace :: FilePath -> Remote -> String -> IO ()
-initRemoteWorkspace cwd remote remName = do
-    let wsPath = remoteWorkspacePath cwd remName
-    let wsGit = wsPath </> ".git"
+----------------------------------------------------------------------
+-- Workspace operations
+----------------------------------------------------------------------
 
-    -- Check if workspace already exists
-    exists <- doesDirectoryExist wsGit
-    when exists $ do
-        hPutStrLn stderr $ "Remote workspace '" ++ remName ++ "' already exists."
-        hPutStrLn stderr $ "Use 'bit @" ++ remName ++ " status' to see its state, or delete .bit/remote-workspaces/" ++ remName ++ "/ to start over."
-        exitWith (ExitFailure 1)
+-- | Remove all files from workspace (keeping .git directory).
+-- This ensures the workspace reflects the current remote state exactly,
+-- so git can detect additions, modifications, AND deletions correctly.
+clearWorkspace :: FilePath -> IO ()
+clearWorkspace wsPath = do
+    contents <- listDirectory wsPath
+    forM_ contents $ \item ->
+        when (item /= ".git") $ do
+            let itemPath = wsPath </> item
+            isDir <- doesDirectoryExist itemPath
+            if isDir
+                then removeDirectoryRecursive itemPath
+                else removeFile itemPath
 
-    putStrLn $ "Scanning remote '" ++ remName ++ "' (" ++ remoteUrl remote ++ ")..."
+-- | Write metadata files into workspace for all classified remote files.
+-- Text files: download actual content from remote.
+-- Binary files: write hash+size metadata.
+writeFilesToWorkspace :: FilePath -> Remote -> [FileEntry] -> IO ()
+writeFilesToWorkspace wsPath remote allFiles = do
+    let (textFiles, binaryFiles) = partition isTextFile allFiles
+    -- Download text file content from remote
+    unless (null textFiles) $ do
+        putStrLn $ "Downloading " ++ show (length textFiles) ++ " text files..."
+        forM_ textFiles $ \fe -> do
+            let localPath = wsPath </> unPath (path fe)
+            createDirectoryIfMissing True (takeDirectory localPath)
+            code <- Transport.copyFromRemote remote (unPath (path fe)) localPath
+            when (code /= ExitSuccess) $
+                hPutStrLn stderr $ "Warning: Failed to download text file " ++ unPath (path fe)
+    -- Write hash+size metadata for binary files
+    forM_ binaryFiles $ \fe -> do
+        let metaPath = wsPath </> unPath (path fe)
+        createDirectoryIfMissing True (takeDirectory metaPath)
+        case kind fe of
+            File{fHash, fSize} ->
+                atomicWriteFileStr metaPath (serializeMetadata (MetaContent fHash fSize))
+            _ -> pure ()
+  where
+    isTextFile fe = case kind fe of
+        File{fContentType = TextContent} -> True
+        _ -> False
 
-    -- Step 1: Fetch file list from remote
-    result <- Remote.Scan.fetchRemoteFiles remote
-    case result of
+-- | Scan the remote, classify files, and write metadata into the workspace.
+-- Returns True on success, False on failure (errors printed to stderr).
+scanAndWriteMetadata :: Remote -> FilePath -> IO Bool
+scanAndWriteMetadata remote wsPath = do
+    putStrLn "Scanning remote..."
+    scanResult <- Remote.Scan.fetchRemoteFiles remote
+    case scanResult of
         Left err -> do
-            hPutStrLn stderr $ "Error scanning remote: " ++ show err
-            exitWith (ExitFailure 1)
+            hPutStrLn stderr $ "fatal: error scanning remote: " ++ show err
+            pure False
         Right remoteFiles -> do
             let files = filter (not . isBitPath . unPath . path) remoteFiles
             putStrLn $ "Found " ++ show (length files) ++ " files on remote."
-
-            -- Step 2: Partition into binary (certain) and text candidates
             config <- ConfigFile.readTextConfig
-            let (definitelyBinary, textCandidates) = partitionFiles config files
-
-            putStrLn $ "  " ++ show (length definitelyBinary) ++ " binary files (by size/extension)"
-            putStrLn $ "  " ++ show (length textCandidates) ++ " small files to classify..."
-
-            -- Step 3: Download text candidates to temp dir and classify
-            classifiedFiles <- if null textCandidates
+            let (binary, textCands) = partitionFiles config files
+            putStrLn $ "  " ++ show (length binary) ++ " binary files (by size/extension)"
+            putStrLn $ "  " ++ show (length textCands) ++ " small files to classify..."
+            classifiedFiles <- if null textCands
                 then pure []
-                else classifyRemoteTextCandidates remote config textCandidates
+                else classifyTextCandidates remote config textCands
+            let allFiles = binary ++ classifiedFiles
+            clearWorkspace wsPath
+            writeFilesToWorkspace wsPath remote allFiles
+            pure True
 
-            -- Step 4: Merge results
-            let allFiles = definitelyBinary ++ classifiedFiles
+-- | Stage and auto-commit changes in the workspace.
+stageAndCommit :: FilePath -> [String] -> IO ExitCode
+stageAndCommit wsPath paths = do
+    let addPaths = if null paths then ["."] else paths
+    (addCode, _, _) <- Git.runGitAt wsPath ("add" : addPaths)
+    case addCode of
+        ExitSuccess -> do
+            (diffCode, _, _) <- Git.runGitAt wsPath ["diff", "--cached", "--quiet"]
+            case diffCode of
+                ExitFailure 1 -> do
+                    (commitCode, _, _) <- Git.runGitAt wsPath ["commit", "-m", "Update remote metadata"]
+                    case commitCode of
+                        ExitSuccess -> do
+                            putStrLn "Remote metadata updated."
+                            pure ExitSuccess
+                        _ -> do
+                            hPutStrLn stderr "error: failed to commit metadata."
+                            pure commitCode
+                _ -> do
+                    putStrLn "Nothing to add — remote metadata is up to date."
+                    pure ExitSuccess
+        _ -> do
+            hPutStrLn stderr "error: failed to stage files."
+            pure addCode
 
-            -- Step 5: Create workspace and write metadata
-            putStrLn "Building metadata workspace..."
+----------------------------------------------------------------------
+-- Public API: Remote commands
+----------------------------------------------------------------------
+
+-- | Initialize a remote repository (create empty bundle and push).
+-- Does NOT use withRemoteWorkspace — there's no bundle to fetch yet.
+initRemote :: Remote -> String -> IO ()
+initRemote remote remoteName = withTempDir "bit-remote-init" $ \tmpBase -> do
+    let checkPath = tmpBase </> "check.bundle"
+        wsPath = tmpBase </> "workspace"
+    -- Check if already initialized
+    result <- Transport.copyFromRemoteDetailed remote ".bit/bit.bundle" checkPath
+    case result of
+        Transport.CopySuccess -> do
+            hPutStrLn stderr "fatal: remote already has a bit repository."
+            exitWith (ExitFailure 1)
+        Transport.CopyNetworkError err -> do
+            hPutStrLn stderr $ "fatal: network error: " ++ err
+            exitWith (ExitFailure 1)
+        Transport.CopyOtherError err -> do
+            hPutStrLn stderr $ "fatal: " ++ err
+            exitWith (ExitFailure 1)
+        Transport.CopyNotFound -> do
+            -- Create fresh repo
             createDirectoryIfMissing True wsPath
-            
-            -- For text files: we need the actual content, but we just classified from remote
-            -- For binary files: we just need metadata (hash+size)
-            -- Split the files accordingly
-            let (textFiles, binaryFiles) = partition isTextFile allFiles
-                  where
-                    isTextFile fe = case kind fe of
-                        File{fContentType = TextContent} -> True
-                        _ -> False
-            
-            -- For text files from the classified set: download them again to the workspace
-            -- (we could optimize by keeping the temp files, but this is simpler and more robust)
-            putStrLn $ "Downloading " ++ show (length textFiles) ++ " text files..."
-            forM_ textFiles $ \fe -> do
-                let localPath = wsPath </> unPath (path fe)
-                createDirectoryIfMissing True (takeDirectory localPath)
-                code <- Transport.copyFromRemote remote (unPath (path fe)) localPath
-                when (code /= ExitSuccess) $
-                    hPutStrLn stderr $ "Warning: Failed to download text file " ++ unPath (path fe)
+            runOrDie wsPath ["init", "--initial-branch=main"] "initialize repository"
+            void $ Git.runGitAt wsPath ["config", "core.quotePath", "false"]
+            runOrDie wsPath ["commit", "--allow-empty", "-m", "Initial remote repository"] "create initial commit"
+            -- Bundle and push
+            let bundlePath = tmpBase </> "init.bundle"
+            (bCode, _, _) <- Git.runGitAt wsPath ["bundle", "create", bundlePath, "--all"]
+            when (bCode /= ExitSuccess) $ do
+                hPutStrLn stderr "fatal: failed to create bundle."
+                exitWith (ExitFailure 1)
+            pCode <- Transport.copyToRemote bundlePath remote ".bit/bit.bundle"
+            case pCode of
+                ExitSuccess ->
+                    putStrLn $ "Initialized bit repository on remote '" ++ remoteName ++ "'."
+                _ -> do
+                    hPutStrLn stderr "fatal: failed to push bundle to remote."
+                    exitWith (ExitFailure 1)
 
-            -- For binary files: write metadata
-            forM_ binaryFiles $ \fe -> do
-                let metaPath = wsPath </> unPath (path fe)
-                createDirectoryIfMissing True (takeDirectory metaPath)
-                case kind fe of
-                    File{fHash, fSize} ->
-                        atomicWriteFileStr metaPath (serializeMetadata (MetaContent fHash fSize))
-                    _ -> pure ()
+-- | Add files in remote workspace (scan + stage + auto-commit).
+-- Scans the full remote to reconstruct metadata, writes it into the
+-- ephemeral workspace, stages the specified paths, and auto-commits.
+addRemote :: Remote -> [String] -> IO ExitCode
+addRemote remote paths =
+    withRemoteWorkspace remote $ \wsPath -> do
+        ok <- scanAndWriteMetadata remote wsPath
+        if ok
+            then stageAndCommit wsPath paths
+            else pure (ExitFailure 1)
 
-            -- Step 6: Initialize git repo in workspace
-            putStrLn "Initializing git repository..."
-            callProcess "git" ["-C", wsPath, "init", "--initial-branch=main"]
-            callProcess "git" ["-C", wsPath, "config", "core.quotePath", "false"]
+-- | Commit in remote workspace (interactive, passes through stdio).
+-- Useful for amending the last commit message or creating additional commits.
+commitRemote :: Remote -> [String] -> IO ExitCode
+commitRemote remote commitArgs =
+    withRemoteWorkspace remote $ \wsPath ->
+        Git.runGitRawAt wsPath ("commit" : commitArgs)
 
-            let textCount = length textFiles
-            let binCount = length binaryFiles
-            putStrLn $ "Remote workspace initialized: " ++ show textCount ++ " text, " ++ show binCount ++ " binary files."
-            putStrLn $ "Next steps:"
-            putStrLn $ "  bit @" ++ remName ++ " add ."
-            putStrLn $ "  bit @" ++ remName ++ " commit -m \"Initial commit\""
+-- | Show status of remote workspace (read-only).
+-- Scans the remote to detect untracked files, then runs git status.
+statusRemote :: Remote -> [String] -> IO ExitCode
+statusRemote remote rest =
+    withRemoteWorkspaceReadOnly remote $ \wsPath -> do
+        -- Scan remote and write metadata so git can detect untracked files
+        ok <- scanAndWriteMetadata remote wsPath
+        hFlush stdout  -- Ensure scan output appears before git status
+        if ok
+            then do
+                -- Update index to match working tree after writing files
+                -- This ensures stat info matches and content-identical files show as clean
+                void $ Git.runGitAt wsPath ["add", "-u"]
+                void $ Git.runGitAt wsPath ["reset", "HEAD"]
+                Git.runGitRawAt wsPath ("status" : rest)
+            else pure (ExitFailure 1)
+
+-- | Show log of remote workspace (read-only).
+logRemote :: Remote -> [String] -> IO ExitCode
+logRemote remote rest =
+    withRemoteWorkspaceReadOnly remote $ \wsPath ->
+        Git.runGitRawAt wsPath ("log" : "--decorate-refs=refs/heads/" : rest)
+
+-- | List tracked files in remote workspace (read-only).
+-- Scans the remote to reconstruct metadata, then runs git ls-files.
+lsFilesRemote :: Remote -> [String] -> IO ExitCode
+lsFilesRemote remote rest =
+    withRemoteWorkspaceReadOnly remote $ \wsPath -> do
+        ok <- scanAndWriteMetadata remote wsPath
+        hFlush stdout
+        if ok
+            then do
+                void $ Git.runGitAt wsPath ["add", "-u"]
+                void $ Git.runGitAt wsPath ["reset", "HEAD"]
+                Git.runGitRawAt wsPath ("ls-files" : rest)
+            else pure (ExitFailure 1)
 ```
 
 ---
@@ -5969,486 +6360,482 @@ instance FromJSON RcloneFile where
 *Source file.*
 
 ```haskell
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE OverloadedStrings #-}
-
-module Bit.Scan
-  ( scanWorkingDir
-  , writeMetadataFiles
-  , readMetadataFile
-  , listMetadataPaths
-  , getFileHashAndSize
-  , hashAndClassifyFile
-  , binaryExtensions
-  , FileEntry(..)
-  , EntryKind(..)
-  ) where
-
-import Bit.Types (Hash(..), HashAlgo(..), FileEntry(..), EntryKind(..), ContentType(..), hashToText, Path(..))
-import System.FilePath
-import System.Directory
-    ( doesDirectoryExist,
-      doesFileExist,
-      listDirectory,
-      getFileSize,
-      createDirectoryIfMissing,
-      copyFileWithMetadata,
-      getModificationTime )
-import System.IO (withFile, IOMode(ReadMode), hIsEOF, hPutStr, hPutStrLn, hIsTerminalDevice, stderr)
-import Data.List (dropWhileEnd, isPrefixOf, isSuffixOf, lines, dropWhile, drop, filter, map, concat, partition, null)
-import Data.Maybe (listToMaybe)
-import qualified Data.ByteString as BS
-import Control.Monad (void, when, forM_)
-import Data.Text.Encoding (decodeUtf8, decodeUtf8', encodeUtf8)
-import Data.Char (toLower)
-import qualified Internal.ConfigFile as ConfigFile
-import Bit.Utils (atomicWriteFileStr)
-import Bit.Internal.Metadata (MetaContent(..), readMetadataOrComputeHash, hashFile, serializeMetadata)
-import qualified Data.Set as Set
-import qualified Crypto.Hash.MD5 as MD5
-import Data.ByteString.Base16 (encode)
-import qualified Data.Text as T
-import Control.Concurrent.Async (mapConcurrently)
-import Control.Concurrent (getNumCapabilities, forkIO, threadDelay, killThread)
-import Control.Concurrent.QSem (newQSem, waitQSem, signalQSem)
-import Control.Exception (bracket_, finally)
-import Bit.Progress (reportProgress, clearProgress)
-import Data.IORef (IORef, newIORef, readIORef, atomicModifyIORef')
-import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
-
--- Binary file extensions that should never be treated as text (hardcoded, not configurable)
-binaryExtensions :: [String]
-binaryExtensions = [".mp4", ".zip", ".bin", ".exe", ".dll", ".so", ".dylib", ".jpg", ".jpeg", ".png", ".gif", ".pdf", ".gz", ".bz2", ".xz", ".tar", ".rar", ".7z", ".iso", ".img", ".dmg", ".deb", ".rpm", ".msi"]
-
--- | Single-pass file hash and classification. Returns (hash, isText).
--- For large files or binary extensions: streams hash only, returns isText=False.
--- For others: reads first 8KB for text classification, then streams remaining chunks for hash.
-hashAndClassifyFile :: FilePath -> Integer -> ConfigFile.TextConfig -> IO (Hash 'MD5, Bool)
-hashAndClassifyFile filePath size config = do
-    let ext = map toLower (takeExtension filePath)
-    
-    -- Fast path: large files or known binary extensions - just stream hash
-    if size >= ConfigFile.textSizeLimit config || ext `elem` binaryExtensions
-        then do
-            h <- streamHash filePath
-            pure (h, False)
-        else
-            -- Single-pass: read first 8KB for classification, continue streaming for hash
-            withFile filePath ReadMode $ \handle -> do
-                firstChunk <- BS.hGet handle 8192
-                let isText = not (BS.elem 0 firstChunk) &&
-                             case decodeUtf8' firstChunk of
-                                 Left _ -> False
-                                 Right _ -> True
-                
-                -- Continue streaming hash from where we left off
-                let loop !ctx = do
-                        eof <- hIsEOF handle
-                        if eof
-                            then do
-                                let md5hex = decodeUtf8 (encode (MD5.finalize ctx))
-                                pure (Hash (T.pack "md5:" <> md5hex))
-                            else do
-                                chunk <- BS.hGet handle 65536
-                                loop (MD5.update ctx chunk)
-                
-                -- Start with first chunk already included
-                h <- loop (MD5.update MD5.init firstChunk)
-                pure (h, isText)
-  where
-    -- Stream hash for files we're not classifying
-    streamHash fp = withFile fp ReadMode $ \h -> do
-        let loop !ctx = do
-                eof <- hIsEOF h
-                if eof
-                    then do
-                        let md5hex = decodeUtf8 (encode (MD5.finalize ctx))
-                        pure (Hash (T.pack "md5:" <> md5hex))
-                    else do
-                        chunk <- BS.hGet h 65536
-                        loop (MD5.update ctx chunk)
-        loop MD5.init
-
--- | Cache entry for file metadata to skip re-hashing unchanged files
-data CacheEntry = CacheEntry
-  { ceMtime :: Integer
-  , ceSize :: Integer
-  , ceHash :: Hash 'MD5
-  , ceIsText :: Bool
-  } deriving (Show, Eq)
-
--- | Serialize cache entry to string format
-serializeCacheEntry :: CacheEntry -> String
-serializeCacheEntry ce =
-  "mtime: " ++ show (ceMtime ce) ++ "\n"
-  ++ "size: " ++ show (ceSize ce) ++ "\n"
-  ++ "hash: " ++ T.unpack (hashToText (ceHash ce)) ++ "\n"
-  ++ "isText: " ++ show (ceIsText ce) ++ "\n"
-
--- | Parse cache entry from string format
-parseCacheEntry :: String -> Maybe CacheEntry
-parseCacheEntry content = do
-  let ls = lines content
-  mtimeLine <- listToMaybe [ drop (length ("mtime: " :: String)) l
-                           | l <- ls, "mtime: " `isPrefixOf` l ]
-  sizeLine <- listToMaybe [ drop (length ("size: " :: String)) l
-                          | l <- ls, "size: " `isPrefixOf` l ]
-  hashLine <- listToMaybe [ drop (length ("hash: " :: String)) l
-                          | l <- ls, "hash: " `isPrefixOf` l ]
-  isTextLine <- listToMaybe [ drop (length ("isText: " :: String)) l
-                            | l <- ls, "isText: " `isPrefixOf` l ]
-  mtime <- readMaybeInt (trim mtimeLine)
-  size <- readMaybeInt (trim sizeLine)
-  let hashVal = trim hashLine
-  isText <- readMaybeBool (trim isTextLine)
-  if null hashVal
-    then Nothing
-    else Just CacheEntry
-      { ceMtime = mtime
-      , ceSize = size
-      , ceHash = Hash (T.pack hashVal)
-      , ceIsText = isText
-      }
-  where
-    trim = dropWhileEnd isSpaceChar . dropWhile isSpaceChar
-    isSpaceChar c = c == ' ' || c == '\t' || c == '\r' || c == '\n'
-    readMaybeInt s = case reads s of
-      [(n, "")] -> Just n
-      [(n, r)] | all isSpaceChar r -> Just n
-      _ -> Nothing
-    readMaybeBool s = case s of
-      "True" -> Just True
-      "False" -> Just False
-      _ -> Nothing
-
--- | Load cache entry for a file, returns Nothing if missing or malformed
-loadCacheEntry :: FilePath -> FilePath -> IO (Maybe CacheEntry)
-loadCacheEntry root relPath = do
-  let cachePath = root </> ".bit" </> "cache" </> relPath
-  exists <- doesFileExist cachePath
-  if not exists
-    then pure Nothing
-    else do
-      -- Use strict bytestring reading to avoid lazy file handle issues on Windows
-      bs <- BS.readFile cachePath
-      case decodeUtf8' bs of
-        Left _ -> pure Nothing
-        Right txt -> pure (parseCacheEntry (T.unpack txt))
-
--- | Save cache entry for a file (non-atomic write, cache corruption is acceptable)
-saveCacheEntry :: FilePath -> FilePath -> CacheEntry -> IO ()
-saveCacheEntry root relPath entry = do
-  let bitRoot = root </> ".bit"
-  bitExists <- doesDirectoryExist bitRoot
-  when bitExists $ do
-    let cachePath = bitRoot </> "cache" </> relPath
-    createDirectoryIfMissing True (takeDirectory cachePath)
-    -- Use strict bytestring writing to ensure file handle is closed immediately
-    BS.writeFile cachePath (encodeUtf8 (T.pack (serializeCacheEntry entry)))
-
--- | Normalize a file path for consistent comparison (forward slashes, trimmed)
-normalizePath :: FilePath -> FilePath
-normalizePath = map (\c -> if c == '\\' then '/' else c) . filter (/= '\r')
-
--- | Check if a filename matches a gitignore-style pattern.
--- Supports: *.ext (extension match), filename (exact match)
-matchesPattern :: String -> FilePath -> Bool
-matchesPattern pattern path =
-    let filename = takeFileName path
-        whitespace = ['\r', '\n', ' '] :: [Char]
-        normalizedPattern = filter (`notElem` whitespace) pattern
-    in if "*." `isPrefixOf` normalizedPattern
-       then -- Extension pattern like *.log
-            let ext = drop 1 normalizedPattern  -- Remove the *
-            in ext `isSuffixOf` filename
-       else -- Exact filename match
-            normalizedPattern == filename
-
--- | Check which files should be ignored based on .bitignore patterns.
--- Reads patterns from .bit/index/.gitignore and matches against paths.
-checkIgnoredFiles :: FilePath -> [FilePath] -> IO (Set.Set FilePath)
-checkIgnoredFiles root paths = do
-    let gitignorePath = root </> ".bit" </> "index" </> ".gitignore"
-    exists <- doesFileExist gitignorePath
-    if not exists
-        then pure Set.empty
-        else do
-            -- Use strict ByteString reading to avoid lazy file handle issues on Windows
-            bs <- BS.readFile gitignorePath
-            let content = case decodeUtf8' bs of
-                    Left _ -> ""  -- Invalid UTF-8, treat as empty
-                    Right txt -> T.unpack txt
-            let whitespace = ['\r', '\n', ' '] :: [Char]
-            let patterns = filter (not . null) $ 
-                           filter (not . ("#" `isPrefixOf`)) $  -- Skip comments
-                           map (filter (`notElem` whitespace)) (lines content)
-            let isIgnored p = any (`matchesPattern` p) patterns
-            pure $ Set.fromList $ filter isIgnored paths
-
--- | Bounded parallel map: runs up to @bound@ actions concurrently.
-mapConcurrentlyBounded :: Int -> (a -> IO b) -> [a] -> IO [b]
-mapConcurrentlyBounded bound f xs = do
-    sem <- newQSem bound
-    mapConcurrently (\x -> bracket_ (waitQSem sem) (signalQSem sem) (f x)) xs
-
--- | Progress reporter thread that periodically displays scan progress
-progressLoop :: IORef Int -> Int -> IO ()
-progressLoop counter total = go
-  where
-    go = do
-        n <- readIORef counter
-        let pct = (n * 100) `div` max 1 total
-        reportProgress $ "Scanning... " ++ show n ++ "/" ++ show total ++ " files (" ++ show pct ++ "%)"
-        threadDelay 50000  -- 50ms
-        when (n < total) go
-
--- Main scan function
-scanWorkingDir :: FilePath -> IO [FileEntry]
-scanWorkingDir root = do
-    let bitRoot = root </> ".bit"
-    bitExists <- doesDirectoryExist bitRoot
-    if not bitExists then pure []
-    else do
-      -- Read config once for all files
-      config <- ConfigFile.readTextConfig
-    
-      -- First pass: collect all paths (without hashing)
-      allPaths <- collectPaths root
-    
-      -- Filter through git check-ignore
-      let filePaths = [p | (p, False) <- allPaths]  -- Only check files, not directories
-      ignoredSet <- checkIgnoredFiles root filePaths
-    
-      -- Separate directories from files to hash
-      let (dirs, _files) = partition snd allPaths
-          dirEntries = [FileEntry { path = Path rel, kind = Directory } | (rel, _) <- dirs]
-          filesToHash = [(rel, root </> rel) | (rel, False) <- allPaths
-                                             , not (Set.member (normalizePath rel) ignoredSet)]
-    
-      -- Setup progress tracking
-      let total = length filesToHash
-      counter <- newIORef (0 :: Int)
-    
-      -- Hash/classify files in parallel (bounded by numCapabilities * 4)
-      caps <- getNumCapabilities
-      let concurrency = max 4 (caps * 4)
-    
-      let hashWithProgress (rel, fullPath) = do
-              size <- getFileSize fullPath
-              mtime <- getModificationTime fullPath
-              let mtimeInt = floor (utcTimeToPOSIXSeconds mtime) :: Integer
-              cached <- loadCacheEntry root rel
-              case cached of
-                Just ce | ceSize ce == fromIntegral size && ceMtime ce == mtimeInt -> do
-                  -- Cache hit: reuse hash and isText
-                  atomicModifyIORef' counter (\n -> (n + 1, ()))
-                  pure $ FileEntry
-                      { path = Path rel
-                      , kind = File { fHash = ceHash ce, fSize = fromIntegral size, fContentType = if ceIsText ce then TextContent else BinaryContent }
-                      }
-                _ -> do
-                  -- Cache miss: hash the file, save cache entry
-                  (h, isText) <- hashAndClassifyFile fullPath (fromIntegral size) config
-                  saveCacheEntry root rel (CacheEntry mtimeInt (fromIntegral size) h isText)
-                  atomicModifyIORef' counter (\n -> (n + 1, ()))
-                  pure $ FileEntry
-                      { path = Path rel
-                      , kind = File { fHash = h, fSize = fromIntegral size, fContentType = if isText then TextContent else BinaryContent }
-                      }
-    
-      -- Wrap hashing with progress reporter
-      let hashingAction = mapConcurrentlyBounded concurrency hashWithProgress filesToHash
-    
-      fileEntries <- if total > 50
-          then do
-              -- Show progress for large scans
-              reporterThread <- forkIO (progressLoop counter total)
-              finally hashingAction $ do
-                  killThread reporterThread
-                  clearProgress
-                  hPutStrLn stderr $ "Scanned " ++ show total ++ " files."
-          else
-              -- No progress for small scans
-              hashingAction
-    
-      pure $ dirEntries ++ fileEntries
-  where
-    collectPaths :: FilePath -> IO [(FilePath, Bool)]
-    collectPaths path = do
-      isDir <- doesDirectoryExist path
-      let rel = makeRelative root path
-
-      -- ignore .bit folder, .git, .bitignore, and .gitignore (the latter two are config files)
-      if rel == ".bit" || (".bit" `isPrefixOf` rel)
-          || rel == ".git" || (".git" `isPrefixOf` rel)
-          || rel == ".bitignore"
-          || rel == ".gitignore"
-        then pure []
-        else if isDir
-          then do
-            names <- listDirectory path
-            let children = map (path </>) names
-            childPaths <- concat <$> mapM collectPaths children
-            pure ((rel, True) : childPaths)
-        else pure [(rel, False)]
-
-writeMetadataFiles :: FilePath -> [FileEntry] -> IO ()
-writeMetadataFiles root entries = do
-    let bitRoot = root </> ".bit"
-    bitExists <- doesDirectoryExist bitRoot
-    when bitExists $ do
-      let metaRoot = bitRoot </> "index"
-      createDirectoryIfMissing True metaRoot
-
-      -- Separate directories from files
-      let (dirs, files) = partitionEntries entries
-    
-      -- First pass: create all directories sequentially (avoid race conditions)
-      forM_ dirs $ \dirPath -> do
-        let fullPath = metaRoot </> dirPath
-        createDirectoryIfMissing True fullPath
-    
-      -- Second pass: create parent directories for files
-      let parentDirs = Set.fromList [takeDirectory (unPath (path e)) | e <- files]
-      forM_ parentDirs $ \dirPath -> do
-        let fullPath = metaRoot </> dirPath
-        createDirectoryIfMissing True fullPath
-    
-      -- Setup progress tracking
-      let total = length files
-      isTTY <- hIsTerminalDevice stderr
-      counter <- newIORef (0 :: Int)
-      skipped <- newIORef (0 :: Int)
-    
-      -- Start progress reporter thread if we're in a TTY and have enough files
-      let shouldShowProgress = isTTY && total > 10
-      reporterThread <- if shouldShowProgress
-          then Just <$> forkIO (writeProgressLoop counter skipped total)
-          else pure Nothing
-    
-      -- Third pass: write files in parallel (bounded concurrency)
-      caps <- getNumCapabilities
-      let concurrency = max 4 (caps * 4)
-    
-      let writeWithProgress entry = do
-              let metaPath = metaRoot </> unPath (path entry)
-              case kind entry of
-                File { fHash, fSize, fContentType } -> do
-                  -- Check if file is unchanged before writing
-                  needsWrite <- shouldWriteFile root metaPath entry fHash fSize fContentType
-                  if needsWrite
-                    then do
-                      case fContentType of
-                        TextContent -> do
-                          -- For text files, copy the actual content directly
-                          let actualPath = root </> unPath (path entry)
-                          copyFileWithMetadata actualPath metaPath
-                        BinaryContent -> do
-                          -- For binary files, write metadata (hash + size). Spec: raw hash value; atomic write.
-                          atomicWriteFileStr metaPath $
-                            serializeMetadata (MetaContent fHash fSize)
-                      atomicModifyIORef' counter (\n -> (n + 1, ()))
-                    else do
-                      atomicModifyIORef' skipped (\n -> (n + 1, ()))
-                      atomicModifyIORef' counter (\n -> (n + 1, ()))
-                Directory -> pure ()  -- Already handled in first pass
-                Symlink _ -> pure ()  -- Symlinks handled separately
-    
-      finally
-          (void $ mapConcurrentlyBounded concurrency writeWithProgress files)
-          (do
-              -- Clean up: kill reporter thread and finalize progress line
-              maybe (pure ()) killThread reporterThread
-              when shouldShowProgress $ do
-                  n <- readIORef counter
-                  s <- readIORef skipped
-                  clearProgress
-                  let written = n - s
-                  hPutStr stderr $ "Wrote " ++ show written ++ " metadata files"
-                  when (s > 0) $ hPutStr stderr $ " (skipped " ++ show s ++ " unchanged)"
-                  hPutStrLn stderr "."
-          )
-  where
-    partitionEntries :: [FileEntry] -> ([FilePath], [FileEntry])
-    partitionEntries es =
-      let dirs = [unPath (path e) | e <- es, case kind e of Directory -> True; _ -> False]
-          files = [e | e <- es, case kind e of File{} -> True; _ -> False]
-      in (dirs, files)
-    
-    writeProgressLoop :: IORef Int -> IORef Int -> Int -> IO ()
-    writeProgressLoop counter skipped total = go
-      where
-        go = do
-            n <- readIORef counter
-            s <- readIORef skipped
-            let pct = (n * 100) `div` max 1 total
-                written = n - s
-                msg = "Writing metadata... " ++ show written ++ "/" ++ show total ++ " files (" ++ show pct ++ "%)"
-                      ++ if s > 0 then ", skipped " ++ show s else ""
-            reportProgress msg
-            threadDelay 50000  -- 50ms
-            when (n < total) go
-
--- | Check if a metadata file needs to be written (returns True if write needed)
-shouldWriteFile :: FilePath -> FilePath -> FileEntry -> Hash 'MD5 -> Integer -> ContentType -> IO Bool
-shouldWriteFile root metaPath entry fHash fSize fContentType = do
-  exists <- doesFileExist metaPath
-  if not exists
-    then pure True  -- File doesn't exist, must write
-    else case fContentType of
-      TextContent -> do
-        -- For text files: compare mtime and size of source vs destination
-        let sourcePath = root </> unPath (path entry)
-        sourceMtime <- getModificationTime sourcePath
-        sourceSize <- getFileSize sourcePath
-        destMtime <- getModificationTime metaPath
-        destSize <- getFileSize metaPath
-        -- Write if mtime or size differs
-        pure (sourceMtime /= destMtime || sourceSize /= destSize)
-      BinaryContent -> do
-        -- For binary files: read existing metadata and compare hash/size
-        existing <- readMetadataOrComputeHash metaPath
-        case existing of
-          Nothing -> pure True  -- Failed to read, must write
-          Just (MetaContent existingHash existingSize) ->
-            -- Write if hash or size differs
-            pure (existingHash /= fHash || existingSize /= fSize)
-
--- | Parse a metadata file (hash/size lines) or read a text file and compute hash/size.
--- Returns Nothing if file is missing or invalid.
--- Text files in .rgit/index/ contain actual content; binary files contain metadata.
-readMetadataFile :: FilePath -> IO (Maybe (Hash 'MD5, Integer))
-readMetadataFile fp = fmap (\mc -> (metaHash mc, metaSize mc)) <$> readMetadataOrComputeHash fp
-
--- | List all metadata file paths under index dir, relative to index root. Excludes .gitattributes.
-listMetadataPaths :: FilePath -> IO [FilePath]
-listMetadataPaths indexRoot = go indexRoot ""
-  where
-    go :: FilePath -> FilePath -> IO [FilePath]
-    go full rel = do
-      isDir <- doesDirectoryExist full
-      if isDir
-        then do
-          names <- listDirectory full
-          let skip name = name == "." || name == ".." || name == ".gitattributes" || name == ".git"
-          let children = [ (full </> name, if null rel then name else rel </> name) | name <- names, not (skip name) ]
-          concat <$> mapM (\(p, r) -> go p r) children
-        else do
-          isFile <- doesFileExist full
-          pure (if isFile then [rel] else [])
-
--- | Get hash and size of a file. Returns Nothing if file is missing or not a regular file.
-getFileHashAndSize :: FilePath -> FilePath -> IO (Maybe (Hash 'MD5, Integer))
-getFileHashAndSize root relPath = do
-  let full = root </> relPath
-  exists <- doesFileExist full
-  if not exists then pure Nothing
-  else do
-    h <- hashFile full
-    sz <- getFileSize full
-    pure (Just (h, fromIntegral sz))
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedStrings #-}
+
+module Bit.Scan
+  ( scanWorkingDir
+  , writeMetadataFiles
+  , readMetadataFile
+  , listMetadataPaths
+  , getFileHashAndSize
+  , hashAndClassifyFile
+  , binaryExtensions
+  , FileEntry(..)
+  , EntryKind(..)
+  ) where
+
+import Bit.Types (Hash(..), HashAlgo(..), FileEntry(..), EntryKind(..), ContentType(..), hashToText, Path(..))
+import System.FilePath
+import System.Directory
+    ( doesDirectoryExist,
+      doesFileExist,
+      listDirectory,
+      getFileSize,
+      createDirectoryIfMissing,
+      copyFileWithMetadata,
+      getModificationTime )
+import System.IO (withFile, IOMode(ReadMode), hIsEOF, hPutStr, hPutStrLn, hIsTerminalDevice, stderr)
+import Data.List (dropWhileEnd, isPrefixOf, isSuffixOf, partition)
+import Data.Either (isRight)
+import Data.Maybe (listToMaybe)
+import qualified Data.ByteString as BS
+import Control.Monad (void, when, forM_)
+import Data.Foldable (traverse_)
+import Data.Text.Encoding (decodeUtf8, decodeUtf8', encodeUtf8)
+import Data.Char (toLower)
+import qualified Internal.ConfigFile as ConfigFile
+import Bit.Utils (atomicWriteFileStr, toPosix)
+import Bit.Internal.Metadata (MetaContent(..), readMetadataOrComputeHash, hashFile, serializeMetadata)
+import qualified Data.Set as Set
+import qualified Crypto.Hash.MD5 as MD5
+import Data.ByteString.Base16 (encode)
+import qualified Data.Text as T
+import Control.Concurrent.Async (mapConcurrently)
+import Control.Concurrent (getNumCapabilities, forkIO, threadDelay, killThread)
+import Control.Concurrent.QSem (newQSem, waitQSem, signalQSem)
+import Control.Exception (bracket_, finally)
+import Bit.Progress (reportProgress, clearProgress)
+import Data.IORef (IORef, newIORef, readIORef, atomicModifyIORef')
+import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
+
+-- Binary file extensions that should never be treated as text (hardcoded, not configurable)
+binaryExtensions :: [String]
+binaryExtensions = [".mp4", ".zip", ".bin", ".exe", ".dll", ".so", ".dylib", ".jpg", ".jpeg", ".png", ".gif", ".pdf", ".gz", ".bz2", ".xz", ".tar", ".rar", ".7z", ".iso", ".img", ".dmg", ".deb", ".rpm", ".msi"]
+
+-- | Single-pass file hash and classification. Returns (hash, contentType).
+-- For large files or binary extensions: streams hash only, returns BinaryContent.
+-- For others: reads first 8KB for text classification, then streams remaining chunks for hash.
+hashAndClassifyFile :: FilePath -> Integer -> ConfigFile.TextConfig -> IO (Hash 'MD5, ContentType)
+hashAndClassifyFile filePath size config = do
+    let ext = map toLower (takeExtension filePath)
+    
+    -- Fast path: large files or known binary extensions - just stream hash
+    if size >= ConfigFile.textSizeLimit config || ext `elem` binaryExtensions
+        then do
+            h <- streamHash filePath
+            pure (h, BinaryContent)
+        else
+            -- Single-pass: read first 8KB for classification, continue streaming for hash
+            withFile filePath ReadMode $ \handle -> do
+                firstChunk <- BS.hGet handle 8192
+                let contentType = if not (BS.elem 0 firstChunk) && isRight (decodeUtf8' firstChunk)
+                                  then TextContent else BinaryContent
+                
+                -- Continue streaming hash from where we left off
+                let loop !ctx = do
+                        eof <- hIsEOF handle
+                        if eof
+                            then do
+                                let md5hex = decodeUtf8 (encode (MD5.finalize ctx))
+                                pure (Hash (T.pack "md5:" <> md5hex))
+                            else do
+                                chunk <- BS.hGet handle 65536
+                                loop (MD5.update ctx chunk)
+                
+                -- Start with first chunk already included
+                h <- loop (MD5.update MD5.init firstChunk)
+                pure (h, contentType)
+  where
+    -- Stream hash for files we're not classifying
+    streamHash fp = withFile fp ReadMode $ \h -> do
+        let loop !ctx = do
+                eof <- hIsEOF h
+                if eof
+                    then do
+                        let md5hex = decodeUtf8 (encode (MD5.finalize ctx))
+                        pure (Hash (T.pack "md5:" <> md5hex))
+                    else do
+                        chunk <- BS.hGet h 65536
+                        loop (MD5.update ctx chunk)
+        loop MD5.init
+
+-- | Cache entry for file metadata to skip re-hashing unchanged files
+data CacheEntry = CacheEntry
+  { ceMtime :: Integer
+  , ceSize :: Integer
+  , ceHash :: Hash 'MD5
+  , ceContentType :: ContentType
+  } deriving (Show, Eq)
+
+-- | Serialize cache entry to string format (isText for backward compatibility)
+serializeCacheEntry :: CacheEntry -> String
+serializeCacheEntry ce =
+  "mtime: " ++ show (ceMtime ce) ++ "\n"
+  ++ "size: " ++ show (ceSize ce) ++ "\n"
+  ++ "hash: " ++ T.unpack (hashToText (ceHash ce)) ++ "\n"
+  ++ "isText: " ++ show (ceContentType ce == TextContent) ++ "\n"
+
+-- | Parse cache entry from string format
+parseCacheEntry :: String -> Maybe CacheEntry
+parseCacheEntry content = do
+  let ls = lines content
+  mtimeLine <- listToMaybe [ drop (length ("mtime: " :: String)) l
+                           | l <- ls, "mtime: " `isPrefixOf` l ]
+  sizeLine <- listToMaybe [ drop (length ("size: " :: String)) l
+                          | l <- ls, "size: " `isPrefixOf` l ]
+  hashLine <- listToMaybe [ drop (length ("hash: " :: String)) l
+                          | l <- ls, "hash: " `isPrefixOf` l ]
+  isTextLine <- listToMaybe [ drop (length ("isText: " :: String)) l
+                            | l <- ls, "isText: " `isPrefixOf` l ]
+  mtime <- readMaybeInt (trim mtimeLine)
+  size <- readMaybeInt (trim sizeLine)
+  let hashVal = trim hashLine
+  isText <- readMaybeBool (trim isTextLine)
+  let contentType = if isText then TextContent else BinaryContent
+  if null hashVal
+    then Nothing
+    else Just CacheEntry
+      { ceMtime = mtime
+      , ceSize = size
+      , ceHash = Hash (T.pack hashVal)
+      , ceContentType = contentType
+      }
+  where
+    trim = dropWhileEnd isSpaceChar . dropWhile isSpaceChar
+    isSpaceChar c = c == ' ' || c == '\t' || c == '\r' || c == '\n'
+    readMaybeInt s = case reads s of
+      [(n, "")] -> Just n
+      [(n, r)] | all isSpaceChar r -> Just n
+      _ -> Nothing
+    readMaybeBool s = case s of
+      "True" -> Just True
+      "False" -> Just False
+      _ -> Nothing
+
+-- | Load cache entry for a file, returns Nothing if missing or malformed
+loadCacheEntry :: FilePath -> FilePath -> IO (Maybe CacheEntry)
+loadCacheEntry root relPath = do
+  let cachePath = root </> ".bit" </> "cache" </> relPath
+  exists <- doesFileExist cachePath
+  if not exists
+    then pure Nothing
+    else do
+      -- Use strict bytestring reading to avoid lazy file handle issues on Windows
+      bs <- BS.readFile cachePath
+      pure $ either (const Nothing) (parseCacheEntry . T.unpack) (decodeUtf8' bs)
+
+-- | Save cache entry for a file (non-atomic write, cache corruption is acceptable)
+saveCacheEntry :: FilePath -> FilePath -> CacheEntry -> IO ()
+saveCacheEntry root relPath entry = do
+  let bitRoot = root </> ".bit"
+  bitExists <- doesDirectoryExist bitRoot
+  when bitExists $ do
+    let cachePath = bitRoot </> "cache" </> relPath
+    createDirectoryIfMissing True (takeDirectory cachePath)
+    -- Use strict bytestring writing to ensure file handle is closed immediately
+    BS.writeFile cachePath (encodeUtf8 (T.pack (serializeCacheEntry entry)))
+
+-- | Normalize a file path for consistent comparison (forward slashes, trimmed)
+normalizePath :: FilePath -> FilePath
+normalizePath = toPosix . filter (/= '\r')
+
+-- | Check if a filename matches a gitignore-style pattern.
+-- Supports: *.ext (extension match), filename (exact match)
+matchesPattern :: String -> FilePath -> Bool
+matchesPattern pattern path =
+    let filename = takeFileName path
+        whitespace = ['\r', '\n', ' '] :: [Char]
+        normalizedPattern = filter (`notElem` whitespace) pattern
+    in if "*." `isPrefixOf` normalizedPattern
+       then -- Extension pattern like *.log
+            let ext = drop 1 normalizedPattern  -- Remove the *
+            in ext `isSuffixOf` filename
+       else -- Exact filename match
+            normalizedPattern == filename
+
+-- | Check which files should be ignored based on .bitignore patterns.
+-- Reads patterns from .bit/index/.gitignore and matches against paths.
+checkIgnoredFiles :: FilePath -> [FilePath] -> IO (Set.Set FilePath)
+checkIgnoredFiles root paths = do
+    let gitignorePath = root </> ".bit" </> "index" </> ".gitignore"
+    exists <- doesFileExist gitignorePath
+    if not exists
+        then pure Set.empty
+        else do
+            -- Use strict ByteString reading to avoid lazy file handle issues on Windows
+            bs <- BS.readFile gitignorePath
+            let content = either (const "") T.unpack (decodeUtf8' bs)
+            let whitespace = ['\r', '\n', ' '] :: [Char]
+            let patterns = filter (not . null) $ 
+                           filter (not . ("#" `isPrefixOf`)) $  -- Skip comments
+                           map (filter (`notElem` whitespace)) (lines content)
+            let isIgnored p = any (`matchesPattern` p) patterns
+            pure $ Set.fromList $ filter isIgnored paths
+
+-- | Bounded parallel map: runs up to @bound@ actions concurrently.
+mapConcurrentlyBounded :: Int -> (a -> IO b) -> [a] -> IO [b]
+mapConcurrentlyBounded bound f xs = do
+    sem <- newQSem bound
+    mapConcurrently (\x -> bracket_ (waitQSem sem) (signalQSem sem) (f x)) xs
+
+-- | Progress reporter thread that periodically displays scan progress
+progressLoop :: IORef Int -> Int -> IO ()
+progressLoop counter total = go
+  where
+    go = do
+        n <- readIORef counter
+        let pct = (n * 100) `div` max 1 total
+        reportProgress $ "Scanning... " ++ show n ++ "/" ++ show total ++ " files (" ++ show pct ++ "%)"
+        threadDelay 50000  -- 50ms
+        when (n < total) go
+
+-- Main scan function
+scanWorkingDir :: FilePath -> IO [FileEntry]
+scanWorkingDir root = do
+    let bitRoot = root </> ".bit"
+    bitExists <- doesDirectoryExist bitRoot
+    if not bitExists then pure []
+    else do
+      -- Read config once for all files
+      config <- ConfigFile.readTextConfig
+    
+      -- First pass: collect all paths (without hashing)
+      allPaths <- collectPaths root
+    
+      -- Filter through git check-ignore
+      let filePaths = [p | (p, False) <- allPaths]  -- Only check files, not directories
+      ignoredSet <- checkIgnoredFiles root filePaths
+    
+      -- Separate directories from files to hash
+      let (dirs, _files) = partition snd allPaths
+          dirEntries = [FileEntry { path = Path rel, kind = Directory } | (rel, _) <- dirs]
+          filesToHash = [(rel, root </> rel) | (rel, False) <- allPaths
+                                             , not (Set.member (normalizePath rel) ignoredSet)]
+    
+      -- Setup progress tracking
+      let total = length filesToHash
+      counter <- newIORef (0 :: Int)
+    
+      -- Hash/classify files in parallel (bounded by numCapabilities * 4)
+      caps <- getNumCapabilities
+      let concurrency = max 4 (caps * 4)
+    
+      let hashWithProgress (rel, fullPath) = do
+              size <- getFileSize fullPath
+              mtime <- getModificationTime fullPath
+              let mtimeInt = floor (utcTimeToPOSIXSeconds mtime) :: Integer
+              cached <- loadCacheEntry root rel
+              case cached of
+                Just ce | ceSize ce == fromIntegral size && ceMtime ce == mtimeInt -> do
+                  -- Cache hit: reuse hash and contentType
+                  atomicModifyIORef' counter (\n -> (n + 1, ()))
+                  pure $ FileEntry
+                      { path = Path rel
+                      , kind = File { fHash = ceHash ce, fSize = fromIntegral size, fContentType = ceContentType ce }
+                      }
+                _ -> do
+                  -- Cache miss: hash the file, save cache entry
+                  (h, contentType) <- hashAndClassifyFile fullPath (fromIntegral size) config
+                  saveCacheEntry root rel (CacheEntry mtimeInt (fromIntegral size) h contentType)
+                  atomicModifyIORef' counter (\n -> (n + 1, ()))
+                  pure $ FileEntry
+                      { path = Path rel
+                      , kind = File { fHash = h, fSize = fromIntegral size, fContentType = contentType }
+                      }
+    
+      -- Wrap hashing with progress reporter
+      let hashingAction = mapConcurrentlyBounded concurrency hashWithProgress filesToHash
+    
+      fileEntries <- if total > 50
+          then do
+              -- Show progress for large scans
+              reporterThread <- forkIO (progressLoop counter total)
+              finally hashingAction $ do
+                  killThread reporterThread
+                  clearProgress
+                  hPutStrLn stderr $ "Scanned " ++ show total ++ " files."
+          else
+              -- No progress for small scans
+              hashingAction
+    
+      pure $ dirEntries ++ fileEntries
+  where
+    collectPaths :: FilePath -> IO [(FilePath, Bool)]
+    collectPaths path = do
+      isDir <- doesDirectoryExist path
+      let rel = makeRelative root path
+
+      -- ignore .bit folder, .git, .bitignore, and .gitignore (the latter two are config files)
+      if rel == ".bit" || (".bit" `isPrefixOf` rel)
+          || rel == ".git" || (".git" `isPrefixOf` rel)
+          || rel == ".bitignore"
+          || rel == ".gitignore"
+        then pure []
+        else if isDir
+          then do
+            names <- listDirectory path
+            let children = map (path </>) names
+            childPaths <- concat <$> mapM collectPaths children
+            pure ((rel, True) : childPaths)
+        else pure [(rel, False)]
+
+writeMetadataFiles :: FilePath -> [FileEntry] -> IO ()
+writeMetadataFiles root entries = do
+    let bitRoot = root </> ".bit"
+    bitExists <- doesDirectoryExist bitRoot
+    when bitExists $ do
+      let metaRoot = bitRoot </> "index"
+      createDirectoryIfMissing True metaRoot
+
+      -- Separate directories from files
+      let (dirs, files) = partitionEntries entries
+    
+      -- First pass: create all directories sequentially (avoid race conditions)
+      forM_ dirs $ \dirPath -> do
+        let fullPath = metaRoot </> dirPath
+        createDirectoryIfMissing True fullPath
+    
+      -- Second pass: create parent directories for files
+      let parentDirs = Set.fromList [takeDirectory (unPath (path e)) | e <- files]
+      forM_ parentDirs $ \dirPath -> do
+        let fullPath = metaRoot </> dirPath
+        createDirectoryIfMissing True fullPath
+    
+      -- Setup progress tracking
+      let total = length files
+      isTTY <- hIsTerminalDevice stderr
+      counter <- newIORef (0 :: Int)
+      skipped <- newIORef (0 :: Int)
+    
+      -- Start progress reporter thread if we're in a TTY and have enough files
+      let shouldShowProgress = isTTY && total > 10
+      reporterThread <- if shouldShowProgress
+          then Just <$> forkIO (writeProgressLoop counter skipped total)
+          else pure Nothing
+    
+      -- Third pass: write files in parallel (bounded concurrency)
+      caps <- getNumCapabilities
+      let concurrency = max 4 (caps * 4)
+    
+      let writeWithProgress entry = do
+              let metaPath = metaRoot </> unPath (path entry)
+              case kind entry of
+                File { fHash, fSize, fContentType } -> do
+                  -- Check if file is unchanged before writing
+                  needsWrite <- shouldWriteFile root metaPath entry fHash fSize fContentType
+                  if needsWrite
+                    then do
+                      case fContentType of
+                        TextContent -> do
+                          -- For text files, copy the actual content directly
+                          let actualPath = root </> unPath (path entry)
+                          copyFileWithMetadata actualPath metaPath
+                        BinaryContent -> do
+                          -- For binary files, write metadata (hash + size). Spec: raw hash value; atomic write.
+                          atomicWriteFileStr metaPath $
+                            serializeMetadata (MetaContent fHash fSize)
+                      atomicModifyIORef' counter (\n -> (n + 1, ()))
+                    else do
+                      atomicModifyIORef' skipped (\n -> (n + 1, ()))
+                      atomicModifyIORef' counter (\n -> (n + 1, ()))
+                Directory -> pure ()  -- Already handled in first pass
+                Symlink _ -> pure ()  -- Symlinks handled separately
+    
+      finally
+          (void $ mapConcurrentlyBounded concurrency writeWithProgress files)
+          (do
+              -- Clean up: kill reporter thread and finalize progress line
+              traverse_ killThread reporterThread
+              when shouldShowProgress $ do
+                  n <- readIORef counter
+                  s <- readIORef skipped
+                  clearProgress
+                  let written = n - s
+                  hPutStr stderr $ "Wrote " ++ show written ++ " metadata files"
+                  when (s > 0) $ hPutStr stderr $ " (skipped " ++ show s ++ " unchanged)"
+                  hPutStrLn stderr "."
+          )
+  where
+    partitionEntries :: [FileEntry] -> ([FilePath], [FileEntry])
+    partitionEntries es =
+      let dirs = [unPath (path e) | e <- es, case kind e of Directory -> True; _ -> False]
+          files = [e | e <- es, case kind e of File{} -> True; _ -> False]
+      in (dirs, files)
+    
+    writeProgressLoop :: IORef Int -> IORef Int -> Int -> IO ()
+    writeProgressLoop counter skipped total = go
+      where
+        go = do
+            n <- readIORef counter
+            s <- readIORef skipped
+            let pct = (n * 100) `div` max 1 total
+                written = n - s
+                msg = "Writing metadata... " ++ show written ++ "/" ++ show total ++ " files (" ++ show pct ++ "%)"
+                      ++ if s > 0 then ", skipped " ++ show s else ""
+            reportProgress msg
+            threadDelay 50000  -- 50ms
+            when (n < total) go
+
+-- | Check if a metadata file needs to be written (returns True if write needed)
+shouldWriteFile :: FilePath -> FilePath -> FileEntry -> Hash 'MD5 -> Integer -> ContentType -> IO Bool
+shouldWriteFile root metaPath entry fHash fSize fContentType = do
+  exists <- doesFileExist metaPath
+  if not exists
+    then pure True  -- File doesn't exist, must write
+    else case fContentType of
+      TextContent -> do
+        -- For text files: compare mtime and size of source vs destination
+        let sourcePath = root </> unPath (path entry)
+        sourceMtime <- getModificationTime sourcePath
+        sourceSize <- getFileSize sourcePath
+        destMtime <- getModificationTime metaPath
+        destSize <- getFileSize metaPath
+        -- Write if mtime or size differs
+        pure (sourceMtime /= destMtime || sourceSize /= destSize)
+      BinaryContent -> do
+        -- For binary files: read existing metadata and compare hash/size
+        existing <- readMetadataOrComputeHash metaPath
+        pure $ maybe True  -- Failed to read, must write
+          (\(MetaContent existingHash existingSize) ->
+            -- Write if hash or size differs
+            existingHash /= fHash || existingSize /= fSize) existing
+
+-- | Parse a metadata file (hash/size lines) or read a text file and compute hash/size.
+-- Returns Nothing if file is missing or invalid.
+-- Text files in .rgit/index/ contain actual content; binary files contain metadata.
+readMetadataFile :: FilePath -> IO (Maybe (Hash 'MD5, Integer))
+readMetadataFile fp = fmap (\mc -> (metaHash mc, metaSize mc)) <$> readMetadataOrComputeHash fp
+
+-- | List all metadata file paths under index dir, relative to index root. Excludes .gitattributes.
+listMetadataPaths :: FilePath -> IO [FilePath]
+listMetadataPaths indexRoot = go indexRoot ""
+  where
+    go :: FilePath -> FilePath -> IO [FilePath]
+    go full rel = do
+      isDir <- doesDirectoryExist full
+      if isDir
+        then do
+          names <- listDirectory full
+          let skip name = name == "." || name == ".." || name == ".gitattributes" || name == ".git"
+          let children = [ (full </> name, if null rel then name else rel </> name) | name <- names, not (skip name) ]
+          concat <$> mapM (\(p, r) -> go p r) children
+        else do
+          isFile <- doesFileExist full
+          pure (if isFile then [rel] else [])
+
+-- | Get hash and size of a file. Returns Nothing if file is missing or not a regular file.
+getFileHashAndSize :: FilePath -> FilePath -> IO (Maybe (Hash 'MD5, Integer))
+getFileHashAndSize root relPath = do
+  let full = root </> relPath
+  exists <- doesFileExist full
+  if not exists then pure Nothing
+  else do
+    h <- hashFile full
+    sz <- getFileSize full
+    pure (Just (h, fromIntegral sz))
 ```
 
 ---
@@ -6475,6 +6862,7 @@ module Bit.Types
   , EntryKind(..)
   , FileEntry(..)
   , syncHash
+  , ForceMode(..)
   , BitEnv(..)
   , BitM
   , runBitM
@@ -6518,13 +6906,18 @@ data FileEntry = FileEntry
   , kind :: EntryKind
   } deriving (Show, Eq, Generic)
 
+-- | How to handle force pushing.
+data ForceMode
+    = NoForce         -- ^ Normal push (check ancestry)
+    | Force           -- ^ Overwrite remote unconditionally
+    | ForceWithLease  -- ^ Overwrite only if remote matches last fetch
+    deriving (Show, Eq)
+
 data BitEnv = BitEnv
     { envCwd            :: FilePath
     , envLocalFiles     :: [FileEntry]
     , envRemote         :: Maybe Remote
-    , envForce          :: Bool
-    , envForceWithLease :: Bool
-    , envSkipVerify     :: Bool
+    , envForceMode      :: ForceMode
     }
 
 type BitM = ReaderT BitEnv IO
@@ -6557,6 +6950,7 @@ module Bit.Utils
   
     -- * Formatting utilities
   , formatBytes
+  , trimGitOutput
   
     -- * Atomic file writes (re-exported from Bit.AtomicWrite)
   , atomicWriteFile
@@ -6619,6 +7013,11 @@ formatBytes bytes
         let multiplier = 10 ^ decimals
             rounded = fromIntegral (round (n * multiplier) :: Integer) / multiplier
         in show rounded
+
+-- | Trim whitespace from git output (newlines, spaces, tabs, carriage returns).
+-- Git commands often return commit hashes or refs with trailing newlines.
+trimGitOutput :: String -> String
+trimGitOutput = filter (\c -> c /= ' ' && c /= '\n' && c /= '\r' && c /= '\t')
 ```
 
 ---
@@ -6630,322 +7029,427 @@ formatBytes bytes
 *Source file.*
 
 ```haskell
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE LambdaCase #-}
-
-module Bit.Verify
-  ( verifyLocal
-  , verifyLocalAt
-  , verifyRemote
-  , VerifyIssue(..)
-  , loadBinaryMetadata
-  , loadMetadataFromBundle
-  , MetadataEntry(..)
-  , MetadataSource(..)
-  , loadMetadata
-  , entryPath
-  , binaryEntries
-  , allEntryPaths
-  ) where
-
-import Bit.Types (Hash(..), HashAlgo(..), Path(..), FileEntry(..), EntryKind(..), syncHash, hashToText)
-import Bit.Utils (filterOutBitPaths)
-import Bit.Concurrency (Concurrency(..), runConcurrently, ioConcurrency)
-import System.FilePath ((</>), makeRelative, normalise)
-import System.Directory (doesFileExist, listDirectory, doesDirectoryExist, removeFile)
-import Data.List (isPrefixOf)
-import Data.Maybe (maybeToList)
-import qualified Data.ByteString as BS
-import qualified Data.Text as T
-import qualified Internal.Git as Git
-import Bit.Internal.Metadata (MetaContent(..), parseMetadata, readMetadataOrComputeHash, hashFile, parseMetadataFile)
-import qualified Bit.Remote.Scan as Remote.Scan
-import qualified Bit.Remote
-import qualified Internal.Transport as Transport
-import Internal.Config (fetchedBundle, bitIndexPath, bundleCwdPath, fromCwdPath, BundleName)
-import System.Process (readProcessWithExitCode)
-import System.Exit (ExitCode(..))
-import Data.Char (isSpace)
-import System.IO (hPutStrLn, stderr)
-import Control.Monad (when, unless)
-import qualified Data.Map as Map
-import qualified Data.Set as Set
-import Data.IORef (IORef, atomicModifyIORef')
-
--- | Result of comparing one file to metadata.
-data VerifyIssue
-  = HashMismatch Path String String Integer Integer  -- path, expectedHash, actualHash, expectedSize, actualSize
-  | Missing Path                                      -- path (in metadata but no actual file)
-  deriving (Show, Eq)
-
--- | A metadata entry loaded from any source.
--- Binary files have hash+size metadata that can be verified.
--- Text files are known to exist but their hashes may not be reliably comparable
--- across sources (git normalizes line endings in blobs).
-data MetadataEntry
-  = BinaryEntry Path (Hash 'MD5) Integer   -- ^ Hash-verifiable: path, hash, size
-  | TextEntry Path                          -- ^ Exists but not hash-comparable
-  deriving (Show, Eq)
-
--- | Source for reading metadata entries.
-data MetadataSource
-  = FromFilesystem FilePath            -- ^ Read .bit/index/ directory on disk
-  | FromCommit String                  -- ^ Read from a git commit hash (e.g. refs/remotes/origin/main)
-  deriving (Show, Eq)
-
--- | Extract path from any entry.
-entryPath :: MetadataEntry -> Path
-entryPath (BinaryEntry p _ _) = p
-entryPath (TextEntry p) = p
-
--- | Extract verifiable (binary) entries only.
-binaryEntries :: [MetadataEntry] -> [(Path, Hash 'MD5, Integer)]
-binaryEntries = concatMap go
-  where go (BinaryEntry p h s) = [(p, h, s)]
-        go (TextEntry _) = []
-
--- | Extract all known paths (binary + text).
-allEntryPaths :: [MetadataEntry] -> Set.Set Path
-allEntryPaths = Set.fromList . map entryPath
-
--- | Filter to user files only (exclude .git internals and .gitignore).
--- Used by BOTH filesystem and commit-tree paths.
-isUserFile :: FilePath -> Bool
-isUserFile filePath = not (isGitPath filePath) && filePath /= ".gitignore"
-
--- | Resolve concurrency setting to a concrete bound.
-resolveConcurrency :: Concurrency -> IO Int
-resolveConcurrency Sequential = pure 1
-resolveConcurrency (Parallel 0) = ioConcurrency
-resolveConcurrency (Parallel n) = pure n
-
--- | List all regular files under dir, with paths relative to baseDir.
-listFilesRecursive :: FilePath -> FilePath -> IO [FilePath]
-listFilesRecursive baseDir dir = do
-  entries <- listDirectory dir
-  concat <$> mapM (\name -> do
-    let full = dir </> name
-    isDir <- doesDirectoryExist full
-    if isDir
-      then listFilesRecursive baseDir full
-      else pure [makeRelative baseDir full]
-    ) entries
-
--- | Check if a path is within the .git directory.
-isGitPath :: FilePath -> Bool
-isGitPath filePath = ".git" `isPrefixOf` normalise filePath || normalise filePath == ".git"
-
--- | Load metadata entries from any source.
--- Handles file enumeration, parsing, and binary/text classification uniformly.
-loadMetadata :: MetadataSource -> Concurrency -> IO [MetadataEntry]
-loadMetadata (FromFilesystem indexDir) concurrency = do
-  exists <- doesDirectoryExist indexDir
-  if not exists
-    then pure []
-    else do
-      relPaths <- listFilesRecursive indexDir indexDir
-      let userPaths = filter isUserFile relPaths
-      bound <- resolveConcurrency concurrency
-      runConcurrently (Parallel bound) (readEntryFromFilesystem indexDir) userPaths
-
-loadMetadata (FromCommit commitHash) _concurrency = do
-  -- ls-tree at ROOT level (no prefix!) to enumerate all files
-  (code, out, _) <- readProcessWithExitCode "git"
-    [ "-C", bitIndexPath, "ls-tree", "-r", "--name-only", commitHash ] ""
-  if code /= ExitSuccess
-    then pure []
-    else do
-      let paths = filter isUserFile $ filter (not . null) $ lines out
-      mapM (readEntryFromCommit commitHash) paths
-
--- | Read a single metadata entry from a filesystem path.
-readEntryFromFilesystem :: FilePath -> FilePath -> IO MetadataEntry
-readEntryFromFilesystem indexDir relPath = do
-  let fullPath = indexDir </> relPath
-  mc <- readMetadataOrComputeHash fullPath
-  case mc of
-    Just (MetaContent { metaHash = h, metaSize = sz }) ->
-      -- Check if this was parsed as metadata (binary) or computed from content (text)
-      -- by trying parseMetadata on the raw content
-      parseMetadataFile fullPath >>= \case
-        Just _ -> pure (BinaryEntry (Path relPath) h sz)   -- has hash:/size: format → binary
-        Nothing -> pure (TextEntry (Path relPath))          -- content IS the file → text
-    Nothing -> pure (TextEntry (Path relPath))  -- shouldn't happen, but safe fallback
-
--- | Read a single metadata entry from a git commit tree.
-readEntryFromCommit :: String -> FilePath -> IO MetadataEntry
-readEntryFromCommit commitHash relPath = do
-  -- NOTE: path is at root level in the commit tree, NOT under index/
-  (code, content, _) <- readProcessWithExitCode "git"
-    [ "-C", bitIndexPath, "show", commitHash ++ ":" ++ relPath ] ""
-  if code /= ExitSuccess
-    then pure (TextEntry (Path relPath))
-    else case parseMetadata content of
-      Just (MetaContent { metaHash = h, metaSize = sz }) ->
-        pure (BinaryEntry (Path relPath) h sz)
-      Nothing ->
-        pure (TextEntry (Path relPath))  -- text file: content IS the data, skip hash verify
-
--- | Load only binary (hash-verifiable) metadata entries from the index.
--- Text files are excluded. If you need all entries, use 'loadMetadata' directly.
-loadBinaryMetadata :: FilePath -> Concurrency -> IO [(Path, Hash 'MD5, Integer)]
-loadBinaryMetadata indexDir concurrency =
-  binaryEntries <$> loadMetadata (FromFilesystem indexDir) concurrency
-
--- | Verify working tree at an arbitrary root path against metadata at that path.
--- This is the core verification function used for both local and filesystem remote verification.
--- Returns (number of files checked, list of issues).
--- If an IORef counter is provided, it will be incremented after each file is checked.
-verifyLocalAt :: FilePath -> Maybe (IORef Int) -> Concurrency -> IO (Int, [VerifyIssue])
-verifyLocalAt root mCounter concurrency = do
-  let indexDir = root </> ".bit/index"
-  entries <- loadMetadata (FromFilesystem indexDir) concurrency
-  -- Filter out .git directory entries
-  let filteredEntries = filter (\entry -> not (isGitPath (unPath (entryPath entry)))) entries
-  
-  -- Determine concurrency level
-  bound <- resolveConcurrency concurrency
-  
-  -- Parallelize verification (IO-bound: file reads and hashing)
-  issues <- runConcurrently (Parallel bound) (checkOne root indexDir) filteredEntries
-  pure (length filteredEntries, concat issues)
-  where
-    checkOne rootPath indexPath entry = do
-      let relPath = entryPath entry
-          actualPath = rootPath </> unPath relPath
-      exists <- doesFileExist actualPath
-      result <- if not exists
-        then pure [Missing relPath]
-        else case entry of
-          BinaryEntry _ expectedHash expectedSize -> do
-            actualHash <- hashFile actualPath
-            actualSize <- fromIntegral . BS.length <$> BS.readFile actualPath
-            if actualHash == expectedHash && actualSize == expectedSize
-              then pure []
-              else pure [HashMismatch relPath (T.unpack (hashToText expectedHash)) (T.unpack (hashToText actualHash)) expectedSize actualSize]
-          TextEntry _ -> do
-            -- Text files: just verify they exist (already checked above)
-            -- Could optionally verify content matches index, but that's redundant
-            -- since the index content IS the file content for text files
-            actualHash <- hashFile actualPath
-            actualSize <- fromIntegral . BS.length <$> BS.readFile actualPath
-            -- For text files, we need to check against what's in the index
-            let indexFilePath = indexPath </> unPath relPath
-            indexHash <- hashFile indexFilePath
-            indexSize <- fromIntegral . BS.length <$> BS.readFile indexFilePath
-            if actualHash == indexHash && actualSize == indexSize
-              then pure []
-              else pure [HashMismatch relPath (T.unpack (hashToText indexHash)) (T.unpack (hashToText actualHash)) indexSize actualSize]
-      -- Increment counter after checking file (atomicModifyIORef' is thread-safe)
-      maybe (pure ()) (\ref -> atomicModifyIORef' ref (\n -> (n + 1, ()))) mCounter
-      pure result
-
--- | Verify local working tree against metadata in .rgit/index.
--- Returns (number of files checked, list of issues).
--- If an IORef counter is provided, it will be incremented after each file is checked.
-verifyLocal :: FilePath -> Maybe (IORef Int) -> Concurrency -> IO (Int, [VerifyIssue])
-verifyLocal cwd = verifyLocalAt cwd
-
--- | Extract metadata from a bundle's HEAD commit.
--- First fetches the bundle into the repo, then reads metadata from refs/remotes/origin/main.
--- Returns (binaryMetadata, allKnownPaths):
---   binaryMetadata: list of (path, hash, size) for binary files (verifiable)
---   allKnownPaths: set of all file paths in the bundle (binary + text, for "extra files" check)
--- Text files are NOT hash-verified because git may normalize line endings (CRLF→LF),
--- causing hash mismatches with the actual files on the remote.
-loadMetadataFromBundle :: BundleName -> IO ([(Path, Hash 'MD5, Integer)], Set.Set Path)
-loadMetadataFromBundle bundleName = do
-  -- First, fetch the bundle into the repo so we can read from it
-  fetchCode <- Git.fetchFromBundle bundleName
-  if fetchCode /= ExitSuccess
-    then pure ([], Set.empty)
-    else do
-      -- Get the remote HEAD hash (now available as refs/remotes/origin/main)
-      (_code, out, _) <- readProcessWithExitCode "git"
-        [ "-C", bitIndexPath
-        , "rev-parse"
-        , "refs/remotes/origin/main"
-        ] ""
-      case filter (not . isSpace) out of
-        [] -> pure ([], Set.empty)
-        headHash -> do
-          entries <- loadMetadata (FromCommit headHash) Sequential
-          pure (binaryEntries entries, allEntryPaths entries)
-
--- | Verify remote files match remote metadata.
--- Returns (number of files checked, list of issues).
--- If an IORef counter is provided, it will be incremented after each file is checked.
-verifyRemote :: FilePath -> Bit.Remote.Remote -> Maybe (IORef Int) -> Concurrency -> IO (Int, [VerifyIssue])
-verifyRemote _cwd remote mCounter _concurrency = do
-  -- 1. Fetch the remote bundle if needed
-  let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
-  bundleExists <- doesFileExist fetchedPath
-  unless bundleExists $ do
-    let localDest = ".bit/temp_remote.bundle"
-    fetchResult <- Transport.copyFromRemoteDetailed remote ".bit/bit.bundle" localDest
-    case fetchResult of
-      Transport.CopySuccess -> do
-        -- Copy to fetchedPath for consistency
-        BS.readFile localDest >>= BS.writeFile fetchedPath
-        when (localDest /= fetchedPath) $ safeRemove localDest
-      _ -> do
-        hPutStrLn stderr "Error: Could not fetch remote bundle."
-        pure ()
-  
-  -- Check if bundle exists now (if fetch failed, we can't continue)
-  bundleExistsNow <- doesFileExist fetchedPath
-  if not bundleExistsNow
-    then pure (0, [])
-    else do
-      -- 2. Load metadata from the bundle (binary metadata + all known paths)
-      (remoteMeta, allKnownPaths) <- loadMetadataFromBundle fetchedBundle
-      
-      -- 3. Fetch actual remote files
-      Remote.Scan.fetchRemoteFiles remote >>= either
-        (\_ -> hPutStrLn stderr "Error: Could not fetch remote file list." >> pure (0, []))
-        (\remoteFiles -> do
-          let filteredRemoteFiles = filterOutBitPaths remoteFiles
-          
-          -- 4. Build maps for comparison (both use MD5 hashes)
-          let remoteFileMap = Map.fromList
-                [ (normalise (unPath e.path), (h, e.kind))
-                | e <- filteredRemoteFiles
-                , h <- maybeToList (syncHash e.kind)
-                ]
-          
-          -- 5. Compare binary file metadata with actual files on remote
-          issues <- traverse (checkRemoteFile remoteFileMap) remoteMeta
-          
-          -- 6. Check for files on remote that aren't known to the bundle
-          -- Use allKnownPaths (binary + text) to avoid false positives for text files
-          let filePaths = Set.fromList (map Path (Map.keys remoteFileMap))
-              extraPaths = filePaths `Set.difference` allKnownPaths
-              extraIssues = map (\p -> HashMismatch p "(not in metadata)" "(exists on remote)" 0 0) (Set.toList extraPaths)
-          
-          pure (length remoteMeta, concat issues ++ extraIssues))
-  where
-    -- Check one file from metadata against remote (both use MD5)
-    checkRemoteFile :: Map.Map FilePath (Hash 'MD5, EntryKind) -> (Path, Hash 'MD5, Integer) -> IO [VerifyIssue]
-    checkRemoteFile remoteFileMap (relPath, expectedHash, expectedSize) = do
-      let normalizedPath = normalise (unPath relPath)
-      result <- case Map.lookup normalizedPath remoteFileMap of
-        Nothing -> pure [Missing relPath]
-        Just (actualHash, File _ actualSize _) ->
-          if actualHash == expectedHash && actualSize == expectedSize
-            then pure []
-            else pure [HashMismatch relPath (T.unpack (hashToText expectedHash)) (T.unpack (hashToText actualHash)) expectedSize actualSize]
-        Just _ -> pure []
-      -- Increment counter after checking file
-      maybe (pure ()) (\ref -> atomicModifyIORef' ref (\n -> (n + 1, ()))) mCounter
-      pure result
-
--- Helper to safely remove a file
-safeRemove :: FilePath -> IO ()
-safeRemove filePath = do
-  exists <- doesFileExist filePath
-  when exists $ removeFile filePath
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE LambdaCase #-}
+
+module Bit.Verify
+  ( verifyLocal
+  , verifyLocalAt
+  , verifyRemote
+  , VerifyIssue(..)
+  , loadBinaryMetadata
+  , loadCommittedBinaryMetadata
+  , loadMetadataFromBundle
+  , MetadataEntry(..)
+  , MetadataSource(..)
+  , loadMetadata
+  , entryPath
+  , binaryEntries
+  , allEntryPaths
+  ) where
+
+import Bit.Types (Hash(..), HashAlgo(..), Path(..), FileEntry(..), EntryKind(..), syncHash, hashToText)
+import Bit.Utils (filterOutBitPaths, toPosix)
+import Bit.Concurrency (Concurrency(..), runConcurrently, ioConcurrency)
+import System.FilePath ((</>), makeRelative, normalise, takeDirectory)
+import System.Directory (doesFileExist, listDirectory, doesDirectoryExist, removeFile, createDirectoryIfMissing, removeDirectoryRecursive, getPermissions, setPermissions, setOwnerWritable, setModificationTime)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
+import Data.List (isPrefixOf)
+import Data.Maybe (maybeToList)
+import qualified Data.ByteString as BS
+import qualified Data.Text as T
+import qualified Internal.Git as Git
+import Bit.Internal.Metadata (MetaContent(..), parseMetadata, parseMetadataFile, hashFile, serializeMetadata)
+import qualified Bit.Remote.Scan as Remote.Scan
+import qualified Bit.Remote
+import qualified Internal.Transport as Transport
+import Internal.Config (fetchedBundle, bitIndexPath, bundleCwdPath, fromCwdPath, BundleName)
+import System.Process (readProcessWithExitCode)
+import System.Exit (ExitCode(..))
+import Data.Char (isSpace)
+import System.IO (hPutStrLn, stderr)
+import Control.Monad (when, unless, void)
+import Data.Foldable (traverse_)
+import qualified Data.Map as Map
+import qualified Data.Set as Set
+import Data.IORef (IORef, atomicModifyIORef')
+import qualified Bit.Scan as Scan
+
+-- | Result of comparing one file to metadata.
+data VerifyIssue
+  = HashMismatch Path String String Integer Integer  -- path, expectedHash, actualHash, expectedSize, actualSize
+  | Missing Path                                      -- path (in metadata but no actual file)
+  deriving (Show, Eq)
+
+-- | A metadata entry loaded from any source.
+-- Binary files have hash+size metadata that can be verified.
+-- Text files are known to exist but their hashes may not be reliably comparable
+-- across sources (git normalizes line endings in blobs).
+data MetadataEntry
+  = BinaryEntry Path (Hash 'MD5) Integer   -- ^ Hash-verifiable: path, hash, size
+  | TextEntry Path                          -- ^ Exists but not hash-comparable
+  deriving (Show, Eq)
+
+-- | Source for reading metadata entries.
+data MetadataSource
+  = FromFilesystem FilePath            -- ^ Read .bit/index/ directory on disk
+  | FromCommit String                  -- ^ Read from a git commit hash (e.g. refs/remotes/origin/main)
+  deriving (Show, Eq)
+
+-- | Extract path from any entry.
+entryPath :: MetadataEntry -> Path
+entryPath (BinaryEntry p _ _) = p
+entryPath (TextEntry p) = p
+
+-- | Extract verifiable (binary) entries only.
+binaryEntries :: [MetadataEntry] -> [(Path, Hash 'MD5, Integer)]
+binaryEntries = concatMap go
+  where go (BinaryEntry p h s) = [(p, h, s)]
+        go (TextEntry _) = []
+
+-- | Extract all known paths (binary + text).
+allEntryPaths :: [MetadataEntry] -> Set.Set Path
+allEntryPaths = Set.fromList . map entryPath
+
+-- | Filter to user files only (exclude .git internals and .gitignore).
+-- Used by BOTH filesystem and commit-tree paths.
+isUserFile :: FilePath -> Bool
+isUserFile filePath = not (isGitPath filePath) && filePath /= ".gitignore"
+
+-- | Resolve concurrency setting to a concrete bound.
+resolveConcurrency :: Concurrency -> IO Int
+resolveConcurrency Sequential = pure 1
+resolveConcurrency (Parallel 0) = ioConcurrency
+resolveConcurrency (Parallel n) = pure n
+
+-- | List all regular files under dir, with paths relative to baseDir.
+listFilesRecursive :: FilePath -> FilePath -> IO [FilePath]
+listFilesRecursive baseDir dir = do
+  entries <- listDirectory dir
+  concat <$> mapM (\name -> do
+    let full = dir </> name
+    isDir <- doesDirectoryExist full
+    if isDir
+      then listFilesRecursive baseDir full
+      else pure [makeRelative baseDir full]
+    ) entries
+
+-- | Check if a path is within the .git directory.
+isGitPath :: FilePath -> Bool
+isGitPath filePath = ".git" `isPrefixOf` normalise filePath || normalise filePath == ".git"
+
+-- | Load metadata entries from any source.
+-- Handles file enumeration, parsing, and binary/text classification uniformly.
+loadMetadata :: MetadataSource -> Concurrency -> IO [MetadataEntry]
+loadMetadata (FromFilesystem indexDir) concurrency = do
+  exists <- doesDirectoryExist indexDir
+  if not exists
+    then pure []
+    else do
+      relPaths <- listFilesRecursive indexDir indexDir
+      let userPaths = filter isUserFile relPaths
+      bound <- resolveConcurrency concurrency
+      runConcurrently (Parallel bound) (readEntryFromFilesystem indexDir) userPaths
+
+loadMetadata (FromCommit commitHash) _concurrency = do
+  -- ls-tree at ROOT level (no prefix!) to enumerate all files
+  (code, out, _) <- readProcessWithExitCode "git"
+    [ "-C", bitIndexPath, "-c", "core.quotePath=false", "ls-tree", "-r", "--name-only", commitHash ] ""
+  case code of
+    ExitSuccess -> do
+      let paths = filter isUserFile $ filter (not . null) $ lines out
+      mapM (readEntryFromCommit commitHash) paths
+    _ -> pure []
+
+-- | Read a single metadata entry from a filesystem path.
+readEntryFromFilesystem :: FilePath -> FilePath -> IO MetadataEntry
+readEntryFromFilesystem indexDir relPath =
+  classifyMetadataFile (Path relPath) (indexDir </> relPath)
+
+-- | Read a single metadata entry from a git commit tree.
+readEntryFromCommit :: String -> FilePath -> IO MetadataEntry
+readEntryFromCommit commitHash relPath = do
+  -- NOTE: path is at root level in the commit tree, NOT under index/
+  (code, content, _) <- readProcessWithExitCode "git"
+    [ "-C", bitIndexPath, "show", commitHash ++ ":" ++ relPath ] ""
+  pure $ case code of
+    ExitSuccess -> classifyMetadata (Path relPath) content
+    _           -> TextEntry (Path relPath)
+
+-- | Classify metadata content string as binary or text entry.
+classifyMetadata :: Path -> String -> MetadataEntry
+classifyMetadata p content =
+  case parseMetadata content of
+    Just mc -> BinaryEntry p (metaHash mc) (metaSize mc)
+    Nothing -> TextEntry p
+
+-- | Classify a metadata file on disk as binary or text entry.
+classifyMetadataFile :: Path -> FilePath -> IO MetadataEntry
+classifyMetadataFile p filePath =
+  parseMetadataFile filePath >>= \case
+    Just mc -> pure (BinaryEntry p (metaHash mc) (metaSize mc))
+    Nothing -> pure (TextEntry p)
+
+-- | Load only binary (hash-verifiable) metadata entries from the index.
+-- Text files are excluded. If you need all entries, use 'loadMetadata' directly.
+loadBinaryMetadata :: FilePath -> Concurrency -> IO [(Path, Hash 'MD5, Integer)]
+loadBinaryMetadata indexDir concurrency =
+  binaryEntries <$> loadMetadata (FromFilesystem indexDir) concurrency
+
+-- | Load binary metadata from the committed (HEAD) state of a .bit/index repo.
+-- This returns what the metadata *should* be, immune to scan updates.
+loadCommittedBinaryMetadata :: FilePath -> IO [(Path, Hash 'MD5, Integer)]
+loadCommittedBinaryMetadata indexDir = do
+  (code, out, _) <- Git.runGitAt indexDir ["rev-parse", "HEAD"]
+  case code of
+    ExitSuccess -> do
+      let headHash = filter (not . isSpace) out
+      binaryEntries <$> loadMetadata (FromCommit headHash) Sequential
+    _ -> pure []
+
+-- | Verify working tree at an arbitrary root path against its committed metadata.
+-- Scans the working directory to update .bit/index/ metadata, then uses
+-- git diff to find files whose metadata changed from the committed state.
+-- Returns (number of files checked, list of issues).
+-- If an IORef counter is provided, it will be incremented after each file is checked.
+verifyLocalAt :: FilePath -> Maybe (IORef Int) -> Concurrency -> IO (Int, [VerifyIssue])
+verifyLocalAt root mCounter _concurrency = do
+  let indexDir = root </> bitIndexPath
+
+  -- 1. Scan working directory and update .bit/index/ metadata
+  entries <- Scan.scanWorkingDir root
+  Scan.writeMetadataFiles root entries
+
+  -- 2. Defeat racy git: set mtime to epoch so git always re-reads content.
+  --    Without this, git's stat cache can skip content comparison when metadata
+  --    files have the same byte length (e.g. two 2-digit file sizes).
+  let metaFiles = [indexDir </> unPath (path e) | e <- entries
+                  , case kind e of File{} -> True; _ -> False]
+  mapM_ (\f -> setModificationTime f (posixSecondsToUTCTime 0)) metaFiles
+
+  -- 3. git diff in the index repo to find files changed from committed state
+  (diffCode, diffOut, _) <- Git.runGitAt indexDir ["diff", "--name-only"]
+  let changedPaths
+        | diffCode == ExitSuccess = filter (not . null) (lines diffOut)
+        | otherwise               = []
+
+  -- 4. Also check for missing files: committed paths not in working tree
+  (lsCode, lsOut, _) <- Git.runGitAt indexDir ["ls-tree", "-r", "--name-only", "HEAD"]
+  let committedPaths
+        | lsCode == ExitSuccess = filter isUserFile $ filter (not . null) (lines lsOut)
+        | otherwise             = []
+
+  -- 5. Build issues from changed files (hash mismatches)
+  mismatchIssues <- concat <$> mapM (checkChanged indexDir) changedPaths
+
+  -- 6. Build issues from missing files (committed but not in working tree)
+  missingFiltered <- fmap concat $ mapM (\p -> do
+    exists <- doesFileExist (root </> p)
+    pure [Missing (Path p) | not exists]
+    ) committedPaths
+
+  let allIssues = mismatchIssues ++ missingFiltered
+      totalChecked = length committedPaths
+
+  -- Update counter
+  traverse_ (\ref -> atomicModifyIORef' ref (\_ -> (totalChecked, ()))) mCounter
+
+  pure (totalChecked, allIssues)
+  where
+    checkChanged indexDir relPath = do
+      (showCode, committedContent, _) <- Git.runGitAt indexDir ["show", "HEAD:" ++ relPath]
+      let fsPath = indexDir </> relPath
+      fsExists <- doesFileExist fsPath
+      case (showCode, fsExists) of
+        (ExitSuccess, True) -> do
+          let committed = classifyMetadata (Path relPath) committedContent
+          actual <- classifyMetadataFile (Path relPath) fsPath
+          case (committed, actual) of
+            (BinaryEntry _ eh es, BinaryEntry _ ah as') ->
+              pure [HashMismatch (Path relPath)
+                      (T.unpack (hashToText eh))
+                      (T.unpack (hashToText ah))
+                      es
+                      as']
+            (BinaryEntry _ eh es, TextEntry _) -> do
+              actualHash <- hashFile fsPath
+              actualSize <- fromIntegral . BS.length <$> BS.readFile fsPath
+              pure [HashMismatch (Path relPath)
+                      (T.unpack (hashToText eh))
+                      (T.unpack (hashToText actualHash))
+                      es
+                      actualSize]
+            (TextEntry _, TextEntry _) ->
+              reportTextMismatch fsPath relPath
+            (TextEntry _, BinaryEntry _ _ _) ->
+              reportTextMismatch fsPath relPath
+        _ -> pure []
+
+    reportTextMismatch fsPath relPath = do
+      actualHash <- hashFile fsPath
+      actualSize <- fromIntegral . BS.length <$> BS.readFile fsPath
+      pure [HashMismatch (Path relPath)
+              "(committed)"
+              (T.unpack (hashToText actualHash))
+              0
+              actualSize]
+
+-- | Verify local working tree against committed metadata in .bit/index.
+-- Returns (number of files checked, list of issues).
+-- If an IORef counter is provided, it will be incremented after each file is checked.
+verifyLocal :: FilePath -> Maybe (IORef Int) -> Concurrency -> IO (Int, [VerifyIssue])
+verifyLocal cwd = verifyLocalAt cwd
+
+-- | Extract metadata from a bundle's HEAD commit.
+-- First fetches the bundle into the repo, then reads metadata from refs/remotes/origin/main.
+-- Returns all metadata entries (binary + text). Callers extract what they need
+-- via 'binaryEntries' or 'allEntryPaths'.
+loadMetadataFromBundle :: BundleName -> IO [MetadataEntry]
+loadMetadataFromBundle bundleName = do
+  -- First, fetch the bundle into the repo so we can read from it
+  fetchCode <- Git.fetchFromBundle bundleName
+  case fetchCode of
+    ExitSuccess -> do
+      -- Get the remote HEAD hash (now available as refs/remotes/origin/main)
+      (_code, out, _) <- readProcessWithExitCode "git"
+        [ "-C", bitIndexPath
+        , "rev-parse"
+        , "refs/remotes/origin/main"
+        ] ""
+      case filter (not . isSpace) out of
+        [] -> pure []
+        headHash -> loadMetadata (FromCommit headHash) Sequential
+    _ -> pure []
+
+-- | Verify remote files match remote metadata.
+-- Sets up a temporary working tree in .bit/vremotes/<name>/, checks out the
+-- expected state from the bundle, overwrites with actual remote data (rclone
+-- metadata for binaries, downloaded content for text files), then runs a single
+-- git diff to find all mismatches.
+-- Returns (number of files checked, list of issues).
+-- If an IORef counter is provided, it will be incremented after each file is checked.
+verifyRemote :: FilePath -> Bit.Remote.Remote -> Maybe (IORef Int) -> Concurrency -> IO (Int, [VerifyIssue])
+verifyRemote cwd remote mCounter _concurrency = do
+  -- 1. Fetch the remote bundle if needed
+  let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
+  bundleExists <- doesFileExist fetchedPath
+  unless bundleExists $ do
+    let localDest = ".bit/temp_remote.bundle"
+    fetchResult <- Transport.copyFromRemoteDetailed remote ".bit/bit.bundle" localDest
+    case fetchResult of
+      Transport.CopySuccess -> do
+        BS.readFile localDest >>= BS.writeFile fetchedPath
+        when (localDest /= fetchedPath) $ safeRemove localDest
+      _ -> do
+        hPutStrLn stderr "Error: Could not fetch remote bundle."
+        pure ()
+
+  bundleExistsNow <- doesFileExist fetchedPath
+  if not bundleExistsNow
+    then pure (0, [])
+    else do
+      -- 2. Load metadata from bundle (classifies entries; fetches bundle into .bit/index)
+      entries <- loadMetadataFromBundle fetchedBundle
+      let allKnownPaths = allEntryPaths entries
+
+      -- 3. Fetch remote file list via rclone ls
+      Remote.Scan.fetchRemoteFiles remote >>= either
+        (const $ hPutStrLn stderr "Error: Could not fetch remote file list." >> pure (0, []))
+        (\remoteFiles -> do
+          let filteredRemoteFiles = filterOutBitPaths remoteFiles
+              remoteFileMap = Map.fromList
+                [ (normalise (unPath e.path), (h, e.kind))
+                | e <- filteredRemoteFiles
+                , h <- maybeToList (syncHash e.kind)
+                ]
+
+          -- 4. Set up verification working tree
+          let vremoteDir = cwd </> ".bit" </> "vremotes" </> Bit.Remote.remoteName remote
+          forceRemoveDir vremoteDir
+          createDirectoryIfMissing True vremoteDir
+
+          -- Checkout expected state from the remote's bundle
+          let absBundlePath = cwd </> fetchedPath
+          void $ Git.runGitAt vremoteDir ["init", "-q"]
+          void $ Git.runGitAt vremoteDir ["fetch", "-q", absBundlePath, "refs/heads/main:refs/heads/main"]
+          void $ Git.runGitAt vremoteDir ["checkout", "-q", "main"]
+
+          -- 5. Overwrite working tree with actual remote state:
+          --    Binary: construct metadata from rclone ls data
+          --    Text: download actual content from remote
+          --    Missing: delete the checked-out file
+          mapM_ (\entry -> do
+            let p = entryPath entry
+                destFile = vremoteDir </> unPath p
+            case entry of
+              BinaryEntry _ _ _ ->
+                case Map.lookup (normalise (unPath p)) remoteFileMap of
+                  Just (h, File _ sz _) ->
+                    writeFile destFile (serializeMetadata (MetaContent h sz))
+                  _ -> safeRemove destFile
+              TextEntry _ -> do
+                code <- Transport.copyFromRemote remote (toPosix (unPath p)) destFile
+                when (code /= ExitSuccess) $ safeRemove destFile
+            traverse_ (\ref -> atomicModifyIORef' ref (\n -> (n + 1, ()))) mCounter
+            ) entries
+
+          -- 6. Single git diff: compares actual working tree against expected (HEAD)
+          (_, diffOut, _) <- Git.runGitAt vremoteDir
+            ["diff", "--ignore-cr-at-eol", "--name-status", "HEAD"]
+          let entryMap = Map.fromList
+                [(normalise (unPath (entryPath e)), e) | e <- entries]
+              issues = concatMap (parseDiffLine entryMap remoteFileMap)
+                (filter (not . null) (lines diffOut))
+
+          -- 7. Extra files on remote not in bundle metadata
+          let filePaths = Set.fromList (map Path (Map.keys remoteFileMap))
+              extraPaths = filePaths `Set.difference` allKnownPaths
+              extraIssues = map (\p -> HashMismatch p "(not in metadata)" "(exists on remote)" 0 0) (Set.toList extraPaths)
+
+          -- 8. Clean up (.git/objects are read-only, need forceRemoveDir)
+          forceRemoveDir vremoteDir
+
+          pure (length entries, issues ++ extraIssues))
+  where
+    parseDiffLine entryMap remoteFileMap line =
+      let (status, rest) = break (== '\t') line
+          path = drop 1 rest
+          npath = normalise path
+      in case status of
+        "D" -> [Missing (Path path)]
+        "M" -> case (Map.lookup npath entryMap, Map.lookup npath remoteFileMap) of
+          (Just (BinaryEntry p eh es), Just (ah, File _ as' _)) ->
+            [HashMismatch p (T.unpack (hashToText eh)) (T.unpack (hashToText ah)) es as']
+          _ -> [HashMismatch (Path path) "(committed)" "(remote differs)" 0 0]
+        _ -> []
+
+-- Helper to safely remove a file
+safeRemove :: FilePath -> IO ()
+safeRemove filePath = do
+  exists <- doesFileExist filePath
+  when exists $ removeFile filePath
+
+-- | Remove a directory tree, handling read-only files (e.g. .git/objects).
+forceRemoveDir :: FilePath -> IO ()
+forceRemoveDir dir = do
+  exists <- doesDirectoryExist dir
+  when exists $ do
+    makeWritable dir
+    removeDirectoryRecursive dir
+  where
+    makeWritable d = do
+      contents <- listDirectory d
+      mapM_ (\name -> do
+        let full = d </> name
+        isDir <- doesDirectoryExist full
+        if isDir
+          then makeWritable full
+          else do
+            perms <- getPermissions full
+            setPermissions full (setOwnerWritable True perms)
+        ) contents
 ```
 
 ---
@@ -7032,7 +7536,7 @@ import System.FilePath ((</>))
 import System.Directory (doesFileExist)
 import Data.Char (isSpace)
 import Data.List (dropWhileEnd)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.ByteString as BS
@@ -7065,9 +7569,7 @@ readTextConfig = do
     then pure defaultTextConfig
     else do
       bs <- BS.readFile configPath
-      let content = case T.decodeUtf8' bs of
-            Left _ -> T.empty  -- Invalid UTF-8, use defaults
-            Right txt -> txt
+      let content = either (const T.empty) id (T.decodeUtf8' bs)
       pure $ parseConfig content
 
 -- | Read config file (for future expansion)
@@ -7088,22 +7590,18 @@ parseConfig content =
 
 -- | Find index of first element matching predicate
 findIndex' :: (a -> Bool) -> [a] -> Maybe Int
-findIndex' p xs = case [i | (i, x) <- zip [0..] xs, p x] of
-  [] -> Nothing
-  (i:_) -> Just i
+findIndex' p xs = listToMaybe [i | (i, x) <- zip [0..] xs, p x]
 
 -- | Extract lines for a given section (between [section] and next [section] or EOF)
 extractSection :: String -> [T.Text] -> [T.Text]
 extractSection sectionName linesOfText =
   let sectionHeader = "[" ++ sectionName ++ "]"
       -- Find start of section
-      startIdx = case findIndex' (\l -> T.strip l == T.pack sectionHeader) linesOfText of
-        Nothing -> length linesOfText  -- Section not found
-        Just idx -> idx + 1
+      startIdx = maybe (length linesOfText) (+ 1) $
+        findIndex' (\l -> T.strip l == T.pack sectionHeader) linesOfText
       -- Find end of section (next [section] or EOF)
-      endIdx = case findIndex' (\l -> T.stripStart l `T.isPrefixOf` T.pack "[") (drop startIdx linesOfText) of
-        Nothing -> length linesOfText
-        Just idx -> startIdx + idx
+      endIdx = maybe (length linesOfText) (+ startIdx) $
+        findIndex' (\l -> T.stripStart l `T.isPrefixOf` T.pack "[") (drop startIdx linesOfText)
   in map T.strip $ take (endIdx - startIdx) (drop startIdx linesOfText)
 
 -- | Parse size-limit from section lines
@@ -7111,10 +7609,7 @@ parseSizeLimit :: [T.Text] -> Maybe Integer
 parseSizeLimit linesOfText =
   let findLine prefix = [T.unpack (T.drop (T.length (T.pack prefix)) (T.strip l)) | l <- linesOfText, T.stripStart l `T.isPrefixOf` T.pack prefix]
       sizeLines = findLine "size-limit"
-  in case sizeLines of
-    [] -> Nothing
-    (sizeStr:_) -> 
-      -- Remove comments and parse
+  in listToMaybe sizeLines >>= \sizeStr ->
       let cleaned = takeWhile (/= '#') sizeStr
           trimmed = dropWhile isSpace $ dropWhileEnd isSpace cleaned
       in case reads trimmed of
@@ -7126,13 +7621,9 @@ parseExtensions :: [T.Text] -> Maybe [String]
 parseExtensions linesOfText =
   let findLine prefix = [T.unpack (T.drop (T.length (T.pack prefix)) (T.strip l)) | l <- linesOfText, T.stripStart l `T.isPrefixOf` T.pack prefix]
       extLines = findLine "extensions"
-  in case extLines of
-    [] -> Nothing
-    (extStr:_) ->
-      -- Remove comments and parse comma-separated list
+  in listToMaybe extLines >>= \extStr ->
       let cleaned = takeWhile (/= '#') extStr
           trimmed = dropWhile isSpace $ dropWhileEnd isSpace cleaned
-          -- Split by comma and clean each extension
           exts = map (dropWhile isSpace . dropWhileEnd isSpace) $ splitComma trimmed
       in Just exts
   where
@@ -7150,6 +7641,8 @@ parseExtensions linesOfText =
 *Source file.*
 
 ```haskell
+{-# LANGUAGE MultiWayIf #-}
+
 module Internal.Git
     ( add
     , commit
@@ -7191,8 +7684,10 @@ module Internal.Git
     , checkoutOurs
     , checkoutTheirs
     , runGitRaw
+    , runGitRawAt
     , runGitWithOutput
     , runGitAt
+    , rewriteGitHints
     , ConflictType(..)
     , readFileFromRef
     , listFilesInRef
@@ -7200,6 +7695,8 @@ module Internal.Git
     , hasStagedChanges
     , getDiffNameStatus
     , getFilesAtCommit
+    , NameStatusChange(..)
+    , parseNameStatusOutput
     ) where
 
 import Data.Maybe (mapMaybe, listToMaybe)
@@ -7302,17 +7799,18 @@ init :: FilePath -> IO ExitCode
 init dir = runGitCommand (Init dir)
 
 createBundle :: BundleName -> IO ExitCode
-createBundle bundleName = do
+createBundle bundleName =
     let (GitRelPath relPath) = bundleGitRelPath bundleName
-    runGitCommand (CreateBundle relPath)
+    in runGitCommand (CreateBundle relPath)
 
 config :: String -> String -> IO ExitCode
 config configName configValue = runGitCommand (Config configName configValue)
 
+-- | Check if @localHash@ is ahead of @remoteHash@ (i.e., remote is an ancestor of local).
+-- Parameter order: remote hash first, local hash second — matching @git merge-base --is-ancestor@.
 checkIsAhead :: String -> String -> IO Bool
-checkIsAhead rHash lHash = do
-    code <- runGitCommand (IsAncestor rHash lHash)
-    pure (code == ExitSuccess)
+checkIsAhead remoteHash localHash =
+    (== ExitSuccess) <$> runGitCommand (IsAncestor remoteHash localHash)
 
 replace :: String -> String -> String -> String
 replace _ _ [] = []
@@ -7335,6 +7833,31 @@ runGitRaw args = do
         _ -> "auto"
   let fullArgs =
         baseFlags
+        ++ ["-c", "color.ui=" ++ colorFlag]
+        ++ args
+
+  (code, out, err) <- readProcessWithExitCode "git" fullArgs ""
+
+  putStr (rewriteGitHints out)
+  hPutStr stderr (rewriteGitHints err)
+
+  case code of
+    ExitSuccess   -> pure ()
+    ExitFailure n ->
+      hPutStrLn stderr ("bit: git exited with code " ++ show n)
+
+  pure code
+
+-- | Like runGitRaw but targets an arbitrary directory instead of .bit/index.
+runGitRawAt :: FilePath -> [String] -> IO ExitCode
+runGitRawAt dir args = do
+  noColor <- lookupEnv "BIT_NO_COLOR"
+  let colorFlag = case noColor of
+        Just "1" -> "never"
+        Just "true" -> "never"
+        _ -> "auto"
+  let fullArgs =
+        ["-C", dir]
         ++ ["-c", "color.ui=" ++ colorFlag]
         ++ args
 
@@ -7387,8 +7910,9 @@ addRemote remoteName url = do
 getRemoteUrl :: String -> IO (Maybe String)
 getRemoteUrl remoteName = do
     (code, out, _) <- readProcessWithExitCode "git" (baseFlags ++ ["remote", "get-url", remoteName]) ""
-    if code /= ExitSuccess then pure Nothing
-    else pure (Just (filter (/= '\n') out))
+    pure $ case code of
+        ExitSuccess -> Just (filter (/= '\n') out)
+        _ -> Nothing
 
 -- | Get the remote name that the current branch tracks (branch.main.remote).
 -- Falls back to "origin" if not configured — this means commands work with
@@ -7397,8 +7921,9 @@ getRemoteUrl remoteName = do
 getTrackedRemoteName :: IO String
 getTrackedRemoteName = do
     (code, out, _) <- readProcessWithExitCode "git" (baseFlags ++ ["config", "--get", "branch.main.remote"]) ""
-    if code /= ExitSuccess then pure "origin"
-    else pure (filter (/= '\n') out)
+    pure $ case code of
+        ExitSuccess -> filter (/= '\n') out
+        _ -> "origin"
 
 -- | Set up a git remote named "origin" pointing to the given URL (legacy / internal use)
 setupRemote :: String -> IO ExitCode
@@ -7419,14 +7944,8 @@ fetchFromBundle bundleName = do
 -- | Update the remote tracking branch refs/remotes/origin/main to point to the hash from the bundle.
 -- Use when the objects are already in the repo (e.g. after push); for fetch/pull use fetchFromBundle.
 updateRemoteTrackingBranch :: BundleName -> IO ExitCode
-updateRemoteTrackingBranch bundleName = do
-    maybeHash <- getHashFromBundle bundleName
-    case maybeHash of
-        Just hash -> do
-            -- Update the remote tracking branch ref
-            -- Use update-ref to create or update refs/remotes/origin/main
-            updateRemoteTrackingBranchToHash hash
-        Nothing -> pure (ExitFailure 1)
+updateRemoteTrackingBranch bundleName =
+    getHashFromBundle bundleName >>= maybe (pure (ExitFailure 1)) updateRemoteTrackingBranchToHash
 
 -- | Set refs/remotes/origin/main to a specific hash. Use after a successful pull so status shows
 -- "up to date with 'origin/main'" instead of "ahead by N commits".
@@ -7524,7 +8043,9 @@ checkoutRemoteAsMain = do
 getConflictedFiles :: IO [FilePath]
 getConflictedFiles = do
   (code, out, _) <- runGitWithOutput ["diff", "--name-only", "--diff-filter=U"]
-  if code /= ExitSuccess then pure [] else pure (filter (not . null) (lines out))
+  pure $ case code of
+    ExitSuccess -> filter (not . null) (lines out)
+    _ -> []
 
 -- | Conflict type for Git-like messages. Path is work-tree relative (e.g. index/src/model.bin).
 data ConflictType
@@ -7539,18 +8060,21 @@ getConflictType :: FilePath -> IO ConflictType
 getConflictType path = do
   (_, out, _) <- runGitWithOutput ["ls-files", "-u", "--", path]
   let beforeTab line = takeWhile (/= '\t') line
-  let stageNum line = case reverse (words (beforeTab line)) of
-        (s:_) | s `elem` ["1","2","3"] -> Just (read s :: Int)
+  let stageNums :: [Int]
+      stageNums = mapMaybe stageNum (lines out)
+      stageNum line = case reverse (words (beforeTab line)) of
+        ("1":_) -> Just (1 :: Int)
+        ("2":_) -> Just 2
+        ("3":_) -> Just 3
         _ -> Nothing
-  let stageNums = mapMaybe stageNum (lines out)
   let has1 = 1 `elem` stageNums
   let has2 = 2 `elem` stageNums
   let has3 = 3 `elem` stageNums
-  if has2 && has3 && has1 then pure (ContentConflict path)
-  else if has2 && has3 && not has1 then pure (AddAdd path)
-  else if has2 && not has3 then pure (ModifyDelete path False)  -- deleted in theirs
-  else if has3 && not has2 then pure (ModifyDelete path True)   -- deleted in ours (HEAD)
-  else pure (ContentConflict path)
+  pure $ if | has2 && has3 && has1     -> ContentConflict path
+            | has2 && has3 && not has1 -> AddAdd path
+            | has2 && not has3         -> ModifyDelete path False  -- deleted in theirs
+            | has3 && not has2         -> ModifyDelete path True   -- deleted in ours (HEAD)
+            | otherwise                -> ContentConflict path
 
 -- | Check out our version for path (work-tree path under .rgit/index).
 checkoutOurs :: FilePath -> IO ExitCode
@@ -7573,17 +8097,17 @@ checkoutTheirs path = do
 readFileFromRef :: String -> FilePath -> IO (Maybe String)
 readFileFromRef gitRef path = do
   (code, out, _err) <- runGitWithOutput ["show", gitRef ++ ":" ++ path]
-  if code == ExitSuccess && not (null out)
-    then pure (Just out)
-    else pure Nothing
+  pure $ case code of
+    ExitSuccess | not (null out) -> Just out
+    _ -> Nothing
 
 -- | List all files in a Git ref's tree (recursive). Returns paths relative to work tree root.
 listFilesInRef :: String -> IO [FilePath]
 listFilesInRef gitRef = do
   (code, out, _) <- runGitWithOutput ["ls-tree", "-r", "--name-only", gitRef]
-  if code == ExitSuccess
-    then pure (filter (not . null) (lines out))
-    else pure []
+  pure $ case code of
+    ExitSuccess -> filter (not . null) (lines out)
+    _ -> []
 
 -- | Run git fsck to check metadata history integrity.
 -- Returns (exitCode, output, errorOutput).
@@ -7597,38 +8121,52 @@ hasStagedChanges = do
   (code, _, _) <- runGitWithOutput ["diff", "--cached", "--quiet"]
   pure (code == ExitFailure 1)  -- git diff --cached --quiet exits with 1 if there are changes
 
--- | Get the list of file changes between two commits.
--- Returns list of (status, path, maybe-new-path-for-renames).
--- Status: 'A' = added, 'D' = deleted, 'M' = modified, 'R' = renamed.
-getDiffNameStatus :: String -> String -> IO [(Char, FilePath, Maybe FilePath)]
-getDiffNameStatus oldHead newHead = do
-    (code, out, _) <- runGitWithOutput ["diff", "--name-status", oldHead, newHead]
-    if code /= ExitSuccess then pure []
-    else pure (parseNameStatus out)
+-- | Parsed line from `git diff --name-status` output.
+-- Makes invalid states unrepresentable (no bare Char + Maybe tuple).
+data NameStatusChange
+    = Added FilePath
+    | Deleted FilePath
+    | Modified FilePath
+    | Renamed FilePath FilePath  -- ^ old path, new path
+    | Copied FilePath FilePath   -- ^ old path, new path
+    deriving (Show, Eq)
 
-parseNameStatus :: String -> [(Char, FilePath, Maybe FilePath)]
-parseNameStatus = mapMaybe parseLine . lines
+-- | Parse raw `git diff --name-status` output into structured changes.
+parseNameStatusOutput :: String -> [NameStatusChange]
+parseNameStatusOutput = mapMaybe parseLine . lines
   where
     parseLine line = case line of
         (fileStatus:rest)
             | fileStatus == 'R' || fileStatus == 'C' ->
-                -- R100\told\tnew or Rnnn old new (tab-separated)
                 case words (dropWhile (\c -> c /= '\t' && c /= ' ') rest) of
-                    (old:new:_) -> Just (fileStatus, old, Just new)
+                    (old:new:_) -> Just $ case fileStatus of
+                        'R' -> Renamed old new
+                        _  -> Copied old new
                     _ -> Nothing
-            | fileStatus `elem` "ADM" ->
-                case words rest of
-                    (path:_) -> Just (fileStatus, path, Nothing)
-                    _ -> Nothing
+            | fileStatus == 'A' ->
+                case words rest of (path:_) -> Just (Added path); _ -> Nothing
+            | fileStatus == 'D' ->
+                case words rest of (path:_) -> Just (Deleted path); _ -> Nothing
+            | fileStatus == 'M' ->
+                case words rest of (path:_) -> Just (Modified path); _ -> Nothing
             | otherwise -> Nothing
         _ -> Nothing
+
+-- | Get the list of file changes between two commits.
+getDiffNameStatus :: String -> String -> IO [NameStatusChange]
+getDiffNameStatus oldHead newHead = do
+    (code, out, _) <- runGitWithOutput ["diff", "--name-status", oldHead, newHead]
+    pure $ case code of
+        ExitSuccess -> parseNameStatusOutput out
+        _ -> []
 
 -- | Get all file paths at a given commit. Used when there's no old HEAD to diff against.
 getFilesAtCommit :: String -> IO [FilePath]
 getFilesAtCommit gitRef = do
     (code, out, _) <- runGitWithOutput ["ls-tree", "-r", "--name-only", gitRef]
-    if code /= ExitSuccess then pure []
-    else pure (filter (not . null) (lines out))
+    pure $ case code of
+        ExitSuccess -> filter (not . null) (lines out)
+        _ -> []
 
 -- | Run a git command targeting a specific index path (for filesystem remotes).
 -- This is used when operating on a remote filesystem repo directly.
@@ -7671,8 +8209,9 @@ import System.Exit (ExitCode(..))
 import System.IO (hGetLine, hIsEOF, hClose, Handle)
 import System.FilePath (normalise)
 import Control.Monad (unless, void)
+import Data.Foldable (traverse_)
 import Control.Concurrent.Async (async, wait)
-import Data.List (isInfixOf)
+import Data.List (dropWhileEnd, isInfixOf)
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
@@ -7710,9 +8249,9 @@ readProcessBytes cmd args = do
     -- Cleanup: close any handles that might still be open and wait for process
     cleanupProcess (mStdin, mStdout, mStderr, ph) = do
         -- Try to close handles (may already be closed by hGetContents)
-        maybe (pure ()) (const $ pure ()) mStdin
-        maybe (pure ()) (\h -> void (try (hClose h) :: IO (Either SomeException ()))) mStdout
-        maybe (pure ()) (\h -> void (try (hClose h) :: IO (Either SomeException ()))) mStderr
+        traverse_ (\h -> void (try (hClose h) :: IO (Either SomeException ()))) mStdin
+        traverse_ (\h -> void (try (hClose h) :: IO (Either SomeException ()))) mStdout
+        traverse_ (\h -> void (try (hClose h) :: IO (Either SomeException ()))) mStderr
         -- Ensure process is cleaned up
         void (try (waitForProcess ph) :: IO (Either SomeException ExitCode))
     
@@ -7736,7 +8275,7 @@ remoteFilePath remote relPath =
         -- Ensure exactly one separator between base and relative path
         base' = case base of
             [] -> base
-            _  -> if last base == '/' then init base else base
+            _  -> dropWhileEnd (== '/') base
     in base' ++ "/" ++ relPath
 
 -- Dumb transport-level data types
@@ -7781,17 +8320,15 @@ data CheckResult = CheckResult
 
 -- | Copy local file to remote at relative path
 copyToRemote :: FilePath -> Remote -> FilePath -> IO ExitCode
-copyToRemote localPath remote relPath = do
+copyToRemote localPath remote relPath =
     let fullRemote = remoteFilePath remote relPath
-    (code, _, _) <- readProcessWithExitCode "rclone" ["copyto", localPath, fullRemote] ""
-    pure code
+    in (\(code, _, _) -> code) <$> readProcessWithExitCode "rclone" ["copyto", localPath, fullRemote] ""
 
 -- | Copy file from remote (relative path) to local
 copyFromRemote :: Remote -> FilePath -> FilePath -> IO ExitCode
-copyFromRemote remote relPath localPath = do
+copyFromRemote remote relPath localPath =
     let fullRemote = remoteFilePath remote relPath
-    (code, _, _) <- readProcessWithExitCode "rclone" ["copyto", fullRemote, localPath] ""
-    pure code
+    in (\(code, _, _) -> code) <$> readProcessWithExitCode "rclone" ["copyto", fullRemote, localPath] ""
 
 -- | Copy from remote with detailed error classification
 copyFromRemoteDetailed :: Remote -> FilePath -> FilePath -> IO CopyResult
@@ -7801,38 +8338,31 @@ copyFromRemoteDetailed remote relPath localPath = do
     case code of
         ExitSuccess -> pure CopySuccess
         ExitFailure _ 
-            | "directory not found" `isInfixOf` err || "object not found" `isInfixOf` err -> pure CopyNotFound
+            | "directory not found" `isInfixOf` err || "object not found" `isInfixOf` err || "doesn't exist" `isInfixOf` err -> pure CopyNotFound
             | "no such host" `isInfixOf` err || "dial tcp" `isInfixOf` err -> pure (CopyNetworkError err)
             | otherwise -> pure (CopyOtherError err)
 
 -- | Move a file on remote (both paths relative to remote root)
 moveRemote :: Remote -> FilePath -> FilePath -> IO ExitCode
-moveRemote remote srcRel destRel = do
+moveRemote remote srcRel destRel =
     let src = remoteFilePath remote srcRel
         dest = remoteFilePath remote destRel
-    (code, _, _) <- readProcessWithExitCode "rclone" ["moveto", src, dest] ""
-    pure code
+    in (\(code, _, _) -> code) <$> readProcessWithExitCode "rclone" ["moveto", src, dest] ""
 
 -- | Delete a file on remote (relative path)
 deleteRemote :: Remote -> FilePath -> IO ExitCode
-deleteRemote remote relPath = do
-    let fullRemote = remoteFilePath remote relPath
-    (code, _, _) <- readProcessWithExitCode "rclone" ["deletefile", fullRemote] ""
-    pure code
+deleteRemote remote relPath =
+    (\(code, _, _) -> code) <$> readProcessWithExitCode "rclone" ["deletefile", remoteFilePath remote relPath] ""
 
 -- | Purge entire remote (no relative path — purges the remote root)
 purgeRemote :: Remote -> IO ExitCode
-purgeRemote remote = do
-    let fullRemote = remoteUrl remote
-    (code, _, _) <- readProcessWithExitCode "rclone" ["purge", fullRemote] ""
-    pure code
+purgeRemote remote =
+    (\(code, _, _) -> code) <$> readProcessWithExitCode "rclone" ["purge", remoteUrl remote] ""
 
 -- | Create directory on remote (relative path)
 mkdirRemote :: Remote -> FilePath -> IO ExitCode
-mkdirRemote remote relPath = do
-    let fullRemote = remoteFilePath remote relPath
-    (code, _, _) <- readProcessWithExitCode "rclone" ["mkdir", fullRemote] ""
-    pure code
+mkdirRemote remote relPath =
+    (\(code, _, _) -> code) <$> readProcessWithExitCode "rclone" ["mkdir", remoteFilePath remote relPath] ""
 
 -- | List remote directory as JSON (at remote root)
 -- Returns (ExitCode, ByteString, String) where stdout is raw bytes for proper UTF-8 handling
@@ -7922,8 +8452,8 @@ checkRemote localPath remote mCounter = do
   where
     cleanup (_, mOut, mErr, ph) = do
         -- Try to close any handles that are still open
-        maybe (pure ()) (\h -> void (try (hClose h) :: IO (Either SomeException ()))) mOut
-        maybe (pure ()) (\h -> void (try (hClose h) :: IO (Either SomeException ()))) mErr
+        traverse_ (\h -> void (try (hClose h) :: IO (Either SomeException ()))) mOut
+        traverse_ (\h -> void (try (hClose h) :: IO (Either SomeException ()))) mErr
         -- Ensure process is cleaned up
         void (try (waitForProcess ph) :: IO (Either SomeException ExitCode))
     
@@ -7981,156 +8511,164 @@ checkRemote localPath remote mCounter = do
 *Build configuration — package metadata and dependencies.*
 
 ```cabal
-cabal-version:      2.4
-name:               bit
-version:            0.1.0.0
-
-executable bit
-    main-is:          Bit.hs
-    ghc-options:
-        -threaded
-        -rtsopts
-        -with-rtsopts=-N
-        -Wall
-    other-modules:    Bit.AtomicWrite,
-                      Bit.Commands,
-                      Bit.Concurrency,
-                      Bit.Conflict,
-                      Bit.ConcurrentIO,
-                      Bit.ConcurrentFileIO,
-                      Bit.CopyProgress,
-                      Bit.Device,
-                      Bit.DevicePrompt,
-                      Bit.Diff,
-                      Bit.Process,
-                      Bit.Progress,
-                      Bit.Utils,
-                      Bit.Plan,
-                      Bit.Pipeline,
-                      Bit.Remote,
-                      Bit.Remote.Scan,
-                      Bit.RemoteWorkspace,
-                      Bit.Scan,
-                      Bit.Types,
-                      Bit.Verify,
-                      Bit.Fsck,
-                      Bit.Core,
-                      Bit.Core.Helpers,
-                      Bit.Core.Init,
-                      Bit.Core.GitPassthrough,
-                      Bit.Core.Fetch,
-                      Bit.Core.Transport,
-                      Bit.Core.Push,
-                      Bit.Core.Pull,
-                      Bit.Core.RemoteManagement,
-                      Bit.Core.Verify,
-                      Internal.Git,
-                      Internal.Config,
-                      Internal.ConfigFile,
-                      Bit.Internal.Metadata,
-                      Internal.Transport
-    build-depends:    base16-bytestring ^>=1.0.2.0,
-                      base,
-                      async,
-                      directory,
-                      uuid ^>=1.3.13,
-                      filepath,
-                      time,
-                      yaml,
-                      bytestring,
-                      cryptohash-sha256,
-                      cryptohash-md5,
-                      aeson,
-                      process,
-                      containers,
-                      transformers,
-                      text,
-                      free,
-                      mtl
-    default-language: Haskell2010
-
-executable generate-literate
-    main-is:             GenerateLiterate.hs
-    hs-source-dirs:      scripts
-    ghc-options:         -Wall
-    build-depends:       base, directory, filepath, process, bytestring, text
-    default-language:    Haskell2010
-
-test-suite cli
-    type:                exitcode-stdio-1.0
-    main-is:             RunCliTests.hs
-    hs-source-dirs:      test
-    ghc-options:         -Wall
-    build-depends:       base, directory, filepath, process
-    default-language:    Haskell2010
-
-test-suite device-prompt
-    type:                exitcode-stdio-1.0
-    main-is:             DevicePromptTests.hs
-    hs-source-dirs:      test, .
-    other-modules:       Bit.DevicePrompt
-    ghc-options:         -Wall
-    build-depends:       base,
-                        directory,
-                        tasty,
-                        tasty-hunit
-    default-language:    Haskell2010
-
-test-suite pipeline
-    type:                exitcode-stdio-1.0
-    main-is:             PipelineSpec.hs
-    hs-source-dirs:      test, .
-    other-modules:       Bit.AtomicWrite,
-                         Bit.Types,
-                         Bit.Diff,
-                         Bit.Plan,
-                         Bit.Pipeline,
-                         Bit.Utils,
-                         Bit.Internal.Metadata,
-                         Bit.Device,
-                         Bit.Remote,
-                         Internal.Git,
-                         Internal.Config,
-                         Internal.ConfigFile
-    ghc-options:         -Wall
-    build-depends:       base,
-                         containers,
-                         text,
-                         tasty,
-                         tasty-hunit,
-                         tasty-quickcheck,
-                         QuickCheck,
-                         free,
-                         transformers,
-                         bytestring,
-                         base16-bytestring ^>=1.0.2.0,
-                         cryptohash-md5,
-                         directory,
-                         filepath,
-                         process,
-                         time,
-                         uuid ^>=1.3.13
-    default-language:    Haskell2010
-
-test-suite generate-literate-docs
-    type:                exitcode-stdio-1.0
-    main-is:             GenerateLiterate.hs
-    hs-source-dirs:      scripts
-    ghc-options:         -Wall
-    build-depends:       base, process, directory, filepath, bytestring, text
-    build-tool-depends:  bit:generate-literate
-    default-language:    Haskell2010
-
-test-suite lint-tests
-    type:                exitcode-stdio-1.0
-    main-is:             LintTestFiles.hs
-    hs-source-dirs:      test
-    ghc-options:         -Wall
-    build-depends:       base,
-                         directory,
-                         filepath,
-                         tasty,
-                         tasty-hunit
+cabal-version:      2.4
+name:               bit
+version:            0.1.0.0
+
+executable bit
+    main-is:          Bit.hs
+    ghc-options:
+        -threaded
+        -rtsopts
+        -with-rtsopts=-N
+        -Wall
+    other-modules:    Bit.AtomicWrite,
+                      Bit.Commands,
+                      Bit.Concurrency,
+                      Bit.Conflict,
+                      Bit.ConcurrentIO,
+                      Bit.ConcurrentFileIO,
+                      Bit.CopyProgress,
+                      Bit.Device,
+                      Bit.DevicePrompt,
+                      Bit.Diff,
+                      Bit.Process,
+                      Bit.Progress,
+                      Bit.Utils,
+                      Bit.Plan,
+                      Bit.Pipeline,
+                      Bit.Remote,
+                      Bit.Remote.Scan,
+                      Bit.RemoteWorkspace,
+                      Bit.Scan,
+                      Bit.Types,
+                      Bit.Verify,
+                      Bit.Fsck,
+                      Bit.Core,
+                      Bit.Core.Helpers,
+                      Bit.Core.Init,
+                      Bit.Core.GitPassthrough,
+                      Bit.Core.Fetch,
+                      Bit.Core.Transport,
+                      Bit.Core.Push,
+                      Bit.Core.Pull,
+                      Bit.Core.RemoteManagement,
+                      Bit.Core.Verify,
+                      Internal.Git,
+                      Internal.Config,
+                      Internal.ConfigFile,
+                      Bit.Internal.Metadata,
+                      Internal.Transport
+    build-depends:    base16-bytestring ^>=1.0.2.0,
+                      base,
+                      async,
+                      directory,
+                      uuid ^>=1.3.13,
+                      filepath,
+                      time,
+                      yaml,
+                      bytestring,
+                      cryptohash-sha256,
+                      cryptohash-md5,
+                      aeson,
+                      process,
+                      containers,
+                      transformers,
+                      text,
+                      free,
+                      mtl
+    default-language: Haskell2010
+
+executable generate-literate
+    main-is:             GenerateLiterate.hs
+    hs-source-dirs:      scripts
+    ghc-options:         -Wall
+    build-depends:       base, directory, filepath, process, bytestring, text
+    default-language:    Haskell2010
+
+test-suite cli
+    type:                exitcode-stdio-1.0
+    main-is:             RunCliTests.hs
+    hs-source-dirs:      test
+    ghc-options:         -Wall
+    build-depends:       base, directory, filepath, process
+    default-language:    Haskell2010
+
+test-suite cli-fast
+    type:                exitcode-stdio-1.0
+    main-is:             RunCliTestsFast.hs
+    hs-source-dirs:      test
+    ghc-options:         -Wall
+    build-depends:       base, directory, filepath, process
+    default-language:    Haskell2010
+
+test-suite device-prompt
+    type:                exitcode-stdio-1.0
+    main-is:             DevicePromptTests.hs
+    hs-source-dirs:      test, .
+    other-modules:       Bit.DevicePrompt
+    ghc-options:         -Wall
+    build-depends:       base,
+                        directory,
+                        tasty,
+                        tasty-hunit
+    default-language:    Haskell2010
+
+test-suite pipeline
+    type:                exitcode-stdio-1.0
+    main-is:             PipelineSpec.hs
+    hs-source-dirs:      test, .
+    other-modules:       Bit.AtomicWrite,
+                         Bit.Types,
+                         Bit.Diff,
+                         Bit.Plan,
+                         Bit.Pipeline,
+                         Bit.Utils,
+                         Bit.Internal.Metadata,
+                         Bit.Device,
+                         Bit.Remote,
+                         Internal.Git,
+                         Internal.Config,
+                         Internal.ConfigFile
+    ghc-options:         -Wall
+    build-depends:       base,
+                         containers,
+                         text,
+                         tasty,
+                         tasty-hunit,
+                         tasty-quickcheck,
+                         QuickCheck,
+                         free,
+                         transformers,
+                         bytestring,
+                         base16-bytestring ^>=1.0.2.0,
+                         cryptohash-md5,
+                         directory,
+                         filepath,
+                         process,
+                         time,
+                         uuid ^>=1.3.13
+    default-language:    Haskell2010
+
+test-suite generate-literate-docs
+    type:                exitcode-stdio-1.0
+    main-is:             GenerateLiterate.hs
+    hs-source-dirs:      scripts
+    ghc-options:         -Wall
+    build-depends:       base, process, directory, filepath, bytestring, text
+    build-tool-depends:  bit:generate-literate
+    default-language:    Haskell2010
+
+test-suite lint-tests
+    type:                exitcode-stdio-1.0
+    main-is:             LintTestFiles.hs
+    hs-source-dirs:      test
+    ghc-options:         -Wall
+    build-depends:       base,
+                         directory,
+                         filepath,
+                         tasty,
+                         tasty-hunit
     default-language:    Haskell2010
 ```
 
@@ -8155,7 +8693,7 @@ test-suite lint-tests
 module Main where
 
 import Control.Exception (SomeException, try)
-import Control.Monad (forM_)
+import Control.Monad (forM_, when)
 import Data.Char (toLower)
 import Data.List (isPrefixOf, sort)
 import System.Directory (doesDirectoryExist, doesFileExist, getCurrentDirectory, listDirectory, createDirectoryIfMissing)
@@ -8176,7 +8714,7 @@ findRepoRoot :: FilePath -> IO FilePath
 findRepoRoot dir = do
   exists <- doesFileExist (dir </> "bit.cabal")
   if exists
-    then return dir
+    then pure dir
     else let parent = takeDirectory dir
          in  if parent == dir
                then fail "Could not find repo root (bit.cabal)"
@@ -8201,16 +8739,16 @@ gatherHsFiles root = go ""
       fmap concat $ mapM (visit rel) entries
 
     visit rel name
-      | name `elem` excludedDirs = return []
-      | name == "test"           = return []  -- test/ handled separately
-      | head name == '.'         = return []
+      | name `elem` excludedDirs = pure []
+      | name == "test"           = pure []  -- test/ handled separately
+      | isPrefixOf "." name      = pure []
       | otherwise = do
           let relPath  = if null rel then name else rel </> name
               fullPath = root </> relPath
           isDir <- doesDirectoryExist fullPath
           if isDir
             then go relPath
-            else return [ relPath | takeExtension name == ".hs" ]
+            else pure [ relPath | takeExtension name == ".hs" ]
 
 -- | Collect all files under test/, relative to @root@.
 gatherTestFiles :: FilePath -> IO [FilePath]
@@ -8219,35 +8757,35 @@ gatherTestFiles root = go "test"
     go rel = do
       let full = root </> rel
       exists <- doesDirectoryExist full
-      if not exists then return []
+      if not exists then pure []
       else do
         entries <- listDirectory full
         fmap concat $ mapM (visit rel) entries
 
     visit rel name
-      | name `elem` excludedTestDirs  = return []
-      | name `elem` excludedTestFiles = return []
-      | head name == '.'              = return []
+      | name `elem` excludedTestDirs  = pure []
+      | name `elem` excludedTestFiles = pure []
+      | isPrefixOf "." name           = pure []
       | otherwise = do
           let relPath  = rel </> name
               fullPath = root </> relPath
           isDir <- doesDirectoryExist fullPath
           if isDir
             then go relPath
-            else return [relPath]
+            else pure [relPath]
 
 -- | Collect all .md files under docs/, relative to @root@.
 gatherDocsFiles :: FilePath -> IO [FilePath]
 gatherDocsFiles root = do
   let docsDir = root </> "docs"
   exists <- doesDirectoryExist docsDir
-  if not exists then return []
+  if not exists then pure []
   else do
     entries <- listDirectory docsDir
     let mdFiles = [ "docs" </> name | name <- entries
                   , takeExtension name == ".md"
-                  , head name /= '.' ]
-    return (sort mdFiles)
+                  , not (isPrefixOf "." name) ]
+    pure (sort mdFiles)
 
 -- | Map file extension to fenced-code-block language tag.
 getLang :: FilePath -> String
@@ -8282,7 +8820,7 @@ toPosix = map (\c -> if c == '\\' then '/' else c)
 gitIn :: FilePath -> [String] -> IO Bool
 gitIn dir args = do
   (code, _out, _err) <- readProcessWithExitCode "git" (["-C", dir] ++ args) ""
-  return (code == ExitSuccess)
+  pure (code == ExitSuccess)
 
 main :: IO ()
 main = do
@@ -8388,9 +8926,8 @@ writeDocument outputPath title description root files =
             Right content -> do
               let contentStr = T.unpack content
               hPutStr h contentStr
-              if not (T.null content) && T.last content /= '\n'
-                then hPutStrLn h ""
-                else return ()
+              when (not (T.null content) && T.last content /= '\n') $
+                hPutStrLn h ""
             Left err ->
               hPutStrLn h $ "-- Error decoding UTF-8: " ++ show err
         Left err ->

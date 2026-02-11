@@ -91,7 +91,7 @@ import System.Directory (doesDirectoryExist, listDirectory)
 import System.FilePath ((</>), takeExtension)
 import Control.Monad (filterM)
 import Data.Char (toLower, isSpace)
-import Data.List (isInfixOf, isPrefixOf)
+import Data.List (foldl', isInfixOf, isPrefixOf)
 
 main :: IO ()
 main = do
@@ -236,7 +236,7 @@ splitTestCases linesWithNums =
 parseTestCase :: [(Int, String)] -> TestCase
 parseTestCase [] = TestCase 0 Nothing [] [] [] []
 parseTestCase block@((startLine, _):_) =
-    let (cmd, stdin, stdout, stderr, exitCode) = foldl classifyAndAccumulate (Nothing, [], [], [], []) block
+    let (cmd, stdin, stdout, stderr, exitCode) = foldl' classifyAndAccumulate (Nothing, [], [], [], []) block
     in TestCase startLine cmd stdin stdout stderr exitCode
   where
     classifyAndAccumulate (cmd, stdin, stdout, stderr, exitCode) (lineNum, lineText) =
@@ -310,17 +310,17 @@ findTestFiles :: FilePath -> IO [FilePath]
 findTestFiles dir = do
     exists <- doesDirectoryExist dir
     if not exists
-        then return []
+        then pure []
         else do
             entries <- listDirectory dir
             let fullPaths = map (dir </>) entries
             files <- filterM (\p -> do
                 isDir <- doesDirectoryExist p
-                return $ not isDir && takeExtension p == ".test"
+                pure $ not isDir && takeExtension p == ".test"
                 ) fullPaths
             dirs <- filterM doesDirectoryExist fullPaths
             subFiles <- mapM findTestFiles dirs
-            return $ files ++ concat subFiles
+            pure $ files ++ concat subFiles
 
 -- | Create a test case for a single test file
 createTestForFile :: FilePath -> IO TestTree
@@ -329,9 +329,9 @@ createTestForFile path = do
     let patternViolations = scanForViolations path content
     let formatViolations = validateShelltestFormat path content
     let allViolations = patternViolations ++ formatViolations
-    return $ testCase path $ do
+    pure $ testCase path $ do
         case allViolations of
-            [] -> return ()  -- No violations, test passes
+            [] -> pure ()  -- No violations, test passes
             (v:_) -> assertFailure v  -- Report first violation
 
 -- | Scan a file for dangerous patterns and return violation messages
@@ -444,7 +444,7 @@ conflictInfoParsingTests = testGroup "parseConflictInfo"
             [ "100644 abc123 1\tindex/gone.bin"
             , "100644 def456 2\tindex/gone.bin"
             ]
-      parseConflictInfo "index/gone.bin" output @?= ModifyDelete "index/gone.bin" False
+      parseConflictInfo "index/gone.bin" output @?= ModifyDelete "index/gone.bin" DeletedInTheirs
 
   -- Modify/delete: theirs modified (stage 3) but ours deleted (no stage 2)
   , testCase "stage 3 only -> ModifyDelete (deleted in ours)" $ do
@@ -452,7 +452,7 @@ conflictInfoParsingTests = testGroup "parseConflictInfo"
             [ "100644 abc123 1\tindex/gone.bin"
             , "100644 ghi789 3\tindex/gone.bin"
             ]
-      parseConflictInfo "index/gone.bin" output @?= ModifyDelete "index/gone.bin" True
+      parseConflictInfo "index/gone.bin" output @?= ModifyDelete "index/gone.bin" DeletedInOurs
 
   -- Empty output (fallback)
   , testCase "empty output -> ContentConflict (fallback)" $ do
@@ -556,9 +556,8 @@ import Test.Tasty
 import Test.Tasty.QuickCheck
 import Test.Tasty.HUnit
 
-import Data.List (sort, group)
+import Data.List (nub)
 import Bit.Types
-import Bit.Diff (GitDiff(..), LightFileEntry(..), FileIndex, buildIndexFromFileEntries, computeDiff)
 import Bit.Plan (RcloneAction(..))
 import Bit.Pipeline (diffAndPlan)
 import qualified Data.Text as T
@@ -573,7 +572,8 @@ instance Arbitrary EntryKind where
     h <- arbitrary
     sz <- choose (0, 10000000)
     isText <- arbitrary
-    return $ File h sz isText
+    let ct = if isText then TextContent else BinaryContent
+    pure $ File h sz ct
 
 instance Arbitrary FileEntry where
   arbitrary = do
@@ -582,7 +582,7 @@ instance Arbitrary FileEntry where
     segments <- vectorOf depth (vectorOf 5 (elements "abcdefghijklmnop"))
     let filePath = foldl1 (\a b -> a ++ "/" ++ b) segments
     k <- arbitrary
-    return $ FileEntry filePath k
+    pure $ FileEntry (Path filePath) k
 
 main :: IO ()
 main = defaultMain tests
@@ -612,8 +612,7 @@ prop_noDuplicateTargets :: [FileEntry] -> [FileEntry] -> Bool
 prop_noDuplicateTargets source target =
   let actions = diffAndPlan source target
       targets = concatMap actionTargets actions
-      uniqueTargets = map head (group (sort targets))
-  in  length targets == length uniqueTargets
+  in  length targets == length (nub targets)
   where
     actionTargets (Copy _ d)    = [d]
     actionTargets (Move _ d)    = [d]
@@ -640,36 +639,33 @@ prop_emptyTargetOnlyCopies source =
 test_singleAddedFile :: Assertion
 test_singleAddedFile = do
   let h = Hash (T.pack "md5:abc123")
-      source = [FileEntry "foo.bin" (File h 100 False)]
+      source = [FileEntry "foo.bin" (File h 100 BinaryContent)]
       target = []
       actions = diffAndPlan source target
-  length actions @?= 1
-  case head actions of
-    Copy "foo.bin" "foo.bin" -> return ()
-    other -> assertFailure $ "Expected Copy, got: " ++ show other
+  case actions of
+    [Copy "foo.bin" "foo.bin"] -> pure ()
+    _ -> assertFailure $ "Expected [Copy], got: " ++ show actions
 
 test_singleDeletedFile :: Assertion
 test_singleDeletedFile = do
   let h = Hash (T.pack "md5:abc123")
       source = []
-      target = [FileEntry "foo.bin" (File h 100 False)]
+      target = [FileEntry "foo.bin" (File h 100 BinaryContent)]
       actions = diffAndPlan source target
-  length actions @?= 1
-  case head actions of
-    Delete "foo.bin" -> return ()
-    other -> assertFailure $ "Expected Delete, got: " ++ show other
+  case actions of
+    [Delete "foo.bin"] -> pure ()
+    _ -> assertFailure $ "Expected [Delete], got: " ++ show actions
 
 test_modifiedFile :: Assertion
 test_modifiedFile = do
   let h1 = Hash (T.pack "md5:aaa")
       h2 = Hash (T.pack "md5:bbb")
-      source = [FileEntry "foo.bin" (File h1 100 False)]
-      target = [FileEntry "foo.bin" (File h2 200 False)]
+      source = [FileEntry "foo.bin" (File h1 100 BinaryContent)]
+      target = [FileEntry "foo.bin" (File h2 200 BinaryContent)]
       actions = diffAndPlan source target
-  length actions @?= 1
-  case head actions of
-    Copy "foo.bin" "foo.bin" -> return ()
-    other -> assertFailure $ "Expected Copy (overwrite), got: " ++ show other
+  case actions of
+    [Copy "foo.bin" "foo.bin"] -> pure ()
+    _ -> assertFailure $ "Expected [Copy (overwrite)], got: " ++ show actions
 ```
 
 ---
@@ -699,7 +695,7 @@ main = do
   let purgeAndMkdir =
         rawSystem "rclone" ["purge", "gdrive-test:bit-test"] >>
         rawSystem "rclone" ["mkdir", "gdrive-test:bit-test"]
-  _ <- catch (void purgeAndMkdir) (\(_ :: SomeException) -> return ())
+  void $ catch (void purgeAndMkdir) (\(_ :: SomeException) -> pure ())
   -- Prepend directory containing bit to PATH so shelltest runs use this build
   bitBin <- readProcess "cabal" ["list-bin", "bit"] ""
   let bitDir = takeDirectory (filter (`notElem` "\n\r") bitBin)
@@ -711,6 +707,67 @@ main = do
   setEnv "PATH" path
   -- Run shelltest on test/cli (Format 3 .test files)
   callProcess "shelltest" ["test" </> "cli"]
+```
+
+---
+
+## test/RunCliTestsFast.hs
+
+**Path:** `test/RunCliTestsFast.hs`
+
+*Source file.*
+
+```haskell
+-- Run a subset of CLI shell tests (no gdrive, no device prompt).
+-- Same PATH setup as RunCliTests; runs only the listed .test files.
+import System.Process (callProcess, readProcess)
+import System.Environment (getEnvironment, setEnv)
+import System.FilePath (takeDirectory, (</>))
+import Data.List (lookup)
+import System.Info (os)
+
+-- | Test files that run without rclone gdrive or device subst. Local-only or quick.
+cliFastTests :: [FilePath]
+cliFastTests =
+  [ "000-cleanup.test"
+  , "bitignore.test"
+  , "init.test"
+  , "init-config.test"
+  , "no-repo.test"
+  , "one-repo.test"
+  , "ls-files.test"
+  , "status.test"
+  , "skip-scan.test"
+  , "scan-cache.test"
+  , "fsck.test"
+  , "path-type-safety.test"
+  , "process-io.test"
+  , "restore-checkout.test"
+  , "verify.test"
+  , "verify-progress.test"
+  , "merge-local.test"
+  , "filesystem-remote-direct.test"
+  , "proof-of-possession.test"
+  , "unicode.test"
+  , "upstream-tracking.test"
+  , "remote-show.test"
+  , "remote-flag.test"
+  ]
+
+main :: IO ()
+main = do
+  -- Prepend directory containing bit to PATH so shelltest runs use this build
+  bitBin <- readProcess "cabal" ["list-bin", "bit"] ""
+  let bitDir = takeDirectory (filter (`notElem` "\n\r") bitBin)
+  env <- getEnvironment
+  let pathSep = if os == "mingw32" || os == "win32" then ";" else ":"
+  let path = case lookup "PATH" env of
+        Nothing -> bitDir
+        Just p  -> bitDir ++ pathSep ++ p
+  setEnv "PATH" path
+  let cliDir = "test" </> "cli"
+  let testPaths = map (cliDir </>) cliFastTests
+  callProcess "shelltest" testPaths
 ```
 
 ---
@@ -732,8 +789,8 @@ main = do
 # Note: We use timeout to give Windows time to release file handles.
 # =============================================================================
 
-# ---- Clean up all known test directories ----
-timeout /t 1 >nul & rmdir /s /q test\cli\work 2>nul & rmdir /s /q test\cli\work_a 2>nul & rmdir /s /q test\cli\work_b 2>nul & rmdir /s /q test\cli\work_gdrive_a 2>nul & rmdir /s /q test\cli\work_gdrive_b 2>nul & rmdir /s /q test\cli\work_merge_a 2>nul & rmdir /s /q test\cli\work_merge_b 2>nul & rmdir /s /q test\cli\work_direct 2>nul & rmdir /s /q test\cli\shared_remote 2>nul & rmdir /s /q test\cli\shared_merge_remote 2>nul & rmdir /s /q test\cli\fs_remote_direct 2>nul & rmdir /s /q test\cli\device_prompt_remote 2>nul & rmdir /s /q test\cli\remote_mirror 2>nul & rmdir /s /q test\cli\upstream-local 2>nul & rmdir /s /q test\cli\upstream-local2 2>nul & rmdir /s /q test\cli\upstream-local3 2>nul & rmdir /s /q test\cli\upstream-local4 2>nul & rmdir /s /q test\cli\upstream-remote 2>nul & rmdir /s /q test\cli\upstream-remote3 2>nul & rmdir /s /q test\cli\upstream-remote4 2>nul & rmdir /s /q test\cli\work_progress_a 2>nul & rmdir /s /q test\cli\work_progress_b 2>nul & rmdir /s /q test\cli\fs_remote_progress 2>nul & rmdir /s /q test\cli\work_verify_progress 2>nul & rmdir /s /q test\cli\work_process 2>nul & rmdir /s /q test\cli\work_skipscan 2>nul & rmdir /s /q test\cli\work_remote_show 2>nul & rmdir /s /q test\cli\remote_show_a 2>nul & rmdir /s /q test\cli\remote_show_b 2>nul & rmdir /s /q test\cli\work_check_progress 2>nul & rmdir /s /q test\cli\remote_check_progress 2>nul & rmdir /s /q test\cli\work_check_small 2>nul & rmdir /s /q test\cli\remote_check_small 2>nul & rmdir /s /q test\cli\work_unicode_remote 2>nul & rmdir /s /q test\cli\work_unicode_remote_b 2>nul & rmdir /s /q test\cli\fs_unicode_remote 2>nul & rmdir /s /q test\cli\work_pop_local 2>nul & rmdir /s /q test\cli\work_pop_remote 2>nul & rmdir /s /q test\cli\work_rmt_a 2>nul & rmdir /s /q test\cli\fs_remote_rmt 2>nul & rmdir /s /q test\cli\work_fetch_a 2>nul & rmdir /s /q test\cli\work_fetch_b 2>nul & echo global cleanup done
+# ---- Clean up entire test output directory and recreate it ----
+timeout /t 1 >nul & rmdir /s /q test\cli\output 2>nul & mkdir test\cli\output & echo global cleanup done
 <<<
 >>>
 global cleanup done
@@ -753,7 +810,7 @@ global cleanup done
 
 CLI tests use **[shelltest](https://hackage.haskell.org/package/shelltestrunner)** (shelltestrunner). Test files use the `.test` extension and Format 3: command line, `<<<` (stdin), `>>>` expected stdout (literal or `/regex/`), `>>>=` expected exit code.
 
-**Run from the repository root** so paths like `test\cli\work_merge_a` resolve correctly.
+**Run from the repository root** so paths like `test\cli\output\work_merge_a` resolve correctly.
 
 ## Forbidden Patterns
 
@@ -770,7 +827,7 @@ Test files **must not** use Windows environment variables that expand before com
 Example of the problem:
 
 ```batch
-cd test\cli\work & bit remote add origin "%CD%\test\cli\remote_mirror"
+cd test\cli\output\work_mytest & bit remote add origin "%CD%\test\cli\output\remote_mirror"
 ```
 
 On Windows, `%CD%` expands **before** the command chain runs. If the `cd` command fails (or hasn't executed yet due to timing), `bit remote add origin` runs in the **main repository directory**, changing the development repo's remote URL instead of the test repo's. This corrupts the development environment.
@@ -779,10 +836,10 @@ On Windows, `%CD%` expands **before** the command chain runs. If the `cd` comman
 
 ```batch
 # WRONG (banned):
-cd test\cli\work & bit remote add origin "%CD%\test\cli\remote_mirror"
+cd test\cli\output\work_mytest & bit remote add origin "%CD%\test\cli\output\remote_mirror"
 
 # CORRECT:
-cd test\cli\work & bit remote add origin ..\remote_mirror
+cd test\cli\output\work_mytest & bit remote add origin ..\remote_mirror
 ```
 
 Relative paths resolve at the time the command executes, so they work correctly even if the working directory changes.
@@ -880,7 +937,20 @@ Cleanup commands use `timeout /t 1 >nul &` before `rmdir` to give Windows time t
 2. Build bit: `cabal build bit`
 3. Run CLI tests: `cabal test cli`
 
-The test runner puts the built `bit` on `PATH` and invokes `shelltest test/cli`, so all `.test` files under `test/cli/` are run. To run a single file: `shelltest test/cli/init.test` (ensure `bit` is on `PATH`, e.g. `cabal exec -- env PATH="$(cabal list-bin bit):$PATH" shelltest test/cli/init.test` on Unix).
+The test runner puts the built `bit` on `PATH` and invokes `shelltest test/cli`, so all `.test` files under `test/cli/` are run.
+
+### Fast tests (over 3 minutes)
+
+To run the main test suites in one go (unit tests, lint, a subset of CLI shell tests, and literate doc generation):
+
+- **Suites:** **lint-tests**, **pipeline**, **device-prompt**, **cli-fast**, **generate-literate-docs**
+- **cli-fast** runs a subset of CLI tests (no gdrive, no device prompt): init, status, merge-local, fsck, verify, scan-cache, filesystem-remote-direct, etc. Full **cli** (all shell tests including gdrive) is not part of fast tests.
+- One-liner: `cabal test lint-tests pipeline device-prompt cli-fast generate-literate-docs`
+- Script: `scripts\run-fast-tests.bat` (from repo root)
+
+Expect runtime over 3 minutes. For quicker feedback (under one minute), run only unit/lint: `cabal test lint-tests pipeline device-prompt`.
+
+To run a single CLI file: `shelltest test/cli/init.test` (ensure `bit` is on `PATH`, e.g. `cabal exec -- env PATH="$(cabal list-bin bit):$PATH" shelltest test/cli/init.test` on Unix).
 
 ## gdrive-remote.test
 
@@ -919,11 +989,13 @@ Tests `bit fsck` (local-only, git-style: terse output, one line per issue, exit 
 
 Fsck does not check remote; use `bit verify --remote` for that.
 
-## remote-check.test
+## remote-repair.test
 
-Tests `bit remote check`: runs **rclone check** between local working tree and the configured remote (excludes `.bit`). Requires rclone on PATH. Covers:
-- No remote configured: prints "Error: No remote URL configured." and exits 0.
-- Local directory as "remote" (remote_mirror): add remote, change local file, run `bit remote check` → exits 1 and reports differences (e.g. "differences found", "size differ", "hash differ").
+Tests `bit remote repair`: verifies both local and remote files against their metadata, then repairs broken files by copying verified files from the other side using content-addressable (hash+size) lookup. Covers:
+- No remote configured: prints error and exits 1.
+- Nothing to repair: push then repair — all files verified.
+- Local corruption: corrupt a local binary file — repair copies from remote.
+- Unrepairable: corrupt same file on both sides — reports unrepairable.
 
 ## unicode.test
 
@@ -948,75 +1020,75 @@ This test validates the UTF-8 encoding setup in `Bit.hs` (Windows codepage 65001
 # Test .bitignore support
 
 # Setup: fresh repo with .bitignore
-rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit init
+rmdir /s /q test\cli\output\work 2>nul & mkdir test\cli\output\work & cd test\cli\output\work & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
 # Create .bitignore with *.log pattern
-cd test\cli\work & echo *.log> .bitignore
+cd test\cli\output\work & echo *.log> .bitignore
 <<<
 >>>= 0
 
 # Create test files: file.txt and debug.log
-cd test\cli\work & echo hello> file.txt & echo debug content> debug.log
+cd test\cli\output\work & echo hello> file.txt & echo debug content> debug.log
 <<<
 >>>= 0
 
 # Add all files - should only stage file.txt
-cd test\cli\work & bit add .
+cd test\cli\output\work & bit add .
 <<<
 >>>= 0
 
 # Status should show file.txt as staged
-cd test\cli\work & bit status
+cd test\cli\output\work & bit status
 <<<
 >>> /file\.txt/
 >>>= 0
 
 # Verify debug.log is NOT shown in status (use findstr exit code - fail if found)
-cd test\cli\work & bit status | findstr "debug.log" && exit 1 || exit 0
+cd test\cli\output\work & bit status | findstr "debug.log" && exit 1 || exit 0
 <<<
 >>>= 0
 
 # Commit
-cd test\cli\work & bit commit -m "test commit"
+cd test\cli\output\work & bit commit -m "test commit"
 <<<
 >>> /file.*changed/
 >>>= 0
 
 # Check that debug.log metadata file does not exist (exit 0 if missing, exit 1 if exists)
-if exist "test\cli\work\.bit\index\debug.log" (exit 1) else (exit 0)
+if exist "test\cli\output\work\.bit\index\debug.log" (exit 1) else (exit 0)
 <<<
 >>>= 0
 
 # Check that file.txt metadata DOES exist
-if exist "test\cli\work\.bit\index\file.txt" (exit 0) else (exit 1)
+if exist "test\cli\output\work\.bit\index\file.txt" (exit 0) else (exit 1)
 <<<
 >>>= 0
 
 # Modify .bitignore to also ignore *.tmp
-cd test\cli\work & echo *.tmp>> .bitignore
+cd test\cli\output\work & echo *.tmp>> .bitignore
 <<<
 >>>= 0
 
 # Create test.tmp file
-cd test\cli\work & echo temp content> test.tmp
+cd test\cli\output\work & echo temp content> test.tmp
 <<<
 >>>= 0
 
 # Add all - test.tmp should be ignored
-cd test\cli\work & bit add .
+cd test\cli\output\work & bit add .
 <<<
 >>>= 0
 
 # Verify test.tmp is NOT shown in status
-cd test\cli\work & bit status | findstr "test.tmp" && exit 1 || exit 0
+cd test\cli\output\work & bit status | findstr "test.tmp" && exit 1 || exit 0
 <<<
 >>>= 0
 
 # Cleanup
-rmdir /s /q test\cli\work 2>nul
+rmdir /s /q test\cli\output\work 2>nul
 <<<
 >>>= 0
 ```
@@ -1041,25 +1113,25 @@ cd test\cli & subst Z: . & cd ..\..
 >>>= 0
 
 # --- Setup: create work dir, remote dir, init bit ---
-rmdir /s /q test\cli\work 2>nul & rmdir /s /q test\cli\device_prompt_remote 2>nul & mkdir test\cli\work & mkdir test\cli\device_prompt_remote & cd test\cli\work & bit init
+rmdir /s /q test\cli\output\work 2>nul & rmdir /s /q test\cli\output\device_prompt_remote 2>nul & mkdir test\cli\output\work & mkdir test\cli\output\device_prompt_remote & cd test\cli\output\work & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
 # --- Add remote with piped device name (BIT_USE_STDIN=1) ---
-cd test\cli\work & set BIT_USE_STDIN=1 & echo test_device| bit remote add origin Z:\device_prompt_remote
+cd test\cli\output\work & set BIT_USE_STDIN=1 & echo test_device| bit remote add origin Z:\output\device_prompt_remote
 <<<
 >>> /Remote.*origin|Device.*registered/
 >>>= 0
 
 # --- Verify remote was stored: either device name or fallback (local:) ---
-findstr /C:"device:" test\cli\work\.bit\remotes\origin >nul || findstr /C:"local:" test\cli\work\.bit\remotes\origin >nul
+findstr /C:"device:" test\cli\output\work\.bit\remotes\origin >nul || findstr /C:"local:" test\cli\output\work\.bit\remotes\origin >nul
 <<<
 >>>
 >>>= 0
 
 # --- Cleanup ---
-subst Z: /D 2>nul & rmdir /s /q test\cli\work 2>nul & rmdir /s /q test\cli\device_prompt_remote 2>nul
+subst Z: /D 2>nul & del test\cli\.bit-store 2>nul & rmdir /s /q test\cli\output\work 2>nul & rmdir /s /q test\cli\output\device_prompt_remote 2>nul
 <<<
 >>>
 >>>= 0
@@ -1085,7 +1157,7 @@ subst Z: /D 2>nul & rmdir /s /q test\cli\work 2>nul & rmdir /s /q test\cli\devic
 # =============================================================================
 
 # ---- CLEANUP: remove any leftover state from previous runs ----
-timeout /t 1 >nul & rmdir /s /q test\cli\work_fetch_a 2>nul & rmdir /s /q test\cli\work_fetch_b 2>nul & rclone purge gdrive-test:bit-test-fetch 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_fetch_a 2>nul & rmdir /s /q test\cli\output\work_fetch_b 2>nul & rclone purge gdrive-test:bit-test-fetch 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -1095,12 +1167,12 @@ cleanup done
 # SETUP
 # ======================================================================
 
-mkdir test\cli\work_fetch_a
+mkdir test\cli\output\work_fetch_a
 <<<
 >>>
 >>>= 0
 
-mkdir test\cli\work_fetch_b
+mkdir test\cli\output\work_fetch_b
 <<<
 >>>
 >>>= 0
@@ -1111,22 +1183,22 @@ rclone mkdir gdrive-test:bit-test-fetch
 >>>= 0
 
 # ---- Repo A: init, add remote, create initial file ----
-cd test\cli\work_fetch_a & bit init
+cd test\cli\output\work_fetch_a & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
-cd test\cli\work_fetch_a & bit remote add origin gdrive-test:bit-test-fetch
+cd test\cli\output\work_fetch_a & bit remote add origin gdrive-test:bit-test-fetch
 <<<
 >>> /Remote.*added/
 >>>= 0
 
-cd test\cli\work_fetch_a & echo initial> file1.txt & bit add file1.txt & bit commit -m "Initial commit"
+cd test\cli\output\work_fetch_a & echo initial> file1.txt & bit add file1.txt & bit commit -m "Initial commit"
 <<<
 >>> /\[master|main|file changed/
 >>>= 0
 
-cd test\cli\work_fetch_a & bit push
+cd test\cli\output\work_fetch_a & bit push
 <<<
 >>> /Metadata push complete\.|Remote check passed/
 >>>= 0
@@ -1135,18 +1207,18 @@ cd test\cli\work_fetch_a & bit push
 # TEST CASE 1: FetchedFirst - First fetch should show output
 # ======================================================================
 
-cd test\cli\work_fetch_b & bit init
+cd test\cli\output\work_fetch_b & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
-cd test\cli\work_fetch_b & bit remote add origin gdrive-test:bit-test-fetch
+cd test\cli\output\work_fetch_b & bit remote add origin gdrive-test:bit-test-fetch
 <<<
 >>> /Remote.*added/
 >>>= 0
 
 # ---- First fetch: should show "Fetched: <hash>" and "From <remote>" ----
-cd test\cli\work_fetch_b & bit fetch
+cd test\cli\output\work_fetch_b & bit fetch
 <<<
 >>> /Scanning remote|Fetched:|Fetch complete/
 >>>2 /From gdrive-test:bit-test-fetch|new branch.*origin\/main/
@@ -1157,13 +1229,13 @@ cd test\cli\work_fetch_b & bit fetch
 # ======================================================================
 
 # ---- Second fetch with no changes: should be silent (UpToDate) ----
-cd test\cli\work_fetch_b & bit fetch
+cd test\cli\output\work_fetch_b & bit fetch
 <<<
 >>>
 >>>= 0
 
 # ---- Third fetch still silent ----
-cd test\cli\work_fetch_b & bit fetch
+cd test\cli\output\work_fetch_b & bit fetch
 <<<
 >>>
 >>>= 0
@@ -1173,24 +1245,24 @@ cd test\cli\work_fetch_b & bit fetch
 # ======================================================================
 
 # ---- A: make a change and push ----
-cd test\cli\work_fetch_a & echo updated> file2.txt & bit add file2.txt & bit commit -m "Second commit"
+cd test\cli\output\work_fetch_a & echo updated> file2.txt & bit add file2.txt & bit commit -m "Second commit"
 <<<
 >>> /\[master|main|file changed/
 >>>= 0
 
-cd test\cli\work_fetch_a & bit push
+cd test\cli\output\work_fetch_a & bit push
 <<<
 >>> /Metadata push complete\.|Remote check passed/
 >>>= 0
 
 # ---- B: fetch should show "Updated: <old> -> <new>" ----
-cd test\cli\work_fetch_b & bit fetch
+cd test\cli\output\work_fetch_b & bit fetch
 <<<
 >>> /Scanning remote|Updated:|Fetch complete/
 >>>= 0
 
 # ---- B: fetch again should be silent (UpToDate) ----
-cd test\cli\work_fetch_b & bit fetch
+cd test\cli\output\work_fetch_b & bit fetch
 <<<
 >>>
 >>>= 0
@@ -1199,7 +1271,7 @@ cd test\cli\work_fetch_b & bit fetch
 # CLEANUP
 # ======================================================================
 
-timeout /t 1 >nul & rmdir /s /q test\cli\work_fetch_a 2>nul & rmdir /s /q test\cli\work_fetch_b 2>nul & rclone purge gdrive-test:bit-test-fetch 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_fetch_a 2>nul & rmdir /s /q test\cli\output\work_fetch_b 2>nul & rclone purge gdrive-test:bit-test-fetch 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -1219,83 +1291,83 @@ cleanup done
 # Tests running bit commands directly at the filesystem remote location
 
 # Setup: Clean workspace (timeout helps Windows release file handles)
-timeout /t 1 >nul & rmdir /s /q test\cli\work_direct 2>nul & rmdir /s /q test\cli\fs_remote_direct 2>nul & mkdir test\cli\work_direct & mkdir test\cli\fs_remote_direct
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_direct 2>nul & rmdir /s /q test\cli\output\fs_remote_direct 2>nul & mkdir test\cli\output\work_direct & mkdir test\cli\output\fs_remote_direct
 <<<
 >>>
 >>>= 0
 
 # Initialize local repo
-cd test\cli\work_direct & bit init
+cd test\cli\output\work_direct & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
 # Add filesystem remote
-cd test\cli\work_direct & bit remote add origin ..\fs_remote_direct
+cd test\cli\output\work_direct & bit remote add origin ..\fs_remote_direct
 <<<
 >>> /Remote 'origin' added/
 >>>= 0
 
 # Create and push a file
-cd test\cli\work_direct & echo test content> file.txt & bit add file.txt & bit commit -m "Initial"
+cd test\cli\output\work_direct & echo test content> file.txt & bit add file.txt & bit commit -m "Initial"
 <<<
 >>> /\[main|files? changed/
 >>>= 0
 
-cd test\cli\work_direct & bit push
+cd test\cli\output\work_direct & bit push
 <<<
 >>> /Push complete/
 >>>= 0
 
 # Run bit status at the remote (should work since it's a full repo)
-cd test\cli\fs_remote_direct & bit status
+cd test\cli\output\fs_remote_direct & bit status
 <<<
 >>> /nothing to commit|working tree clean|On branch/
 >>>= 0
 
 # Run bit log at the remote
-cd test\cli\fs_remote_direct & bit log --oneline
+cd test\cli\output\fs_remote_direct & bit log --oneline
 <<<
 >>> /Initial/
 >>>= 0
 
 # Modify file directly at remote
-cd test\cli\fs_remote_direct & echo remote change> file.txt & bit add file.txt & bit commit -m "Remote edit"
+cd test\cli\output\fs_remote_direct & echo remote change> file.txt & bit add file.txt & bit commit -m "Remote edit"
 <<<
 >>> /\[main|files? changed/
 >>>= 0
 
 # Local push should now fail (remote has diverged)
-cd test\cli\work_direct & echo local change> other.txt & bit add other.txt & bit commit -m "Local edit"
+cd test\cli\output\work_direct & echo local change> other.txt & bit add other.txt & bit commit -m "Local edit"
 <<<
 >>> /\[main|files? changed/
 >>>= 0
 
-cd test\cli\work_direct & bit push
+cd test\cli\output\work_direct & bit push
 <<<
 >>>2 /error.*Remote has local commits/
 >>>= 1
 
 # Local pull should work (merges remote changes)
-cd test\cli\work_direct & bit pull
+cd test\cli\output\work_direct & bit pull
 <<<
 >>> /Pull|Merging|Updating/
 >>>= 0
 
 # Now push should succeed
-cd test\cli\work_direct & bit push
+cd test\cli\output\work_direct & bit push
 <<<
 >>> /Push complete/
 >>>= 0
 
 # Verify remote has both files
-if exist "test\cli\fs_remote_direct\file.txt" (echo file exists) else (echo missing)
+if exist "test\cli\output\fs_remote_direct\file.txt" (echo file exists) else (echo missing)
 <<<
 >>>
 file exists
 >>>= 0
 
-if exist "test\cli\fs_remote_direct\other.txt" (echo other exists) else (echo missing)
+if exist "test\cli\output\fs_remote_direct\other.txt" (echo other exists) else (echo missing)
 <<<
 >>>
 other exists
@@ -1305,7 +1377,7 @@ other exists
 # CLEANUP
 # ======================================================================
 
-timeout /t 1 >nul & rmdir /s /q test\cli\work_direct 2>nul & rmdir /s /q test\cli\fs_remote_direct 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_direct 2>nul & rmdir /s /q test\cli\output\fs_remote_direct 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -1321,62 +1393,32 @@ cleanup done
 *Source file.*
 
 ```text
-# bit fsck tests (git-style output: terse, one line per issue, exit 1 on any failure)
+# bit fsck tests — passthrough to git fsck on .bit/index metadata repository
 
-# --- fsck on fresh repo (no remote): prints nothing when OK ---
-rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit init
+# --- fsck on fresh repo (unborn branch): git fsck notices but exits 0 ---
+rmdir /s /q test\cli\output\work_fsck 2>nul & mkdir test\cli\output\work_fsck & cd test\cli\output\work_fsck & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
-# fsck OK = status messages to stderr, exit 0
-cd test\cli\work & bit fsck
+cd test\cli\output\work_fsck & bit fsck
 <<<
->>>2 /OK/
 >>>= 0
 
-# --- fsck on repo with committed files: status messages on OK ---
-rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit init & echo hello> a.txt & bit add a.txt & bit commit -m "Add a"
+# --- fsck on repo with committed files: clean, exits 0 ---
+rmdir /s /q test\cli\output\work_fsck 2>nul & mkdir test\cli\output\work_fsck & cd test\cli\output\work_fsck & bit init & echo hello> a.txt & bit add a.txt & bit commit -m "Add a"
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
-cd test\cli\work & bit fsck
+cd test\cli\output\work_fsck & bit fsck
 <<<
->>>2 /OK/
 >>>= 0
 
-# --- fsck detects local hash mismatch: git-style "hash mismatch <path>", exit 1 ---
-rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit init & echo original> file.bin & bit add file.bin & bit commit -m "Add file"
+# --- cleanup ---
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_fsck 2>nul
 <<<
->>> /.*[Ii]nitialized.*/
 >>>= 0
-
-cd test\cli\work & echo corrupted> file.bin
-<<<
->>>
->>>= 0
-
-cd test\cli\work & bit fsck
-<<<
->>>2 /hash mismatch.*file\.bin/
->>>= 1
-
-# --- fsck detects missing file: git-style "missing <path>", exit 1 ---
-rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit init & echo x> missing.txt & bit add missing.txt & bit commit -m "Add missing"
-<<<
->>> /.*[Ii]nitialized.*/
->>>= 0
-
-del test\cli\work\missing.txt
-<<<
->>>
->>>= 0
-
-cd test\cli\work & bit fsck
-<<<
->>>2 /missing.*missing\.txt/
->>>= 1
 ```
 
 ---
@@ -1393,61 +1435,61 @@ cd test\cli\work & bit fsck
 # Requires: rclone remote "gdrive-test" configured; path "bit-test" used on that remote.
 
 # --- Setup: clean work dirs and remote (timeout helps Windows release file handles) ---
-timeout /t 1 >nul & rmdir /s /q test\cli\work_gdrive_a 2>nul & rmdir /s /q test\cli\work_gdrive_b 2>nul & mkdir test\cli\work_gdrive_a & mkdir test\cli\work_gdrive_b & rclone purge gdrive-test:bit-test 2>nul & rclone mkdir gdrive-test:bit-test
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_gdrive_a 2>nul & rmdir /s /q test\cli\output\work_gdrive_b 2>nul & mkdir test\cli\output\work_gdrive_a & mkdir test\cli\output\work_gdrive_b & rclone purge gdrive-test:bit-test 2>nul & rclone mkdir gdrive-test:bit-test
 <<<
 >>>
 >>>= 0
 
 # --- Repo A: init (use main branch for fetch/pull), add remote, add file, commit, push ---
-cd test\cli\work_gdrive_a & bit init
+cd test\cli\output\work_gdrive_a & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
-cd test\cli\work_gdrive_a & bit remote add origin gdrive-test:bit-test
+cd test\cli\output\work_gdrive_a & bit remote add origin gdrive-test:bit-test
 <<<
 >>> /Remote.*added/
 >>>= 0
 
-cd test\cli\work_gdrive_a & echo hello from A> foo.txt & echo x> bar.bin & bit add foo.txt bar.bin & bit commit -m "Add foo and bar"
+cd test\cli\output\work_gdrive_a & echo hello from A> foo.txt & echo x> bar.bin & bit add foo.txt bar.bin & bit commit -m "Add foo and bar"
 <<<
 >>> /\[master|main|file changed/
 >>>= 0
 
-cd test\cli\work_gdrive_a & bit push
+cd test\cli\output\work_gdrive_a & bit push
 <<<
 >>> /Metadata push complete\.|Remote is empty|Remote check passed/
 >>>= 0
 
-# --- A: remote check after push: all files on remote, should match ---
-cd test\cli\work_gdrive_a & bit remote check
+# --- A: remote repair after push: all files verified, nothing to repair ---
+cd test\cli\output\work_gdrive_a & bit remote repair
 <<<
->>> /files match between local and remote/
+>>> /Nothing to repair/
 >>>= 0
 
 # --- Repo B: init, add remote, fetch, pull ---
-cd test\cli\work_gdrive_b & bit init
+cd test\cli\output\work_gdrive_b & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
-cd test\cli\work_gdrive_b & bit remote add origin gdrive-test:bit-test
+cd test\cli\output\work_gdrive_b & bit remote add origin gdrive-test:bit-test
 <<<
 >>> /Remote.*added/
 >>>= 0
 
-cd test\cli\work_gdrive_b & bit fetch
+cd test\cli\output\work_gdrive_b & bit fetch
 <<<
 >>>2 /From gdrive-test:bit-test|new branch.*origin\/main/
 >>>= 0
 
-cd test\cli\work_gdrive_b & bit pull
+cd test\cli\output\work_gdrive_b & bit pull
 <<<
 >>> /first pull|Checking out|Syncing binaries|Merge made|remote: Counting/
 >>>= 0
 
 # --- Verify B has the file from A (text in index, binary in work tree) ---
-findstr /C:"hello from A" test\cli\work_gdrive_b\.bit\index\foo.txt >nul
+findstr /C:"hello from A" test\cli\output\work_gdrive_b\.bit\index\foo.txt >nul
 <<<
 >>>
 >>>= 0
@@ -1459,68 +1501,68 @@ rclone deletefile gdrive-test:bit-test/bar.bin
 >>>= 0
 
 # --- B: verify --remote may report missing file or 0 files (bundle metadata) ---
-cd test\cli\work_gdrive_b & bit verify --remote
+cd test\cli\output\work_gdrive_b & bit verify --remote
 <<<
 >>> /Missing:|issues found|ERROR|\[OK\] All files match|Verifying 0/
 >>>= 0
 
 # --- Restore remote: push from A again (re-syncs files + bundle) ---
-cd test\cli\work_gdrive_a & bit push
+cd test\cli\output\work_gdrive_a & bit push
 <<<
 >>> /Metadata push complete\.|Remote check passed|Pulling changes|up to date/
 >>>= 0
 
 # --- B: fetch and pull to get restored state ---
-cd test\cli\work_gdrive_b & bit fetch
+cd test\cli\output\work_gdrive_b & bit fetch
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work_gdrive_b & bit pull
+cd test\cli\output\work_gdrive_b & bit pull
 <<<
 >>> /up to date|Merge made|Syncing binaries|first pull/
 >>>= 0
 
 # --- B: verify --remote should be clean again ---
-cd test\cli\work_gdrive_b & bit verify --remote
+cd test\cli\output\work_gdrive_b & bit verify --remote
 <<<
 >>> /\[OK\] All.*files match|Checked.*files/
 >>>= 0
 
-findstr /C:"hello from A" test\cli\work_gdrive_b\.bit\index\foo.txt >nul
+findstr /C:"hello from A" test\cli\output\work_gdrive_b\.bit\index\foo.txt >nul
 <<<
 >>>
 >>>= 0
 
 # --- Second round: A adds another file, pushes; B pulls ---
-cd test\cli\work_gdrive_a & echo second file> baz.txt & bit add baz.txt & bit commit -m "Add baz" & bit push
+cd test\cli\output\work_gdrive_a & echo second file> baz.txt & bit add baz.txt & bit commit -m "Add baz" & bit push
 <<<
 >>> /Metadata push complete\.|Remote check passed|file changed/
 >>>= 0
 
-cd test\cli\work_gdrive_b & bit fetch & bit pull
+cd test\cli\output\work_gdrive_b & bit fetch & bit pull
 <<<
 >>>2 /From (gdrive-test|\.git\\fetched_remote\.bundle)|Merge made|Syncing|Updating|remote: Counting/
 >>>= 0
 
-findstr /C:"second file" test\cli\work_gdrive_b\.bit\index\baz.txt >nul
+findstr /C:"second file" test\cli\output\work_gdrive_b\.bit\index\baz.txt >nul
 <<<
 >>>
 >>>= 0
 
 # --- Corrupt again: add an orphan file on remote with rclone ---
-echo junk content> test\cli\work_gdrive_b\junk.tmp & rclone copyto test\cli\work_gdrive_b\junk.tmp gdrive-test:bit-test/orphan.txt
+echo junk content> test\cli\output\work_gdrive_b\junk.tmp & rclone copyto test\cli\output\work_gdrive_b\junk.tmp gdrive-test:bit-test/orphan.txt
 <<<
 >>>
 >>>= 0
 
 # --- B: fetch (bundle unchanged), then pull: local should not get orphan; verify --remote ---
-cd test\cli\work_gdrive_b & bit fetch
+cd test\cli\output\work_gdrive_b & bit fetch
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work_gdrive_b & bit verify --remote
+cd test\cli\output\work_gdrive_b & bit verify --remote
 <<<
 >>> /Verifying|All files match|issues found/
 >>>= 0
@@ -1532,7 +1574,7 @@ rclone deletefile gdrive-test:bit-test/orphan.txt
 >>>= 0
 
 # --- Final cleanup: remove local work directories ---
-timeout /t 1 >nul & rmdir /s /q test\cli\work_gdrive_a & rmdir /s /q test\cli\work_gdrive_b & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_gdrive_a & rmdir /s /q test\cli\output\work_gdrive_b & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -1549,44 +1591,44 @@ cleanup done
 
 ```text
 # Setup: clean environment and initialize repo
-rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit init
+rmdir /s /q test\cli\output\work 2>nul & mkdir test\cli\output\work & cd test\cli\output\work & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
 # Verify init.defaultBranch was set to "main"
-cd test\cli\work & git -C .bit\index config --get init.defaultBranch
+cd test\cli\output\work & git -C .bit\index config --get init.defaultBranch
 <<<
 >>>
 main
 >>>= 0
 
 # Verify core.quotePath was set to "false" (for Unicode filename support)
-cd test\cli\work & git -C .bit\index config --get core.quotePath
+cd test\cli\output\work & git -C .bit\index config --get core.quotePath
 <<<
 >>>
 false
 >>>= 0
 
 # Verify merge driver was configured
-cd test\cli\work & git -C .bit\index config --get merge.bit-metadata.driver
+cd test\cli\output\work & git -C .bit\index config --get merge.bit-metadata.driver
 <<<
 >>>
 false
 >>>= 0
 
 # Verify bit status works after init (proves git commands work)
-cd test\cli\work & bit status
+cd test\cli\output\work & bit status
 <<<
 >>>= 0
 
 # Verify bit add works after init
-cd test\cli\work & echo test> file.txt & bit add file.txt
+cd test\cli\output\work & echo test> file.txt & bit add file.txt
 <<<
 >>>= 0
 
 # Verify bit commit works after init
-cd test\cli\work & bit commit -m "test commit"
+cd test\cli\output\work & bit commit -m "test commit"
 <<<
 >>> /\[main|master|file/
 >>>= 0
@@ -1602,13 +1644,13 @@ cd test\cli\work & bit commit -m "test commit"
 
 ```text
 # Setup: clean environment
-rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit init
+rmdir /s /q test\cli\output\work 2>nul & mkdir test\cli\output\work & cd test\cli\output\work & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
 # Verify .bit directory was created
-if exist "test\cli\work\.bit\" (echo exists) else (echo missing)
+if exist "test\cli\output\work\.bit\" (echo exists) else (echo missing)
 <<<
 >>>
 exists
@@ -1625,109 +1667,109 @@ exists
 
 ```text
 # Setup fresh repo
-rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit init
+rmdir /s /q test\cli\output\work 2>nul & mkdir test\cli\output\work & cd test\cli\output\work & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
 # ls-files with no tracked files should return nothing
-cd test\cli\work & bit ls-files
+cd test\cli\output\work & bit ls-files
 <<<
 >>>
 >>>= 0
 
 # Add a text file
-cd test\cli\work & echo hello> test.txt & bit add test.txt
+cd test\cli\output\work & echo hello> test.txt & bit add test.txt
 <<<
 >>>
 >>>= 0
 
 # ls-files should show the staged file
-cd test\cli\work & bit ls-files
+cd test\cli\output\work & bit ls-files
 <<<
 >>> /test\.txt/
 >>>= 0
 
 # Commit the file
-cd test\cli\work & bit commit -m "Add test.txt"
+cd test\cli\output\work & bit commit -m "Add test.txt"
 <<<
 >>> /\[master|main|files? changed/
 >>>= 0
 
 # ls-files should still show the committed file
-cd test\cli\work & bit ls-files
+cd test\cli\output\work & bit ls-files
 <<<
 >>> /test\.txt/
 >>>= 0
 
 # Add multiple files
-cd test\cli\work & echo data> data.txt & echo notes> notes.txt & bit add data.txt notes.txt
+cd test\cli\output\work & echo data> data.txt & echo notes> notes.txt & bit add data.txt notes.txt
 <<<
 >>>
 >>>= 0
 
 # Commit the new files
-cd test\cli\work & bit commit -m "Add more files"
+cd test\cli\output\work & bit commit -m "Add more files"
 <<<
 >>> /\[master|main|files? changed/
 >>>= 0
 
 # ls-files should show all tracked files (test.txt, data.txt, notes.txt)
-cd test\cli\work & bit ls-files
+cd test\cli\output\work & bit ls-files
 <<<
 >>> /test\.txt/
 >>>= 0
 
 # ls-files with --stage should show metadata (mode, hash, stage, filename)
-cd test\cli\work & bit ls-files --stage
+cd test\cli\output\work & bit ls-files --stage
 <<<
 >>> /100644.*test\.txt/
 >>>= 0
 
 # ls-files with specific pathspec should filter results
-cd test\cli\work & bit ls-files test.txt
+cd test\cli\output\work & bit ls-files test.txt
 <<<
 >>> /^test\.txt$/
 >>>= 0
 
 # Add a binary file
-cd test\cli\work & echo binary> file.bin & bit add file.bin & bit commit -m "Add binary"
+cd test\cli\output\work & echo binary> file.bin & bit add file.bin & bit commit -m "Add binary"
 <<<
 >>> /\[master|main|files? changed/
 >>>= 0
 
 # ls-files should show all files including binary
-cd test\cli\work & bit ls-files
+cd test\cli\output\work & bit ls-files
 <<<
 >>> /file\.bin/
 >>>= 0
 
 # ls-files with wildcard pattern (should show .txt files)
-cd test\cli\work & bit ls-files *.txt
+cd test\cli\output\work & bit ls-files *.txt
 <<<
 >>> /\.txt/
 >>>= 0
 
 # ls-files --cached should work (default behavior)
-cd test\cli\work & bit ls-files --cached
+cd test\cli\output\work & bit ls-files --cached
 <<<
 >>> /test\.txt/
 >>>= 0
 
 # Create subdirectory with files
-cd test\cli\work & mkdir subdir & echo sub> subdir\sub.txt & bit add subdir\sub.txt & bit commit -m "Add subdir"
+cd test\cli\output\work & mkdir subdir & echo sub> subdir\sub.txt & bit add subdir\sub.txt & bit commit -m "Add subdir"
 <<<
 >>> /\[master|main|files? changed/
 >>>= 0
 
 # ls-files should show files in subdirectories
-cd test\cli\work & bit ls-files
+cd test\cli\output\work & bit ls-files
 <<<
 >>> /subdir/
 >>>= 0
 
 # ls-files with directory pathspec
-cd test\cli\work & bit ls-files subdir
+cd test\cli\output\work & bit ls-files subdir
 <<<
 >>> /subdir/
 >>>= 0
@@ -1742,527 +1784,527 @@ cd test\cli\work & bit ls-files subdir
 *Source file.*
 
 ```text
-# =============================================================================
-# bit merge tests (local directory as remote, no cloud needed)
-#
-# Inspired by Git's t7600-merge.sh and t7611-merge-abort.sh.
-# Tests the full two-repo push/pull/merge cycle.
-#
-# Requires: rclone on PATH (used for local file sync).
-# Convention: work_merge_a = "pusher", work_merge_b = "puller", shared_merge_remote = rclone target.
-#
-# Test categories (cf. Git t64xx / t76xx):
-#   1. First pull into unborn branch
-#   2. Fast-forward merge (no local divergence)
-#   3. Clean three-way merge (non-conflicting parallel changes)
-#   4. Content conflict — resolve keep-local
-#   5. Content conflict — resolve take-remote
-#   6. Binary metadata conflict — resolve keep-local
-#   7. Multiple simultaneous conflicts — mixed resolution
-#   8. Merge abort (no merge in progress)
-#   9. Merge continue (no merge in progress)
-#  10. Pull --accept-remote
-#  11. Add/add conflict (both repos create same new file)
-#  12. Verify working tree clean after resolved merge
-# =============================================================================
-
-# ---- CLEANUP: remove any leftover state from previous runs (timeout helps Windows release file handles) ----
-timeout /t 1 >nul & rmdir /s /q test\cli\work_merge_a 2>nul & rmdir /s /q test\cli\work_merge_b 2>nul & rmdir /s /q test\cli\shared_merge_remote 2>nul & echo cleanup done
-<<<
->>>
-cleanup done
->>>= 0
-
-# ======================================================================
-# SECTION 1: SETUP — shared remote + two repos with common base state
-# ======================================================================
-
-# ---- Create shared remote directory ----
-mkdir test\cli\shared_merge_remote
-<<<
->>>
->>>= 0
-
-# ---- Repo A: init ----
-mkdir test\cli\work_merge_a & cd test\cli\work_merge_a & bit init
-<<<
->>> /.*[Ii]nitialized.*/
->>>= 0
-
-# ---- Repo A: add remote ----
-cd test\cli\work_merge_a & bit remote add origin ..\shared_merge_remote
-<<<
->>> /Remote.*added/
->>>= 0
-
-# ---- Repo A: create base text file, add, commit ----
-cd test\cli\work_merge_a & echo base content> text.txt & bit add text.txt
-<<<
->>>
->>>= 0
-
-cd test\cli\work_merge_a & bit commit -m "Base: add text.txt"
-<<<
->>> /\[main|master|files? changed/
->>>= 0
-
-# ---- Repo A: create base binary file, add, commit ----
-cd test\cli\work_merge_a & echo binarydata> data.bin & bit add data.bin
-<<<
->>>
->>>= 0
-
-cd test\cli\work_merge_a & bit commit -m "Base: add data.bin"
-<<<
->>> /\[main|master|files? changed/
->>>= 0
-
-# ---- Repo A: push base state to shared remote ----
-cd test\cli\work_merge_a & bit push
-<<<
->>> /Push complete|Pushing to filesystem remote/
->>>= 0
-
-# ======================================================================
-# SECTION 2: FIRST PULL — repo B fetches from shared remote (unborn branch)
-# (Mirrors Git's test of merge with unborn HEAD)
-# ======================================================================
-
-# ---- Repo B: init ----
-mkdir test\cli\work_merge_b & cd test\cli\work_merge_b & bit init
-<<<
->>> /.*[Ii]nitialized.*/
->>>= 0
-
-# ---- Repo B: add same remote ----
-cd test\cli\work_merge_b & bit remote add origin ..\shared_merge_remote
-<<<
->>> /Remote.*added/
->>>= 0
-
-# ---- Repo B: fetch ----
-# Note: fetch doesn't support filesystem remotes yet (uses cloud bundle fetch)
-# Pull handles filesystem remotes and does its own fetch, so we skip separate fetch
-# cd test\cli\work_merge_b & bit fetch
-
-# ---- Repo B: pull (first pull — checkout remote as main) ----
-cd test\cli\work_merge_b & bit pull
-<<<
->>> /first pull|Checking out|Syncing binaries/
->>>= 0
-
-# ---- Verify B has the text file from A (content stored in .bit/index) ----
-findstr /C:"base content" test\cli\work_merge_b\.bit\index\text.txt >nul
-<<<
->>>
->>>= 0
-
-# ---- Verify B has the binary file metadata ----
-findstr /C:"hash:" test\cli\work_merge_b\.bit\index\data.bin >nul
-<<<
->>>
->>>= 0
-
-# ---- Verify B's working tree has the text file ----
-if exist "test\cli\work_merge_b\text.txt" (echo file exists) else (echo missing)
-<<<
->>>
-file exists
->>>= 0
-
-# ---- Verify B status after first pull ----
-# Note: binary files may show as modified due to sync timing, but merge succeeded
-cd test\cli\work_merge_b & bit status
-<<<
->>> /nothing to commit|working tree clean|up to date/
->>>= 0
-
-# ======================================================================
-# SECTION 3: FAST-FORWARD MERGE — A pushes, B pulls with no local changes
-# (Mirrors Git's "merge c0 with c1" ff test in t7600)
-# ======================================================================
-
-# ---- A: add a new file and push ----
-cd test\cli\work_merge_a & echo new from A> extra.txt & bit add extra.txt & bit commit -m "Add extra.txt"
-<<<
->>> /\[main|master|files? changed/
->>>= 0
-
-cd test\cli\work_merge_a & bit push
-<<<
->>> /Push complete|Pushing to filesystem remote/
->>>= 0
-
-# ---- B: pull — should merge cleanly (B has no local divergence) ----
-cd test\cli\work_merge_b & bit fetch
-<<<
->>> /Fetch complete|Fetching from/
->>>= 0
-
-cd test\cli\work_merge_b & bit pull
-<<<
->>> /Updating|Merge made|Syncing binaries/
->>>= 0
-
-# ---- Verify B has the new file ----
-findstr /C:"new from A" test\cli\work_merge_b\.bit\index\extra.txt >nul
-<<<
->>>
->>>= 0
-
-# ---- Verify B status is clean ----
-cd test\cli\work_merge_b & bit status
-<<<
->>> /nothing to commit|working tree clean|up to date/
->>>= 0
-
-# ======================================================================
-# SECTION 4: CLEAN THREE-WAY MERGE — non-conflicting parallel changes
-# (Mirrors Git's "merge c1 with c2" where changes are in different hunks)
-# ======================================================================
-
-# ---- A: modify text.txt and push ----
-cd test\cli\work_merge_a & echo updated by A> text.txt & bit add text.txt & bit commit -m "A: update text.txt"
-<<<
->>> /\[main|master|files? changed/
->>>= 0
-
-cd test\cli\work_merge_a & bit push
-<<<
->>> /Push complete|Pushing to filesystem remote/
->>>= 0
-
-# ---- B: add a NEW file (doesn't overlap with A's changes) and commit ----
-cd test\cli\work_merge_b & echo B only file> bonly.txt & bit add bonly.txt & bit commit -m "B: add bonly.txt"
-<<<
->>> /\[main|master|files? changed/
->>>= 0
-
-# ---- B: pull — should merge cleanly since changes don't overlap ----
-cd test\cli\work_merge_b & bit pull
-<<<
->>> /Merge made|Syncing binaries|Updating/
->>>= 0
-
-# ---- Verify B has A's updated text.txt ----
-findstr /C:"updated by A" test\cli\work_merge_b\.bit\index\text.txt >nul
-<<<
->>>
->>>= 0
-
-# ---- Verify B still has its own bonly.txt ----
-findstr /C:"B only file" test\cli\work_merge_b\.bit\index\bonly.txt >nul
-<<<
->>>
->>>= 0
-
-# ---- Verify B status is clean ----
-cd test\cli\work_merge_b & bit status
-<<<
->>> /nothing to commit|working tree clean|up to date/
->>>= 0
-
-# ======================================================================
-# SECTION 5: CONTENT CONFLICT — resolve keep-local
-# Both A and B modify the same text file with different content.
-# bit detects the conflict in .bit/index/ and prompts for resolution.
-# User chooses (l)ocal.
-# (Mirrors Git's "merge c1 with c2 — content conflict" in t7600)
-# ======================================================================
-
-# ---- Synchronize: B pushes its current state so both are aligned ----
-cd test\cli\work_merge_b & bit push
-<<<
->>> /Push complete|Pushing to filesystem remote/
->>>= 0
-
-cd test\cli\work_merge_a & bit fetch & bit pull
-<<<
->>> //
->>>= 0
-
-# ---- A: modify text.txt to A's version and push ----
-cd test\cli\work_merge_a & echo conflict version A> text.txt & bit add text.txt & bit commit -m "A: conflict version"
-<<<
->>> /\[main|master|files? changed/
->>>= 0
-
-cd test\cli\work_merge_a & bit push
-<<<
->>> /Push complete|Pushing to filesystem remote/
->>>= 0
-
-# ---- B: modify SAME text.txt to B's version and commit locally ----
-cd test\cli\work_merge_b & echo conflict version B> text.txt & bit add text.txt & bit commit -m "B: conflict version"
-<<<
->>> /\[main|master|files? changed/
->>>= 0
-
-# ---- B: pull — conflict expected; pipe "l" to keep local ----
-cd test\cli\work_merge_b & bit pull
-<<<
-l
->>> /Automatic merge failed|CONFLICT|Resolving conflicts|Merge complete|conflict/
->>>= 0
-
-# ---- Verify B kept local version in metadata (B's content wins) ----
-findstr /C:"conflict version B" test\cli\work_merge_b\.bit\index\text.txt >nul
-<<<
->>>
->>>= 0
-
-# ======================================================================
-# SECTION 6: CONTENT CONFLICT — resolve take-remote
-# Same setup: both modify same file, but user chooses (r)emote.
-# (Mirrors Git's checkout --theirs pattern)
-# ======================================================================
-
-# ---- Re-sync: push B's state, pull to A ----
-cd test\cli\work_merge_b & bit push
-<<<
->>> /Push complete|Pushing to filesystem remote/
->>>= 0
-
-cd test\cli\work_merge_a & bit fetch & bit pull
-<<<
->>> //
->>>= 0
-
-# ---- A: modify text.txt to "remote wins" and push ----
-cd test\cli\work_merge_a & echo remote wins version> text.txt & bit add text.txt & bit commit -m "A: remote wins"
-<<<
->>> /\[main|master|files? changed/
->>>= 0
-
-cd test\cli\work_merge_a & bit push
-<<<
->>> /Push complete|Pushing to filesystem remote/
->>>= 0
-
-# ---- B: modify SAME text.txt differently and commit locally ----
-cd test\cli\work_merge_b & echo local loses version> text.txt & bit add text.txt & bit commit -m "B: local loses"
-<<<
->>> /\[main|master|files? changed/
->>>= 0
-
-# ---- B: pull — conflict expected; pipe "r" to take remote ----
-cd test\cli\work_merge_b & bit pull
-<<<
-r
->>> /Automatic merge failed|CONFLICT|Resolving conflicts|Merge complete|conflict/
->>>= 0
-
-# ---- Verify B took remote version in metadata (A's content wins) ----
-findstr /C:"remote wins version" test\cli\work_merge_b\.bit\index\text.txt >nul
-<<<
->>>
->>>= 0
-
-# ======================================================================
-# SECTION 7: MULTIPLE SIMULTANEOUS CONFLICTS — mixed resolution
-# Both A and B modify two files. B picks (l)ocal for first, (r)emote for second.
-# (Mirrors Git's "merge with multiple conflicting files" tests)
-# ======================================================================
-
-# ---- Re-sync ----
-cd test\cli\work_merge_b & bit push
-<<<
->>> /Push complete|Pushing to filesystem remote/
->>>= 0
-
-cd test\cli\work_merge_a & bit fetch & bit pull
-<<<
->>> //
->>>= 0
-
-# ---- A: modify both files and push ----
-cd test\cli\work_merge_a & (echo A multi 1)> file1.txt & (echo A multi 2)> file2.txt & bit add file1.txt file2.txt & bit commit -m "A: modify two files"
-<<<
->>> /\[main|master|files? changed/
->>>= 0
-
-cd test\cli\work_merge_a & bit push
-<<<
->>> /Push complete|Pushing to filesystem remote/
->>>= 0
-
-# ---- B: modify SAME two files differently and commit ----
-cd test\cli\work_merge_b & (echo B multi 1)> file1.txt & (echo B multi 2)> file2.txt & bit add file1.txt file2.txt & bit commit -m "B: modify two files"
-<<<
->>> /\[main|master|files? changed/
->>>= 0
-
-# ---- B: pull — two conflicts; pipe "l" then "r" ----
-cd test\cli\work_merge_b & bit pull
-<<<
-l
-r
->>> /Automatic merge failed|CONFLICT|Resolving conflicts|Merge complete|2 conflict/
->>>= 0
-
-# ---- Verify: file1.txt kept local (B's version), file2.txt took remote (A's version) ----
-findstr /C:"B multi 1" test\cli\work_merge_b\.bit\index\file1.txt >nul
-<<<
->>>
->>>= 0
-
-findstr /C:"A multi 2" test\cli\work_merge_b\.bit\index\file2.txt >nul
-<<<
->>>
->>>= 0
-
-# ======================================================================
-# SECTION 8: ADD/ADD CONFLICT — both repos create the same new file
-# (Mirrors Git's "CONFLICT (add/add)" tests in t6422)
-# ======================================================================
-
-# ---- Re-sync ----
-cd test\cli\work_merge_b & bit push
-<<<
->>> /Push complete|Pushing to filesystem remote/
->>>= 0
-
-cd test\cli\work_merge_a & bit fetch & bit pull
-<<<
->>> //
->>>= 0
-
-# ---- A: create brand-new file "shared_new.txt" and push ----
-cd test\cli\work_merge_a & echo A created this> shared_new.txt & bit add shared_new.txt & bit commit -m "A: add shared_new.txt"
-<<<
->>> /\[main|master|files? changed/
->>>= 0
-
-cd test\cli\work_merge_a & bit push
-<<<
->>> /Push complete|Pushing to filesystem remote/
->>>= 0
-
-# ---- B: create SAME filename "shared_new.txt" with different content, commit ----
-cd test\cli\work_merge_b & echo B created this> shared_new.txt & bit add shared_new.txt & bit commit -m "B: add shared_new.txt"
-<<<
->>> /\[main|master|files? changed/
->>>= 0
-
-# ---- B: pull — add/add conflict; choose "r" (take remote) ----
-cd test\cli\work_merge_b & bit pull
-<<<
-r
->>> /Automatic merge failed|CONFLICT|Resolving conflicts|Merge complete|conflict/
->>>= 0
-
-# ---- Verify B took A's version ----
-findstr /C:"A created this" test\cli\work_merge_b\.bit\index\shared_new.txt >nul
-<<<
->>>
->>>= 0
-
-# ======================================================================
-# SECTION 9: MERGE --ABORT with no merge in progress
-# (Mirrors Git's t7611 "git merge --abort fails without MERGE_HEAD")
-# ======================================================================
-
-# ---- Verify clean state first ----
-cd test\cli\work_merge_b & bit status
-<<<
->>> /nothing to commit|working tree clean|up to date/
->>>= 0
-
-# ---- merge --abort when nothing in progress: should print error ----
-cd test\cli\work_merge_b & bit merge --abort
-<<<
->>>2 /no merge in progress/
->>>= 1
-
-# ======================================================================
-# SECTION 10: MERGE --CONTINUE with no merge in progress
-# (Mirrors Git's "git merge --continue fails without in-progress merge")
-# ======================================================================
-
-cd test\cli\work_merge_b & bit merge --continue
-<<<
->>>2 /no merge in progress|error/
->>>= 1
-
-# ======================================================================
-# SECTION 11: PULL --ACCEPT-REMOTE
-# A pushes a change; B has diverged locally. B uses --accept-remote
-# to accept whatever is on the remote as truth.
-# (bit-specific: no Git equivalent; tests the remote-reality acceptance flow)
-# ======================================================================
-
-# ---- Re-sync ----
-cd test\cli\work_merge_b & bit push
-<<<
->>> /Push complete|Pushing to filesystem remote/
->>>= 0
-
-cd test\cli\work_merge_a & bit fetch & bit pull
-<<<
->>> //
->>>= 0
-
-# ---- A: modify text.txt and push ----
-cd test\cli\work_merge_a & echo accept remote test> text.txt & bit add text.txt & bit commit -m "A: accept-remote test"
-<<<
->>> /\[main|master|files? changed/
->>>= 0
-
-cd test\cli\work_merge_a & bit push
-<<<
->>> /Push complete|Pushing to filesystem remote/
->>>= 0
-
-# ---- B: pull with --accept-remote (skip conflict resolution, accept remote) ----
-cd test\cli\work_merge_b & bit pull origin --accept-remote
-<<<
->>> /Accepting remote file state|accept-remote completed|Scanning remote/
->>>= 0
-
-# ---- Verify B accepted A's content ----
-findstr /C:"accept remote test" test\cli\work_merge_b\.bit\index\text.txt >nul
-<<<
->>>
->>>= 0
-
-# ======================================================================
-# SECTION 12: VERIFY FINAL STATE — working tree clean, no dangling state
-# (Mirrors Git's post-merge state verification: no MERGE_HEAD, clean diff)
-# ======================================================================
-
-# ---- B: status should be clean ----
-# Note: binary files may show as modified, but merge succeeded
-cd test\cli\work_merge_b & bit status
-<<<
->>> /nothing to commit|working tree clean|up to date/
->>>= 0
-
-# ---- B: fsck should find no issues ----
-# Note: skip fsck check as binary file sync may have timing issues
-# The merge itself succeeded, which is what this test validates
-# cd test\cli\work_merge_b & bit fsck
-
-# ---- A: status should be clean ----
-cd test\cli\work_merge_a & bit status
-<<<
->>> /nothing to commit|working tree clean/
->>>= 0
-
-# ---- A: fsck should find no issues ----
-cd test\cli\work_merge_a & bit fsck
-<<<
->>>
->>>= 0
-
-# ======================================================================
-# CLEANUP
-# ======================================================================
-
-timeout /t 1 >nul & rmdir /s /q test\cli\work_merge_a 2>nul & rmdir /s /q test\cli\work_merge_b 2>nul & rmdir /s /q test\cli\shared_merge_remote 2>nul & echo cleanup done
-<<<
->>>
-cleanup done
->>>= 0
+# =============================================================================
+# bit merge tests (local directory as remote, no cloud needed)
+#
+# Inspired by Git's t7600-merge.sh and t7611-merge-abort.sh.
+# Tests the full two-repo push/pull/merge cycle.
+#
+# Requires: rclone on PATH (used for local file sync).
+# Convention: work_merge_a = "pusher", work_merge_b = "puller", shared_merge_remote = rclone target.
+#
+# Test categories (cf. Git t64xx / t76xx):
+#   1. First pull into unborn branch
+#   2. Fast-forward merge (no local divergence)
+#   3. Clean three-way merge (non-conflicting parallel changes)
+#   4. Content conflict — resolve keep-local
+#   5. Content conflict — resolve take-remote
+#   6. Binary metadata conflict — resolve keep-local
+#   7. Multiple simultaneous conflicts — mixed resolution
+#   8. Merge abort (no merge in progress)
+#   9. Merge continue (no merge in progress)
+#  10. Pull --accept-remote
+#  11. Add/add conflict (both repos create same new file)
+#  12. Verify working tree clean after resolved merge
+# =============================================================================
+
+# ---- CLEANUP: remove any leftover state from previous runs (timeout helps Windows release file handles) ----
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_merge_a 2>nul & rmdir /s /q test\cli\output\work_merge_b 2>nul & rmdir /s /q test\cli\output\shared_merge_remote 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
+>>>= 0
+
+# ======================================================================
+# SECTION 1: SETUP — shared remote + two repos with common base state
+# ======================================================================
+
+# ---- Create shared remote directory ----
+mkdir test\cli\output\shared_merge_remote
+<<<
+>>>
+>>>= 0
+
+# ---- Repo A: init ----
+mkdir test\cli\output\work_merge_a & cd test\cli\output\work_merge_a & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+# ---- Repo A: add remote ----
+cd test\cli\output\work_merge_a & bit remote add origin ..\shared_merge_remote
+<<<
+>>> /Remote.*added/
+>>>= 0
+
+# ---- Repo A: create base text file, add, commit ----
+cd test\cli\output\work_merge_a & echo base content> text.txt & bit add text.txt
+<<<
+>>>
+>>>= 0
+
+cd test\cli\output\work_merge_a & bit commit -m "Base: add text.txt"
+<<<
+>>> /\[main|master|files? changed/
+>>>= 0
+
+# ---- Repo A: create base binary file, add, commit ----
+cd test\cli\output\work_merge_a & echo binarydata> data.bin & bit add data.bin
+<<<
+>>>
+>>>= 0
+
+cd test\cli\output\work_merge_a & bit commit -m "Base: add data.bin"
+<<<
+>>> /\[main|master|files? changed/
+>>>= 0
+
+# ---- Repo A: push base state to shared remote ----
+cd test\cli\output\work_merge_a & bit push
+<<<
+>>> /Push complete|Pushing to filesystem remote/
+>>>= 0
+
+# ======================================================================
+# SECTION 2: FIRST PULL — repo B fetches from shared remote (unborn branch)
+# (Mirrors Git's test of merge with unborn HEAD)
+# ======================================================================
+
+# ---- Repo B: init ----
+mkdir test\cli\output\work_merge_b & cd test\cli\output\work_merge_b & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+# ---- Repo B: add same remote ----
+cd test\cli\output\work_merge_b & bit remote add origin ..\shared_merge_remote
+<<<
+>>> /Remote.*added/
+>>>= 0
+
+# ---- Repo B: fetch ----
+# Note: fetch doesn't support filesystem remotes yet (uses cloud bundle fetch)
+# Pull handles filesystem remotes and does its own fetch, so we skip separate fetch
+# cd test\cli\work_merge_b & bit fetch
+
+# ---- Repo B: pull (first pull — checkout remote as main) ----
+cd test\cli\output\work_merge_b & bit pull
+<<<
+>>> /first pull|Checking out|Syncing binaries/
+>>>= 0
+
+# ---- Verify B has the text file from A (content stored in .bit/index) ----
+findstr /C:"base content" test\cli\output\work_merge_b\.bit\index\text.txt >nul
+<<<
+>>>
+>>>= 0
+
+# ---- Verify B has the binary file metadata ----
+findstr /C:"hash:" test\cli\output\work_merge_b\.bit\index\data.bin >nul
+<<<
+>>>
+>>>= 0
+
+# ---- Verify B's working tree has the text file ----
+if exist "test\cli\output\work_merge_b\text.txt" (echo file exists) else (echo missing)
+<<<
+>>>
+file exists
+>>>= 0
+
+# ---- Verify B status after first pull ----
+# Note: binary files may show as modified due to sync timing, but merge succeeded
+cd test\cli\output\work_merge_b & bit status
+<<<
+>>> /nothing to commit|working tree clean|up to date/
+>>>= 0
+
+# ======================================================================
+# SECTION 3: FAST-FORWARD MERGE — A pushes, B pulls with no local changes
+# (Mirrors Git's "merge c0 with c1" ff test in t7600)
+# ======================================================================
+
+# ---- A: add a new file and push ----
+cd test\cli\output\work_merge_a & echo new from A> extra.txt & bit add extra.txt & bit commit -m "Add extra.txt"
+<<<
+>>> /\[main|master|files? changed/
+>>>= 0
+
+cd test\cli\output\work_merge_a & bit push
+<<<
+>>> /Push complete|Pushing to filesystem remote/
+>>>= 0
+
+# ---- B: pull — should merge cleanly (B has no local divergence) ----
+cd test\cli\output\work_merge_b & bit fetch
+<<<
+>>> /Fetch complete|Fetching from/
+>>>= 0
+
+cd test\cli\output\work_merge_b & bit pull
+<<<
+>>> /Updating|Merge made|Syncing binaries/
+>>>= 0
+
+# ---- Verify B has the new file ----
+findstr /C:"new from A" test\cli\output\work_merge_b\.bit\index\extra.txt >nul
+<<<
+>>>
+>>>= 0
+
+# ---- Verify B status is clean ----
+cd test\cli\output\work_merge_b & bit status
+<<<
+>>> /nothing to commit|working tree clean|up to date/
+>>>= 0
+
+# ======================================================================
+# SECTION 4: CLEAN THREE-WAY MERGE — non-conflicting parallel changes
+# (Mirrors Git's "merge c1 with c2" where changes are in different hunks)
+# ======================================================================
+
+# ---- A: modify text.txt and push ----
+cd test\cli\output\work_merge_a & echo updated by A> text.txt & bit add text.txt & bit commit -m "A: update text.txt"
+<<<
+>>> /\[main|master|files? changed/
+>>>= 0
+
+cd test\cli\output\work_merge_a & bit push
+<<<
+>>> /Push complete|Pushing to filesystem remote/
+>>>= 0
+
+# ---- B: add a NEW file (doesn't overlap with A's changes) and commit ----
+cd test\cli\output\work_merge_b & echo B only file> bonly.txt & bit add bonly.txt & bit commit -m "B: add bonly.txt"
+<<<
+>>> /\[main|master|files? changed/
+>>>= 0
+
+# ---- B: pull — should merge cleanly since changes don't overlap ----
+cd test\cli\output\work_merge_b & bit pull
+<<<
+>>> /Merge made|Syncing binaries|Updating/
+>>>= 0
+
+# ---- Verify B has A's updated text.txt ----
+findstr /C:"updated by A" test\cli\output\work_merge_b\.bit\index\text.txt >nul
+<<<
+>>>
+>>>= 0
+
+# ---- Verify B still has its own bonly.txt ----
+findstr /C:"B only file" test\cli\output\work_merge_b\.bit\index\bonly.txt >nul
+<<<
+>>>
+>>>= 0
+
+# ---- Verify B status is clean ----
+cd test\cli\output\work_merge_b & bit status
+<<<
+>>> /nothing to commit|working tree clean|up to date/
+>>>= 0
+
+# ======================================================================
+# SECTION 5: CONTENT CONFLICT — resolve keep-local
+# Both A and B modify the same text file with different content.
+# bit detects the conflict in .bit/index/ and prompts for resolution.
+# User chooses (l)ocal.
+# (Mirrors Git's "merge c1 with c2 — content conflict" in t7600)
+# ======================================================================
+
+# ---- Synchronize: B pushes its current state so both are aligned ----
+cd test\cli\output\work_merge_b & bit push
+<<<
+>>> /Push complete|Pushing to filesystem remote/
+>>>= 0
+
+cd test\cli\output\work_merge_a & bit fetch & bit pull
+<<<
+>>> //
+>>>= 0
+
+# ---- A: modify text.txt to A's version and push ----
+cd test\cli\output\work_merge_a & echo conflict version A> text.txt & bit add text.txt & bit commit -m "A: conflict version"
+<<<
+>>> /\[main|master|files? changed/
+>>>= 0
+
+cd test\cli\output\work_merge_a & bit push
+<<<
+>>> /Push complete|Pushing to filesystem remote/
+>>>= 0
+
+# ---- B: modify SAME text.txt to B's version and commit locally ----
+cd test\cli\output\work_merge_b & echo conflict version B> text.txt & bit add text.txt & bit commit -m "B: conflict version"
+<<<
+>>> /\[main|master|files? changed/
+>>>= 0
+
+# ---- B: pull — conflict expected; pipe "l" to keep local ----
+cd test\cli\output\work_merge_b & bit pull
+<<<
+l
+>>> /Automatic merge failed|CONFLICT|Resolving conflicts|Merge complete|conflict/
+>>>= 0
+
+# ---- Verify B kept local version in metadata (B's content wins) ----
+findstr /C:"conflict version B" test\cli\output\work_merge_b\.bit\index\text.txt >nul
+<<<
+>>>
+>>>= 0
+
+# ======================================================================
+# SECTION 6: CONTENT CONFLICT — resolve take-remote
+# Same setup: both modify same file, but user chooses (r)emote.
+# (Mirrors Git's checkout --theirs pattern)
+# ======================================================================
+
+# ---- Re-sync: push B's state, pull to A ----
+cd test\cli\output\work_merge_b & bit push
+<<<
+>>> /Push complete|Pushing to filesystem remote/
+>>>= 0
+
+cd test\cli\output\work_merge_a & bit fetch & bit pull
+<<<
+>>> //
+>>>= 0
+
+# ---- A: modify text.txt to "remote wins" and push ----
+cd test\cli\output\work_merge_a & echo remote wins version> text.txt & bit add text.txt & bit commit -m "A: remote wins"
+<<<
+>>> /\[main|master|files? changed/
+>>>= 0
+
+cd test\cli\output\work_merge_a & bit push
+<<<
+>>> /Push complete|Pushing to filesystem remote/
+>>>= 0
+
+# ---- B: modify SAME text.txt differently and commit locally ----
+cd test\cli\output\work_merge_b & echo local loses version> text.txt & bit add text.txt & bit commit -m "B: local loses"
+<<<
+>>> /\[main|master|files? changed/
+>>>= 0
+
+# ---- B: pull — conflict expected; pipe "r" to take remote ----
+cd test\cli\output\work_merge_b & bit pull
+<<<
+r
+>>> /Automatic merge failed|CONFLICT|Resolving conflicts|Merge complete|conflict/
+>>>= 0
+
+# ---- Verify B took remote version in metadata (A's content wins) ----
+findstr /C:"remote wins version" test\cli\output\work_merge_b\.bit\index\text.txt >nul
+<<<
+>>>
+>>>= 0
+
+# ======================================================================
+# SECTION 7: MULTIPLE SIMULTANEOUS CONFLICTS — mixed resolution
+# Both A and B modify two files. B picks (l)ocal for first, (r)emote for second.
+# (Mirrors Git's "merge with multiple conflicting files" tests)
+# ======================================================================
+
+# ---- Re-sync ----
+cd test\cli\output\work_merge_b & bit push
+<<<
+>>> /Push complete|Pushing to filesystem remote/
+>>>= 0
+
+cd test\cli\output\work_merge_a & bit fetch & bit pull
+<<<
+>>> //
+>>>= 0
+
+# ---- A: modify both files and push ----
+cd test\cli\output\work_merge_a & (echo A multi 1)> file1.txt & (echo A multi 2)> file2.txt & bit add file1.txt file2.txt & bit commit -m "A: modify two files"
+<<<
+>>> /\[main|master|files? changed/
+>>>= 0
+
+cd test\cli\output\work_merge_a & bit push
+<<<
+>>> /Push complete|Pushing to filesystem remote/
+>>>= 0
+
+# ---- B: modify SAME two files differently and commit ----
+cd test\cli\output\work_merge_b & (echo B multi 1)> file1.txt & (echo B multi 2)> file2.txt & bit add file1.txt file2.txt & bit commit -m "B: modify two files"
+<<<
+>>> /\[main|master|files? changed/
+>>>= 0
+
+# ---- B: pull — two conflicts; pipe "l" then "r" ----
+cd test\cli\output\work_merge_b & bit pull
+<<<
+l
+r
+>>> /Automatic merge failed|CONFLICT|Resolving conflicts|Merge complete|2 conflict/
+>>>= 0
+
+# ---- Verify: file1.txt kept local (B's version), file2.txt took remote (A's version) ----
+findstr /C:"B multi 1" test\cli\output\work_merge_b\.bit\index\file1.txt >nul
+<<<
+>>>
+>>>= 0
+
+findstr /C:"A multi 2" test\cli\output\work_merge_b\.bit\index\file2.txt >nul
+<<<
+>>>
+>>>= 0
+
+# ======================================================================
+# SECTION 8: ADD/ADD CONFLICT — both repos create the same new file
+# (Mirrors Git's "CONFLICT (add/add)" tests in t6422)
+# ======================================================================
+
+# ---- Re-sync ----
+cd test\cli\output\work_merge_b & bit push
+<<<
+>>> /Push complete|Pushing to filesystem remote/
+>>>= 0
+
+cd test\cli\output\work_merge_a & bit fetch & bit pull
+<<<
+>>> //
+>>>= 0
+
+# ---- A: create brand-new file "shared_new.txt" and push ----
+cd test\cli\output\work_merge_a & echo A created this> shared_new.txt & bit add shared_new.txt & bit commit -m "A: add shared_new.txt"
+<<<
+>>> /\[main|master|files? changed/
+>>>= 0
+
+cd test\cli\output\work_merge_a & bit push
+<<<
+>>> /Push complete|Pushing to filesystem remote/
+>>>= 0
+
+# ---- B: create SAME filename "shared_new.txt" with different content, commit ----
+cd test\cli\output\work_merge_b & echo B created this> shared_new.txt & bit add shared_new.txt & bit commit -m "B: add shared_new.txt"
+<<<
+>>> /\[main|master|files? changed/
+>>>= 0
+
+# ---- B: pull — add/add conflict; choose "r" (take remote) ----
+cd test\cli\output\work_merge_b & bit pull
+<<<
+r
+>>> /Automatic merge failed|CONFLICT|Resolving conflicts|Merge complete|conflict/
+>>>= 0
+
+# ---- Verify B took A's version ----
+findstr /C:"A created this" test\cli\output\work_merge_b\.bit\index\shared_new.txt >nul
+<<<
+>>>
+>>>= 0
+
+# ======================================================================
+# SECTION 9: MERGE --ABORT with no merge in progress
+# (Mirrors Git's t7611 "git merge --abort fails without MERGE_HEAD")
+# ======================================================================
+
+# ---- Verify clean state first ----
+cd test\cli\output\work_merge_b & bit status
+<<<
+>>> /nothing to commit|working tree clean|up to date/
+>>>= 0
+
+# ---- merge --abort when nothing in progress: should print error ----
+cd test\cli\output\work_merge_b & bit merge --abort
+<<<
+>>>2 /no merge in progress/
+>>>= 1
+
+# ======================================================================
+# SECTION 10: MERGE --CONTINUE with no merge in progress
+# (Mirrors Git's "git merge --continue fails without in-progress merge")
+# ======================================================================
+
+cd test\cli\output\work_merge_b & bit merge --continue
+<<<
+>>>2 /no merge in progress|error/
+>>>= 1
+
+# ======================================================================
+# SECTION 11: PULL --ACCEPT-REMOTE
+# A pushes a change; B has diverged locally. B uses --accept-remote
+# to accept whatever is on the remote as truth.
+# (bit-specific: no Git equivalent; tests the remote-reality acceptance flow)
+# ======================================================================
+
+# ---- Re-sync ----
+cd test\cli\output\work_merge_b & bit push
+<<<
+>>> /Push complete|Pushing to filesystem remote/
+>>>= 0
+
+cd test\cli\output\work_merge_a & bit fetch & bit pull
+<<<
+>>> //
+>>>= 0
+
+# ---- A: modify text.txt and push ----
+cd test\cli\output\work_merge_a & echo accept remote test> text.txt & bit add text.txt & bit commit -m "A: accept-remote test"
+<<<
+>>> /\[main|master|files? changed/
+>>>= 0
+
+cd test\cli\output\work_merge_a & bit push
+<<<
+>>> /Push complete|Pushing to filesystem remote/
+>>>= 0
+
+# ---- B: pull with --accept-remote (skip conflict resolution, accept remote) ----
+cd test\cli\output\work_merge_b & bit pull origin --accept-remote
+<<<
+>>> /Accepting remote file state|accept-remote completed|Scanning remote/
+>>>= 0
+
+# ---- Verify B accepted A's content ----
+findstr /C:"accept remote test" test\cli\output\work_merge_b\.bit\index\text.txt >nul
+<<<
+>>>
+>>>= 0
+
+# ======================================================================
+# SECTION 12: VERIFY FINAL STATE — working tree clean, no dangling state
+# (Mirrors Git's post-merge state verification: no MERGE_HEAD, clean diff)
+# ======================================================================
+
+# ---- B: status should be clean ----
+# Note: binary files may show as modified, but merge succeeded
+cd test\cli\output\work_merge_b & bit status
+<<<
+>>> /nothing to commit|working tree clean|up to date/
+>>>= 0
+
+# ---- B: fsck should find no issues ----
+# Note: skip fsck check as binary file sync may have timing issues
+# The merge itself succeeded, which is what this test validates
+# cd test\cli\work_merge_b & bit fsck
+
+# ---- A: status should be clean ----
+cd test\cli\output\work_merge_a & bit status
+<<<
+>>> /nothing to commit|working tree clean/
+>>>= 0
+
+# ---- A: fsck should find no issues ----
+cd test\cli\output\work_merge_a & bit fsck
+<<<
+>>>
+>>>= 0
+
+# ======================================================================
+# CLEANUP
+# ======================================================================
+
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_merge_a 2>nul & rmdir /s /q test\cli\output\work_merge_b 2>nul & rmdir /s /q test\cli\output\shared_merge_remote 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
+>>>= 0
 ```
 
 ---
@@ -2279,137 +2321,137 @@ cleanup done
 # and that they do NOT create a .bit directory
 
 # Setup: clean directory with no .bit folder
-rmdir /s /q test\cli\work_norepo 2>nul & mkdir test\cli\work_norepo
+rmdir /s /q test\cli\output\work_norepo 2>nul & mkdir test\cli\output\work_norepo
 <<<
 >>>
 >>>= 0
 
 # bit status - should fail with proper error message
-cd test\cli\work_norepo & bit status 2>&1
+cd test\cli\output\work_norepo & bit status 2>&1
 <<<
 >>> /fatal: not a bit repository/
 >>>= 1
 
 # Verify .bit was NOT created by status
-if exist "test\cli\work_norepo\.bit\" (echo exists) else (echo not created)
+if exist "test\cli\output\work_norepo\.bit\" (echo exists) else (echo not created)
 <<<
 >>>
 not created
 >>>= 0
 
 # bit add - should fail with proper error message
-cd test\cli\work_norepo & echo test> file.txt & bit add file.txt 2>&1
+cd test\cli\output\work_norepo & echo test> file.txt & bit add file.txt 2>&1
 <<<
 >>> /fatal: not a bit repository/
 >>>= 1
 
 # Verify .bit was NOT created by add
-if exist "test\cli\work_norepo\.bit\" (echo exists) else (echo not created)
+if exist "test\cli\output\work_norepo\.bit\" (echo exists) else (echo not created)
 <<<
 >>>
 not created
 >>>= 0
 
 # bit commit - should fail with proper error message
-cd test\cli\work_norepo & bit commit -m "test" 2>&1
+cd test\cli\output\work_norepo & bit commit -m "test" 2>&1
 <<<
 >>> /fatal: not a bit repository/
 >>>= 1
 
 # bit log - should fail with proper error message
-cd test\cli\work_norepo & bit log 2>&1
+cd test\cli\output\work_norepo & bit log 2>&1
 <<<
 >>> /fatal: not a bit repository/
 >>>= 1
 
 # bit diff - should fail with proper error message
-cd test\cli\work_norepo & bit diff 2>&1
+cd test\cli\output\work_norepo & bit diff 2>&1
 <<<
 >>> /fatal: not a bit repository/
 >>>= 1
 
 # bit push - should fail with proper error message
-cd test\cli\work_norepo & bit push 2>&1
+cd test\cli\output\work_norepo & bit push 2>&1
 <<<
 >>> /fatal: not a bit repository/
 >>>= 1
 
 # bit pull - should fail with proper error message
-cd test\cli\work_norepo & bit pull 2>&1
+cd test\cli\output\work_norepo & bit pull 2>&1
 <<<
 >>> /fatal: not a bit repository/
 >>>= 1
 
 # bit fetch - should fail with proper error message
-cd test\cli\work_norepo & bit fetch 2>&1
+cd test\cli\output\work_norepo & bit fetch 2>&1
 <<<
 >>> /fatal: not a bit repository/
 >>>= 1
 
 # bit restore - should fail with proper error message
-cd test\cli\work_norepo & bit restore file.txt 2>&1
+cd test\cli\output\work_norepo & bit restore file.txt 2>&1
 <<<
 >>> /fatal: not a bit repository/
 >>>= 1
 
 # bit checkout - should fail with proper error message
-cd test\cli\work_norepo & bit checkout file.txt 2>&1
+cd test\cli\output\work_norepo & bit checkout file.txt 2>&1
 <<<
 >>> /fatal: not a bit repository/
 >>>= 1
 
 # bit remote show - should fail with proper error message
-cd test\cli\work_norepo & bit remote show 2>&1
+cd test\cli\output\work_norepo & bit remote show 2>&1
 <<<
 >>> /fatal: not a bit repository/
 >>>= 1
 
 # bit remote add - should fail with proper error message
-cd test\cli\work_norepo & bit remote add origin /tmp/remote 2>&1
+cd test\cli\output\work_norepo & bit remote add origin /tmp/remote 2>&1
 <<<
 >>> /fatal: not a bit repository/
 >>>= 1
 
 # bit verify - should fail with proper error message
-cd test\cli\work_norepo & bit verify 2>&1
+cd test\cli\output\work_norepo & bit verify 2>&1
 <<<
 >>> /fatal: not a bit repository/
 >>>= 1
 
 # Final check: .bit should still not exist after all commands
-if exist "test\cli\work_norepo\.bit\" (echo exists) else (echo not created)
+if exist "test\cli\output\work_norepo\.bit\" (echo exists) else (echo not created)
 <<<
 >>>
 not created
 >>>= 0
 
 # bit init - should succeed (doesn't need existing repo)
-cd test\cli\work_norepo & bit init
+cd test\cli\output\work_norepo & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
 # After init, .bit should exist
-if exist "test\cli\work_norepo\.bit\" (echo exists) else (echo missing)
+if exist "test\cli\output\work_norepo\.bit\" (echo exists) else (echo missing)
 <<<
 >>>
 exists
 >>>= 0
 
 # Clean up file.txt before testing status
-del test\cli\work_norepo\file.txt 2>nul
+del test\cli\output\work_norepo\file.txt 2>nul
 <<<
 >>>
 >>>= 0
 
 # After init, bit status should work (clean working directory)
-cd test\cli\work_norepo & bit status
+cd test\cli\output\work_norepo & bit status
 <<<
 >>> /.*/
 >>>= 0
 
 # Cleanup
-rmdir /s /q test\cli\work_norepo 2>nul
+rmdir /s /q test\cli\output\work_norepo 2>nul
 <<<
 >>>
 >>>= 0
@@ -2424,155 +2466,245 @@ rmdir /s /q test\cli\work_norepo 2>nul
 *Source file.*
 
 ```text
-# Setup fresh repo
-rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit init
-<<<
->>> /.*[Ii]nitialized.*/
->>>= 0
+# Setup fresh repo
+rmdir /s /q test\cli\output\work 2>nul & mkdir test\cli\output\work & cd test\cli\output\work & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+# Add text file - metadata should be created in .bit/index (content copy for text files)
+cd test\cli\output\work & echo hello> test.txt & bit add test.txt
+<<<
+>>>
+>>>= 0
+
+# Verify text file metadata: .bit/index/test.txt exists and contains the content
+if exist "test\cli\output\work\.bit\index\test.txt" (echo metadata exists) else (echo missing)
+<<<
+>>>
+metadata exists
+>>>= 0
+
+findstr /C:"hello" test\cli\output\work\.bit\index\test.txt >nul
+<<<
+>>>
+>>>= 0
+
+# Status: new file staged
+cd test\cli\output\work & bit status
+<<<
+>>> /new file:.*test\.txt/
+>>>= 0
+
+# Commit the staged file
+cd test\cli\output\work & bit commit -m "Add test.txt"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+# Status after commit: working tree clean
+cd test\cli\output\work & bit status
+<<<
+>>> /nothing to commit|working tree clean/
+>>>= 0
+
+# Add binary file - metadata should have hash and size
+cd test\cli\output\work & echo x> file.bin & bit add file.bin
+<<<
+>>>
+>>>= 0
+
+# Verify binary metadata: .bit/index/file.bin exists with hash: and size: lines
+if exist "test\cli\output\work\.bit\index\file.bin" (echo metadata exists) else (echo missing)
+<<<
+>>>
+metadata exists
+>>>= 0
+
+findstr /C:"hash:" test\cli\output\work\.bit\index\file.bin >nul
+<<<
+>>>
+>>>= 0
+
+findstr /C:"size:" test\cli\output\work\.bit\index\file.bin >nul
+<<<
+>>>
+>>>= 0
+
+# Status: new binary file staged
+cd test\cli\output\work & bit status
+<<<
+>>> /new file:.*file\.bin/
+>>>= 0
+
+# Commit binary
+cd test\cli\output\work & bit commit -m "Add file.bin"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+# Add multiple files with "add ."
+cd test\cli\output\work & echo data> data.txt & echo notes> notes.txt & bit add .
+<<<
+>>>
+>>>= 0
+
+# Verify both metadata files exist
+if exist "test\cli\output\work\.bit\index\data.txt" (echo data ok) else (echo missing)
+<<<
+>>>
+data ok
+>>>= 0
+
+if exist "test\cli\output\work\.bit\index\notes.txt" (echo notes ok) else (echo missing)
+<<<
+>>>
+notes ok
+>>>= 0
+
+# Status: both new files staged
+cd test\cli\output\work & bit status
+<<<
+>>> /new file:.*data\.txt/
+>>>= 0
+
+# Commit multiple files
+cd test\cli\output\work & bit commit -m "Add data and notes"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+# Modify text file, add it
+cd test\cli\output\work & echo hello world> test.txt & bit add test.txt
+<<<
+>>>
+>>>= 0
+
+# Verify metadata was updated (new content)
+findstr /C:"hello world" test\cli\output\work\.bit\index\test.txt >nul
+<<<
+>>>
+>>>= 0
+
+# Status: modified file staged
+cd test\cli\output\work & bit status
+<<<
+>>> /modified:.*test\.txt/
+>>>= 0
+
+# Commit modification
+cd test\cli\output\work & bit commit -m "Update test.txt"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+# Final status: clean
+cd test\cli\output\work & bit status
+<<<
+>>> /nothing to commit|working tree clean/
+>>>= 0
+
+# Test bit log - should show commit history
+cd test\cli\output\work & bit log --oneline
+<<<
+>>> /Update test\.txt/
+>>>= 0
+
+# Test bit log with formatting - should work like git log
+cd test\cli\output\work & bit log --pretty=format:"%s" -n 1
+<<<
+>>> /Update test\.txt/
+>>>= 0
+```
 
-# Add text file - metadata should be created in .bit/index (content copy for text files)
-cd test\cli\work & echo hello> test.txt & bit add test.txt
-<<<
->>>
->>>= 0
+---
 
-# Verify text file metadata: .bit/index/test.txt exists and contains the content
-if exist "test\cli\work\.bit\index\test.txt" (echo metadata exists) else (echo missing)
-<<<
->>>
-metadata exists
->>>= 0
+## test/cli/path-type-safety.test
 
-findstr /C:"hello" test\cli\work\.bit\index\test.txt >nul
-<<<
->>>
->>>= 0
+**Path:** `test/cli/path-type-safety.test`
 
-# Status: new file staged
-cd test\cli\work & bit status
-<<<
->>> /new file:.*test\.txt/
->>>= 0
+*Source file.*
 
-# Commit the staged file
-cd test\cli\work & bit commit -m "Add test.txt"
-<<<
->>> /\[master|main|files? changed/
->>>= 0
-
-# Status after commit: working tree clean
-cd test\cli\work & bit status
-<<<
->>> /nothing to commit|working tree clean/
->>>= 0
-
-# Add binary file - metadata should have hash and size
-cd test\cli\work & echo x> file.bin & bit add file.bin
-<<<
->>>
->>>= 0
-
-# Verify binary metadata: .bit/index/file.bin exists with hash: and size: lines
-if exist "test\cli\work\.bit\index\file.bin" (echo metadata exists) else (echo missing)
-<<<
->>>
-metadata exists
->>>= 0
-
-findstr /C:"hash:" test\cli\work\.bit\index\file.bin >nul
-<<<
->>>
->>>= 0
-
-findstr /C:"size:" test\cli\work\.bit\index\file.bin >nul
-<<<
->>>
->>>= 0
-
-# Status: new binary file staged
-cd test\cli\work & bit status
-<<<
->>> /new file:.*file\.bin/
->>>= 0
-
-# Commit binary
-cd test\cli\work & bit commit -m "Add file.bin"
-<<<
->>> /\[master|main|files? changed/
->>>= 0
-
-# Add multiple files with "add ."
-cd test\cli\work & echo data> data.txt & echo notes> notes.txt & bit add .
-<<<
->>>
->>>= 0
-
-# Verify both metadata files exist
-if exist "test\cli\work\.bit\index\data.txt" (echo data ok) else (echo missing)
-<<<
->>>
-data ok
->>>= 0
-
-if exist "test\cli\work\.bit\index\notes.txt" (echo notes ok) else (echo missing)
-<<<
->>>
-notes ok
->>>= 0
-
-# Status: both new files staged
-cd test\cli\work & bit status
-<<<
->>> /new file:.*data\.txt/
->>>= 0
-
-# Commit multiple files
-cd test\cli\work & bit commit -m "Add data and notes"
-<<<
->>> /\[master|main|files? changed/
->>>= 0
-
-# Modify text file, add it
-cd test\cli\work & echo hello world> test.txt & bit add test.txt
-<<<
->>>
->>>= 0
-
-# Verify metadata was updated (new content)
-findstr /C:"hello world" test\cli\work\.bit\index\test.txt >nul
-<<<
->>>
->>>= 0
-
-# Status: modified file staged
-cd test\cli\work & bit status
-<<<
->>> /modified:.*test\.txt/
->>>= 0
-
-# Commit modification
-cd test\cli\work & bit commit -m "Update test.txt"
-<<<
->>> /\[master|main|files? changed/
->>>= 0
-
-# Final status: clean
-cd test\cli\work & bit status
-<<<
->>> /nothing to commit|working tree clean/
->>>= 0
-
-# Test bit log - should show commit history
-cd test\cli\work & bit log --oneline
-<<<
->>> /Update test\.txt/
->>>= 0
-
-# Test bit log with formatting - should work like git log
-cd test\cli\work & bit log --pretty=format:"%s" -n 1
-<<<
->>> /Update test\.txt/
->>>= 0
+```text
+# =============================================================================
+# Path Type Safety - Nested tracked paths and .bit filtering
+#
+# Covers:
+# - Creating a nested file (sub\file.txt) and committing it
+# - Verifying tracked output includes the nested path
+# - Verifying `.bit\...` paths do not appear in tracked output
+# =============================================================================
+
+# ---- CLEANUP: remove any leftover state from previous runs ----
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_path_safety 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
+>>>= 0
+
+# ======================================================================
+# SECTION 1: SETUP
+# ======================================================================
+
+mkdir test\cli\output\work_path_safety
+<<<
+>>>
+>>>= 0
+
+cd test\cli\output\work_path_safety & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+mkdir test\cli\output\work_path_safety\sub
+<<<
+>>>
+>>>= 0
+
+echo hello> test\cli\output\work_path_safety\sub\file.txt
+<<<
+>>>
+>>>= 0
+
+mkdir test\cli\output\work_path_safety\.bit\junk
+<<<
+>>>
+>>>= 0
+
+echo nope> test\cli\output\work_path_safety\.bit\junk\should_not_show.txt
+<<<
+>>>
+>>>= 0
+
+cd test\cli\output\work_path_safety & bit add . & bit commit -m "Add nested file"
+<<<
+>>> /\[main.*\].*Add nested file/
+>>>= 0
+
+# ======================================================================
+# SECTION 2: ASSERTIONS
+# ======================================================================
+
+# Tracked output should include nested file
+cd test\cli\output\work_path_safety & bit ls-files | findstr /R /C:"sub[\\/]*file\.txt" >nul
+<<<
+>>>= 0
+
+# Tracked output should NOT include `.bit` paths
+cd test\cli\output\work_path_safety & bit ls-files | findstr /C:".bit" >nul
+<<<
+>>>= 1
+
+# ======================================================================
+# CLEANUP
+# ======================================================================
+
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_path_safety 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
+>>>= 0
+
 ```
 
 ---
@@ -2599,7 +2731,7 @@ cd test\cli\work & bit log --pretty=format:"%s" -n 1
 # =============================================================================
 
 # ---- CLEANUP: remove any leftover state from previous runs ----
-timeout /t 1 >nul & rmdir /s /q test\cli\work_process 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_process 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -2609,12 +2741,12 @@ cleanup done
 # SECTION 1: SETUP
 # ======================================================================
 
-mkdir test\cli\work_process
+mkdir test\cli\output\work_process
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work_process & bit init
+cd test\cli\output\work_process & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
@@ -2625,33 +2757,33 @@ cd test\cli\work_process & bit init
 
 # ---- Run multiple git commands in sequence ----
 # If handles leak or aren't closed properly, subsequent commands will fail
-cd test\cli\work_process & bit status
+cd test\cli\output\work_process & bit status
 <<<
 >>> /On branch main/
 >>>= 0
 
-cd test\cli\work_process & bit status
+cd test\cli\output\work_process & bit status
 <<<
 >>> /On branch main/
 >>>= 0
 
-cd test\cli\work_process & bit status
+cd test\cli\output\work_process & bit status
 <<<
 >>> /On branch main/
 >>>= 0
 
 # ---- Create a file and check status multiple times ----
-cd test\cli\work_process & echo test > file.txt
+cd test\cli\output\work_process & echo test > file.txt
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work_process & bit status
+cd test\cli\output\work_process & bit status
 <<<
 >>> /Untracked files/
 >>>= 0
 
-cd test\cli\work_process & bit status
+cd test\cli\output\work_process & bit status
 <<<
 >>> /Untracked files/
 >>>= 0
@@ -2662,7 +2794,7 @@ cd test\cli\work_process & bit status
 
 # ---- Test that error output is properly captured ----
 # Commands that fail should have their stderr captured without hanging
-cd test\cli\work_process & bit add nonexistent_file.txt
+cd test\cli\output\work_process & bit add nonexistent_file.txt
 <<<
 >>>2 /fatal|pathspec|did not match/
 >>>= 128
@@ -2671,7 +2803,7 @@ cd test\cli\work_process & bit add nonexistent_file.txt
 # CLEANUP
 # ======================================================================
 
-timeout /t 1 >nul & rmdir /s /q test\cli\work_process 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_process 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -2696,7 +2828,7 @@ cleanup done
 # =============================================================================
 
 # ---- CLEANUP: remove any leftover state from previous runs ----
-timeout /t 1 >nul & rmdir /s /q test\cli\work_progress_a 2>nul & rmdir /s /q test\cli\work_progress_b 2>nul & rmdir /s /q test\cli\fs_remote_progress 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_progress_a 2>nul & rmdir /s /q test\cli\output\work_progress_b 2>nul & rmdir /s /q test\cli\output\fs_remote_progress 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -2706,19 +2838,19 @@ cleanup done
 # SETUP
 # ======================================================================
 
-mkdir test\cli\work_progress_a & mkdir test\cli\work_progress_b & mkdir test\cli\fs_remote_progress
+mkdir test\cli\output\work_progress_a & mkdir test\cli\output\work_progress_b & mkdir test\cli\output\fs_remote_progress
 <<<
 >>>
 >>>= 0
 
 # Initialize local repo A
-cd test\cli\work_progress_a & bit init
+cd test\cli\output\work_progress_a & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
 # Add filesystem remote
-cd test\cli\work_progress_a & bit remote add origin ..\fs_remote_progress
+cd test\cli\output\work_progress_a & bit remote add origin ..\fs_remote_progress
 <<<
 >>> /Remote 'origin' added/
 >>>= 0
@@ -2728,19 +2860,19 @@ cd test\cli\work_progress_a & bit remote add origin ..\fs_remote_progress
 # ======================================================================
 
 # Create several binary-like files (>1MB to trigger chunked copy)
-cd test\cli\work_progress_a & echo binary content> data1.bin & echo binary content> data2.bin & echo binary content> data3.bin & bit add . & bit commit -m "Add binary files"
+cd test\cli\output\work_progress_a & echo binary content> data1.bin & echo binary content> data2.bin & echo binary content> data3.bin & bit add . & bit commit -m "Add binary files"
 <<<
 >>> /\[main|files? changed/
 >>>= 0
 
 # ---- First push: sync all files ----
-cd test\cli\work_progress_a & bit push
+cd test\cli\output\work_progress_a & bit push
 <<<
 >>> /Push complete|Pushing to filesystem remote/
 >>>= 0
 
 # Verify files copied to remote
-if exist "test\cli\fs_remote_progress\data1.bin" (echo files exist) else (echo missing)
+if exist "test\cli\output\fs_remote_progress\data1.bin" (echo files exist) else (echo missing)
 <<<
 >>>
 files exist
@@ -2751,24 +2883,24 @@ files exist
 # ======================================================================
 
 # Initialize local repo B and add same remote
-cd test\cli\work_progress_b & bit init
+cd test\cli\output\work_progress_b & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
-cd test\cli\work_progress_b & bit remote add origin ..\fs_remote_progress
+cd test\cli\output\work_progress_b & bit remote add origin ..\fs_remote_progress
 <<<
 >>> /Remote 'origin' added/
 >>>= 0
 
 # ---- Pull files from remote ----
-cd test\cli\work_progress_b & bit pull
+cd test\cli\output\work_progress_b & bit pull
 <<<
 >>> /Pull|Checking out/
 >>>= 0
 
 # Verify files copied from remote
-if exist "test\cli\work_progress_b\data1.bin" (echo files exist) else (echo missing)
+if exist "test\cli\output\work_progress_b\data1.bin" (echo files exist) else (echo missing)
 <<<
 >>>
 files exist
@@ -2779,13 +2911,13 @@ files exist
 # ======================================================================
 
 # Modify files in repo A
-cd test\cli\work_progress_a & echo modified> data1.bin & bit add data1.bin & bit commit -m "Modify data1"
+cd test\cli\output\work_progress_a & echo modified> data1.bin & bit add data1.bin & bit commit -m "Modify data1"
 <<<
 >>> /\[main|files? changed/
 >>>= 0
 
 # ---- Subsequent push: sync changed files only ----
-cd test\cli\work_progress_a & bit push
+cd test\cli\output\work_progress_a & bit push
 <<<
 >>> /Push complete|Syncing changed files/
 >>>= 0
@@ -2795,13 +2927,13 @@ cd test\cli\work_progress_a & bit push
 # ======================================================================
 
 # Modify different file in repo B
-cd test\cli\work_progress_b & echo modified> data2.bin & bit add data2.bin & bit commit -m "Modify data2"
+cd test\cli\output\work_progress_b & echo modified> data2.bin & bit add data2.bin & bit commit -m "Modify data2"
 <<<
 >>> /\[main|files? changed/
 >>>= 0
 
 # Pull changes from remote (should merge)
-cd test\cli\work_progress_b & bit pull
+cd test\cli\output\work_progress_b & bit pull
 <<<
 >>> /Pull|Merging|Updating/
 >>>= 0
@@ -2817,7 +2949,7 @@ cd test\cli\work_progress_b & bit pull
 # CLEANUP
 # ======================================================================
 
-timeout /t 1 >nul & rmdir /s /q test\cli\work_progress_a 2>nul & rmdir /s /q test\cli\work_progress_b 2>nul & rmdir /s /q test\cli\fs_remote_progress 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_progress_a 2>nul & rmdir /s /q test\cli\output\work_progress_b 2>nul & rmdir /s /q test\cli\output\fs_remote_progress 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -2833,259 +2965,431 @@ cleanup done
 *Source file.*
 
 ```text
-# =============================================================================
-# Proof of Possession Tests
-#
-# Tests the proof of possession rule: push/pull must verify that working tree
-# matches metadata before transferring metadata.
-#
-# Covers:
-# - Push verification blocks when a tracked file is missing from working tree
-# - Pull verification blocks when remote files don't match remote metadata
-# - --skip-verify bypasses verification on pull
-# - --force bypasses verification on push
-# - --accept-remote bypasses verification on pull
-# =============================================================================
-
-# ---- CLEANUP: remove any leftover state from previous runs ----
-timeout /t 1 >nul & rmdir /s /q test\cli\work_pop_local 2>nul & rmdir /s /q test\cli\work_pop_remote 2>nul & echo cleanup done
-<<<
->>>
-cleanup done
->>>= 0
-
-# ======================================================================
-# SECTION 1: SETUP
-# ======================================================================
-
-mkdir test\cli\work_pop_local
-<<<
->>>
->>>= 0
-
-cd test\cli\work_pop_local & bit init
-<<<
->>> /.*[Ii]nitialized.*/
->>>= 0
-
-# ---- Create a test file and commit it ----
-cd test\cli\work_pop_local & echo original content > file.txt & bit add file.txt
-<<<
->>>
->>>= 0
-
-cd test\cli\work_pop_local & bit commit -m "Initial commit"
-<<<
->>> /.*1 file changed.*/
->>>= 0
-
-# ---- Set up filesystem remote ----
-mkdir test\cli\work_pop_remote
-<<<
->>>
->>>= 0
-
-cd test\cli\work_pop_local & bit remote add origin ..\work_pop_remote
-<<<
->>> /Remote.*added/
->>>= 0
-
-# ---- First push should succeed (everything matches) ----
-cd test\cli\work_pop_local & bit push -u origin
-<<<
->>> /Push complete/
->>>= 0
-
-# ======================================================================
-# SECTION 2: PUSH VERIFICATION - Tracked file must exist in working tree
-# ======================================================================
-
-# ---- Delete tracked file (metadata remains in .bit/index) - push should fail ----
-cd test\cli\work_pop_local & del file.txt & bit push
-<<<
->>> /Verifying local files/
->>>2 /Working tree does not match metadata/
->>>= 1
-
-# ---- Verify --force bypasses verification on push ----
-cd test\cli\work_pop_local & echo original content > file.txt & bit push --force
-<<<
->>> /Push|Pushing to filesystem remote/
->>>= 0
-
-# ======================================================================
-# SECTION 3: PULL VERIFICATION - Remote files must match remote metadata
-# ======================================================================
-
-# ---- Corrupt file at remote - pull should fail ----
-cd test\cli\work_pop_remote & echo corrupted content > file.txt & cd ..\work_pop_local & bit pull
-<<<
->>> /Verifying remote/
->>>2 /Remote working tree does not match remote metadata/
->>>= 1
-
-# ---- Verify --skip-verify bypasses verification on pull ----
-cd test\cli\work_pop_local & bit pull --skip-verify
-<<<
->>> /Pull|Fetching remote commits/
->>>= 0
-
-# ---- Verify --accept-remote bypasses verification (after re-corrupting remote) ----
-cd test\cli\work_pop_remote & echo corrupted again > file.txt & cd ..\work_pop_local & bit pull origin --accept-remote
-<<<
->>> /Accepting remote file state/
->>>= 0
-
-# ======================================================================
-# CLEANUP
-# ======================================================================
-
-timeout /t 1 >nul & rmdir /s /q test\cli\work_pop_local 2>nul & rmdir /s /q test\cli\work_pop_remote 2>nul & echo cleanup done
-<<<
->>>
-cleanup done
->>>= 0
+# =============================================================================
+# Proof of Possession Tests
+#
+# Tests the proof of possession rule: push/pull must verify that working tree
+# matches metadata before transferring metadata. Verification is unconditional.
+#
+# Covers:
+# - Push verification blocks when a tracked file is missing from working tree
+# - Push verification blocks even with --force (force only skips ancestry check)
+# - Pull verification blocks when remote files don't match remote metadata
+# - --accept-remote bypasses verification on pull
+# =============================================================================
+
+# ---- CLEANUP: remove any leftover state from previous runs ----
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_pop_local 2>nul & rmdir /s /q test\cli\output\work_pop_remote 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
+>>>= 0
+
+# ======================================================================
+# SECTION 1: SETUP
+# ======================================================================
+
+mkdir test\cli\output\work_pop_local
+<<<
+>>>
+>>>= 0
+
+cd test\cli\output\work_pop_local & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+# ---- Create a test file and commit it ----
+cd test\cli\output\work_pop_local & echo original content > file.txt & bit add file.txt
+<<<
+>>>
+>>>= 0
+
+cd test\cli\output\work_pop_local & bit commit -m "Initial commit"
+<<<
+>>> /.*1 file changed.*/
+>>>= 0
+
+# ---- Set up filesystem remote ----
+mkdir test\cli\output\work_pop_remote
+<<<
+>>>
+>>>= 0
+
+cd test\cli\output\work_pop_local & bit remote add origin ..\work_pop_remote
+<<<
+>>> /Remote.*added/
+>>>= 0
+
+# ---- First push should succeed (everything matches) ----
+cd test\cli\output\work_pop_local & bit push -u origin
+<<<
+>>> /Push complete/
+>>>= 0
+
+# ======================================================================
+# SECTION 2: PUSH VERIFICATION - Tracked file must exist in working tree
+# ======================================================================
+
+# ---- Delete tracked file (metadata remains in .bit/index) - push should fail ----
+cd test\cli\output\work_pop_local & del file.txt & bit push
+<<<
+>>> /Verifying local files/
+>>>2 /Working tree does not match metadata/
+>>>= 1
+
+# ---- Verify --force does NOT bypass verification on push ----
+cd test\cli\output\work_pop_local & del file.txt & bit push --force
+<<<
+>>> /Verifying local files/
+>>>2 /Working tree does not match metadata/
+>>>= 1
+
+# ---- Restore file so remaining tests can proceed ----
+cd test\cli\output\work_pop_local & echo original content > file.txt
+<<<
+>>>
+>>>= 0
+
+# ======================================================================
+# SECTION 3: PULL VERIFICATION - Remote files must match remote metadata
+# ======================================================================
+
+# ---- Corrupt file at remote - pull should fail ----
+cd test\cli\output\work_pop_remote & echo corrupted content > file.txt & cd ..\work_pop_local & bit pull
+<<<
+>>> /Verifying remote/
+>>>2 /Remote working tree does not match remote metadata/
+>>>= 1
+
+# ---- Verify --accept-remote bypasses verification ----
+cd test\cli\output\work_pop_remote & echo corrupted again > file.txt & cd ..\work_pop_local & bit pull origin --accept-remote
+<<<
+>>> /Accepting remote file state/
+>>>= 0
+
+# ======================================================================
+# CLEANUP
+# ======================================================================
+
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_pop_local 2>nul & rmdir /s /q test\cli\output\work_pop_remote 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
+>>>= 0
 ```
 
 ---
 
-## test/cli/remote-check.test
+## test/cli/remote-flag.test
 
-**Path:** `test/cli/remote-check.test`
+**Path:** `test/cli/remote-flag.test`
 
 *Source file.*
 
 ```text
-# bit remote check tests
-# Runs rclone check between local working tree and remote (excludes .bit).
-# Requires: rclone on PATH.
+# =============================================================================
+# --remote Flag Test (Ephemeral Workspace)
+#
+# Tests the --remote <name> flag as a portable alternative to @<remote> syntax.
+# Verifies equivalence with @<remote> for all remote workspace commands, and
+# tests error handling for misuse.
+# Uses ephemeral workspace pattern: no persistent workspace between commands.
+# Prerequisites: filesystem remote support, rclone
+# =============================================================================
 
-# --- No remote configured: must print error ---
-rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit init
+# ---- CLEANUP: remove any leftover state from previous runs ----
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_rflag_a 2>nul & rmdir /s /q test\cli\output\fs_remote_rflag 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
+>>>= 0
+
+# ======================================================================
+# SECTION 1: SETUP - Create a filesystem remote with test files
+# ======================================================================
+
+# ---- Create remote directory with test files ----
+mkdir test\cli\output\fs_remote_rflag
+<<<
+>>>
+>>>= 0
+
+echo Text file 1 > test\cli\output\fs_remote_rflag\file1.txt
+<<<
+>>>
+>>>= 0
+
+echo Binary content > test\cli\output\fs_remote_rflag\data.bin
+<<<
+>>>
+>>>= 0
+
+mkdir test\cli\output\fs_remote_rflag\subdir
+<<<
+>>>
+>>>= 0
+
+echo Subdir text > test\cli\output\fs_remote_rflag\subdir\file2.txt
+<<<
+>>>
+>>>= 0
+
+# ======================================================================
+# SECTION 2: INIT LOCAL REPO AND ADD REMOTE
+# ======================================================================
+
+mkdir test\cli\output\work_rflag_a
+<<<
+>>>
+>>>= 0
+
+cd test\cli\output\work_rflag_a & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
-cd test\cli\work & bit remote check
+cd test\cli\output\work_rflag_a & bit remote add origin ..\fs_remote_rflag
+<<<
+>>> /Remote.*added/
+>>>= 0
+
+# ======================================================================
+# SECTION 3: TEST --remote <name> init (creates empty bundle, no scan)
+# ======================================================================
+
+# ---- --remote origin init should create an empty bundle on remote ----
+cd test\cli\output\work_rflag_a & bit --remote origin init
+<<<
+>>> /[Ii]nitialized.*bit.*repository.*on.*remote/
+>>>= 0
+
+# ---- Verify NO persistent workspace was created ----
+cd test\cli\output\work_rflag_a & if exist .bit\remote-workspaces\origin\.git (echo workspace exists) else (echo no workspace)
+<<<
+>>>
+no workspace
+>>>= 0
+
+# ---- Verify bundle was created on remote ----
+cd test\cli\output\work_rflag_a & if exist ..\fs_remote_rflag\.bit\bit.bundle echo bundle exists
+<<<
+>>>
+bundle exists
+>>>= 0
+
+# ======================================================================
+# SECTION 4: TEST --remote <name> add (scans, writes metadata, auto-commits)
+# ======================================================================
+
+# ---- Stage all files in remote workspace (scans and auto-commits) ----
+cd test\cli\output\work_rflag_a & bit --remote origin add .
+<<<
+>>> /Scanning remote|Remote metadata updated/
+>>>= 0
+
+# ======================================================================
+# SECTION 5: TEST --remote <name> status (scans remote and shows status)
+# ======================================================================
+
+cd test\cli\output\work_rflag_a & bit --remote origin status
+<<<
+>>> /Scanning remote|On branch main/
+>>>= 0
+
+# ======================================================================
+# SECTION 6: TEST --remote <name> commit (amend use case)
+# ======================================================================
+
+cd test\cli\output\work_rflag_a & bit --remote origin commit --amend -m "Commit via --remote flag"
+<<<
+>>> /Commit via --remote flag/
+>>>= 0
+
+# ---- Verify bundle was updated on remote ----
+cd test\cli\output\work_rflag_a & if exist ..\fs_remote_rflag\.bit\bit.bundle echo bundle exists
+<<<
+>>>
+bundle exists
+>>>= 0
+
+# ======================================================================
+# SECTION 7: TEST --remote <name> log
+# ======================================================================
+
+cd test\cli\output\work_rflag_a & bit --remote origin log --oneline
+<<<
+>>> /Commit via --remote flag/
+>>>= 0
+
+# ======================================================================
+# SECTION 8: ERROR CASES
+# ======================================================================
+
+# ---- --remote without argument ----
+cd test\cli\output\work_rflag_a & bit --remote
+<<<
+>>>2 /requires a remote name argument/
+>>>= 1
+
+# ---- --remote with non-existent remote ----
+cd test\cli\output\work_rflag_a & bit --remote fake init
+<<<
+>>>2 /remote.*not found/
+>>>= 1
+
+# ---- Unsupported command in remote context ----
+cd test\cli\output\work_rflag_a & bit --remote origin push
+<<<
+>>>2 /not supported in remote context/
+>>>= 1
+
+# ---- verify --remote should still work (not confused with --remote flag) ----
+cd test\cli\output\work_rflag_a & bit verify --remote
+<<<
+>>> /Verifying remote files|\[OK\] All/
+>>>= 0
+
+# ======================================================================
+# CLEANUP
+# ======================================================================
+
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_rflag_a 2>nul & rmdir /s /q test\cli\output\fs_remote_rflag 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
+>>>= 0
+```
+
+---
+
+## test/cli/remote-repair.test
+
+**Path:** `test/cli/remote-repair.test`
+
+*Source file.*
+
+```text
+# bit remote repair tests
+# Verifies both local and remote files against metadata, then repairs broken
+# files by copying verified files from the other side (content-addressable by hash+size).
+
+# ---- CLEANUP ----
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_repair 2>nul & rmdir /s /q test\cli\output\remote_repair 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
+>>>= 0
+
+# ======================================================================
+# TEST: No remote configured — must print error
+# ======================================================================
+
+rmdir /s /q test\cli\output\work_repair 2>nul & mkdir test\cli\output\work_repair & cd test\cli\output\work_repair & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+cd test\cli\output\work_repair & bit remote repair
 <<<
 >>>2 /fatal: No remote configured/
 >>>= 1
 
-# --- Setup: repo with text + binary, local dir OUTSIDE work as "remote", push, then check ---
-rmdir /s /q test\cli\work 2>nul & rmdir /s /q test\cli\remote_mirror 2>nul & mkdir test\cli\work & mkdir test\cli\remote_mirror & cd test\cli\work & bit init & echo hello> greet.txt & echo x> data.bin & bit add greet.txt data.bin & bit commit -m "Add files"
+# ======================================================================
+# TEST: Nothing to repair — push then repair, all verified
+# ======================================================================
+
+rmdir /s /q test\cli\output\work_repair 2>nul & rmdir /s /q test\cli\output\remote_repair 2>nul & mkdir test\cli\output\work_repair & mkdir test\cli\output\remote_repair & cd test\cli\output\work_repair & bit init & echo hello> greet.txt & echo binarydata> data.bin & bit add greet.txt data.bin & bit commit -m "Add files"
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
-cd test\cli\work & bit remote add origin ..\remote_mirror
+cd test\cli\output\work_repair & bit remote add origin ..\remote_repair
 <<<
 >>> /Remote.*added/
 >>>= 0
 
-cd test\cli\work & bit push
+cd test\cli\output\work_repair & bit push
 <<<
 >>> /Push complete|Pushing to filesystem remote|Metadata push complete/
 >>>= 0
 
-# --- Happy path: local matches remote after push ---
-cd test\cli\work & bit remote check
+cd test\cli\output\work_repair & bit remote repair
 <<<
->>> /files match|0 differences found/
+>>> /Nothing to repair/
 >>>= 0
 
-# --- Modify local file: rclone check detects difference, exit 1 ---
-cd test\cli\work & echo changed> greet.txt
+# ======================================================================
+# TEST: Local corruption — corrupt a local binary file, repair from remote
+# ======================================================================
+
+cd test\cli\output\work_repair & echo corrupted> data.bin
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work & bit remote check
+cd test\cli\output\work_repair & bit remote repair
 <<<
->>> /content differs|differences,/
+>>> /REPAIRED.*data\.bin/
+>>>= 0
+
+# Verify after repair — should be clean
+cd test\cli\output\work_repair & bit remote repair
+<<<
+>>> /Nothing to repair/
+>>>= 0
+
+# ======================================================================
+# TEST: Stale metadata — corrupt file then scan, repair must still work
+# (Regression: scan updates .bit/index/ metadata to match corrupted
+#  content; repair must use remote metadata for the lookup, not local.)
+# ======================================================================
+
+cd test\cli\output\work_repair & echo stale_corrupt> data.bin
+<<<
+>>>
+>>>= 0
+
+# Run status to trigger a scan — this updates local metadata to the corrupted hash
+cd test\cli\output\work_repair & bit status
+<<<
+>>>= 0
+
+# Repair must still succeed using remote metadata, not the stale local metadata
+cd test\cli\output\work_repair & bit remote repair
+<<<
+>>> /REPAIRED.*data\.bin/
+>>>= 0
+
+# Verify after repair — should be clean
+cd test\cli\output\work_repair & bit remote repair
+<<<
+>>> /Nothing to repair/
+>>>= 0
+
+# ======================================================================
+# TEST: Unrepairable — corrupt on both sides
+# ======================================================================
+
+# Corrupt local
+cd test\cli\output\work_repair & echo local_corrupt> data.bin
+<<<
+>>>
+>>>= 0
+
+# Corrupt remote (same file)
+cd test\cli\output\remote_repair & echo remote_corrupt> data.bin
+<<<
+>>>
+>>>= 0
+
+cd test\cli\output\work_repair & bit remote repair
+<<<
+>>> /UNREPAIRABLE.*data\.bin|unrepairable/
 >>>= 1
 
-# --- Restore local file for next test ---
-cd test\cli\work & echo hello> greet.txt
-<<<
->>>
->>>= 0
-
-# ======================================================================
-# TEST: Progress reporting with multiple files (>5 files)
-# ======================================================================
-
-# --- Setup: Create repo with many files to trigger progress code path ---
-rmdir /s /q test\cli\work_check_progress 2>nul & rmdir /s /q test\cli\remote_check_progress 2>nul & mkdir test\cli\work_check_progress & mkdir test\cli\remote_check_progress & cd test\cli\work_check_progress & bit init
-<<<
->>> /.*[Ii]nitialized.*/
->>>= 0
-
-# --- Create 10 files to ensure progress code is triggered (>5 files) ---
-cd test\cli\work_check_progress & echo f1> f1.txt & echo f2> f2.txt & echo f3> f3.txt & echo f4> f4.txt & echo f5> f5.txt & echo f6> f6.txt & echo f7> f7.txt & echo f8> f8.txt & echo f9> f9.txt & echo f10> f10.txt & bit add . & bit commit -m "Add many files"
-<<<
->>> /\[main|files? changed/
->>>= 0
-
-cd test\cli\work_check_progress & bit remote add origin ..\remote_check_progress
-<<<
->>> /Remote.*added/
->>>= 0
-
-cd test\cli\work_check_progress & bit push
-<<<
->>> /Push complete|Pushing to filesystem remote|Metadata push complete/
->>>= 0
-
-# --- Remote check should succeed with all files matching ---
-cd test\cli\work_check_progress & bit remote check
-<<<
->>> /files match|0 differences found/
->>>= 0
-
-# --- Modify one file and check again ---
-cd test\cli\work_check_progress & echo modified> f5.txt
-<<<
->>>
->>>= 0
-
-cd test\cli\work_check_progress & bit remote check
-<<<
->>> /content differs|differences,/
->>>= 1
-
-# ======================================================================
-# TEST: Progress with fewer files (<=5 files, no progress code path)
-# ======================================================================
-
-# --- Setup: Create repo with exactly 5 files (at threshold) ---
-rmdir /s /q test\cli\work_check_small 2>nul & rmdir /s /q test\cli\remote_check_small 2>nul & mkdir test\cli\work_check_small & mkdir test\cli\remote_check_small & cd test\cli\work_check_small & bit init
-<<<
->>> /.*[Ii]nitialized.*/
->>>= 0
-
-cd test\cli\work_check_small & echo a> a.txt & echo b> b.txt & echo c> c.txt & echo d> d.txt & echo e> e.txt & bit add . & bit commit -m "Add 5 files"
-<<<
->>> /\[main|files? changed/
->>>= 0
-
-cd test\cli\work_check_small & bit remote add origin ..\remote_check_small
-<<<
->>> /Remote.*added/
->>>= 0
-
-cd test\cli\work_check_small & bit push
-<<<
->>> /Push complete|Pushing to filesystem remote|Metadata push complete/
->>>= 0
-
-# --- Remote check should succeed (using simple code path) ---
-cd test\cli\work_check_small & bit remote check
-<<<
->>> /files match|0 differences found/
->>>= 0
-
-# --- Cleanup ---
-timeout /t 1 >nul & rmdir /s /q test\cli\work 2>nul & rmdir /s /q test\cli\remote_mirror 2>nul & rmdir /s /q test\cli\work_check_progress 2>nul & rmdir /s /q test\cli\remote_check_progress 2>nul & rmdir /s /q test\cli\work_check_small 2>nul & rmdir /s /q test\cli\remote_check_small 2>nul
+# ---- CLEANUP ----
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_repair 2>nul & rmdir /s /q test\cli\output\remote_repair 2>nul
 <<<
 >>>
 >>>= 0
@@ -3111,7 +3415,7 @@ timeout /t 1 >nul & rmdir /s /q test\cli\work 2>nul & rmdir /s /q test\cli\remot
 # =============================================================================
 
 # ---- CLEANUP: remove any leftover state from previous runs (timeout helps Windows release file handles) ----
-timeout /t 1 >nul & rmdir /s /q test\cli\work_remote_show 2>nul & rmdir /s /q test\cli\remote_show_a 2>nul & rmdir /s /q test\cli\remote_show_b 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_remote_show 2>nul & rmdir /s /q test\cli\output\remote_show_a 2>nul & rmdir /s /q test\cli\output\remote_show_b 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -3121,18 +3425,18 @@ cleanup done
 # SECTION 1: No remotes configured
 # ======================================================================
 
-mkdir test\cli\work_remote_show
+mkdir test\cli\output\work_remote_show
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work_remote_show & bit init
+cd test\cli\output\work_remote_show & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
 # ---- Test: bit remote show with no remotes ----
-cd test\cli\work_remote_show & bit remote show
+cd test\cli\output\work_remote_show & bit remote show
 <<<
 >>> /No remotes configured.*bit remote add/
 >>>= 0
@@ -3141,55 +3445,65 @@ cd test\cli\work_remote_show & bit remote show
 # SECTION 2: Single remote
 # ======================================================================
 
-mkdir test\cli\remote_show_a
+mkdir test\cli\output\remote_show_a
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work_remote_show & bit remote add dok1 ..\remote_show_a
+cd test\cli\output\work_remote_show & bit remote add dok1 ..\remote_show_a
 <<<
 >>> /Remote.*added/
 >>>= 0
 
 # ---- Test: bit remote show lists the remote ----
-cd test\cli\work_remote_show & bit remote show
+cd test\cli\output\work_remote_show & bit remote show
 <<<
 >>> /dok1.*remote_show_a/
 >>>= 0
 
 # ---- Test: bit remote show <name> shows details ----
-cd test\cli\work_remote_show & bit remote show dok1
+cd test\cli\output\work_remote_show & bit remote show dok1
 <<<
 >>> /dok1.*remote_show_a/
+>>>= 0
+
+# ---- Test: push status line (up to date, fast-forwardable, local out of date, or diverged) ----
+cd test\cli\output\work_remote_show & echo x> f.txt & bit add f.txt & bit commit -m "Add f" & bit push dok1 & bit fetch dok1
+<<<
+>>>= 0
+
+cd test\cli\output\work_remote_show & bit remote show dok1
+<<<
+>>> /main pushes to main \(up to date\)/
 >>>= 0
 
 # ======================================================================
 # SECTION 3: Multiple remotes
 # ======================================================================
 
-mkdir test\cli\remote_show_b
+mkdir test\cli\output\remote_show_b
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work_remote_show & bit remote add backup ..\remote_show_b
+cd test\cli\output\work_remote_show & bit remote add backup ..\remote_show_b
 <<<
 >>> /Remote.*added/
 >>>= 0
 
 # ---- Test: bit remote show lists all remotes ----
-cd test\cli\work_remote_show & bit remote show
+cd test\cli\output\work_remote_show & bit remote show
 <<<
 >>> /dok1.*remote_show_a/
 >>>= 0
 
-cd test\cli\work_remote_show & bit remote show
+cd test\cli\output\work_remote_show & bit remote show
 <<<
 >>> /backup.*remote_show_b/
 >>>= 0
 
 # ---- Test: bit remote show <name> still works for specific remote ----
-cd test\cli\work_remote_show & bit remote show backup
+cd test\cli\output\work_remote_show & bit remote show backup
 <<<
 >>> /backup.*remote_show_b/
 >>>= 0
@@ -3198,7 +3512,7 @@ cd test\cli\work_remote_show & bit remote show backup
 # CLEANUP
 # ======================================================================
 
-timeout /t 1 >nul & rmdir /s /q test\cli\work_remote_show 2>nul & rmdir /s /q test\cli\remote_show_a 2>nul & rmdir /s /q test\cli\remote_show_b 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_remote_show 2>nul & rmdir /s /q test\cli\output\remote_show_a 2>nul & rmdir /s /q test\cli\output\remote_show_b 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -3215,15 +3529,17 @@ cleanup done
 
 ```text
 # =============================================================================
-# Remote-Targeted Commands Test
+# Remote-Targeted Commands Test (Ephemeral Workspace)
 #
-# Tests the @<remote> syntax for operating on remote repositories without
-# downloading large files. Verifies scanning, staging, committing, and status.
-# Prerequisites: filesystem remote support
+# Tests the @<remote> / --remote syntax for operating on remote repositories.
+# Uses an ephemeral workspace pattern: each command fetches the bundle from
+# the remote, inflates into a temp dir, operates, re-bundles, and pushes back.
+# No persistent workspace between commands.
+# Prerequisites: rclone (for remote file operations)
 # =============================================================================
 
 # ---- CLEANUP: remove any leftover state from previous runs ----
-timeout /t 1 >nul & rmdir /s /q test\cli\work_rmt_a 2>nul & rmdir /s /q test\cli\fs_remote_rmt 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_rmt_a 2>nul & rmdir /s /q test\cli\output\fs_remote_rmt 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -3234,35 +3550,35 @@ cleanup done
 # ======================================================================
 
 # ---- Create remote directory with test files ----
-mkdir test\cli\fs_remote_rmt
+mkdir test\cli\output\fs_remote_rmt
 <<<
 >>>
 >>>= 0
 
 # ---- Create some text files in the remote ----
-echo Text file 1 > test\cli\fs_remote_rmt\file1.txt
+echo Text file 1 > test\cli\output\fs_remote_rmt\file1.txt
 <<<
 >>>
 >>>= 0
 
-echo Text file 2 > test\cli\fs_remote_rmt\file2.md
+echo Text file 2 > test\cli\output\fs_remote_rmt\file2.md
 <<<
 >>>
 >>>= 0
 
 # ---- Create a subdirectory with files ----
-mkdir test\cli\fs_remote_rmt\subdir
+mkdir test\cli\output\fs_remote_rmt\subdir
 <<<
 >>>
 >>>= 0
 
-echo Subdir text > test\cli\fs_remote_rmt\subdir\file3.txt
+echo Subdir text > test\cli\output\fs_remote_rmt\subdir\file3.txt
 <<<
 >>>
 >>>= 0
 
 # ---- Create a binary file (simulated) ----
-echo Binary content > test\cli\fs_remote_rmt\data.bin
+echo Binary content > test\cli\output\fs_remote_rmt\data.bin
 <<<
 >>>
 >>>= 0
@@ -3272,18 +3588,18 @@ echo Binary content > test\cli\fs_remote_rmt\data.bin
 # ======================================================================
 
 # ---- Create local repo ----
-mkdir test\cli\work_rmt_a
+mkdir test\cli\output\work_rmt_a
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work_rmt_a & bit init
+cd test\cli\output\work_rmt_a & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
 # ---- Add filesystem remote ----
-cd test\cli\work_rmt_a & bit remote add origin ..\fs_remote_rmt
+cd test\cli\output\work_rmt_a & bit remote add origin ..\fs_remote_rmt
 <<<
 >>> /Remote.*added/
 >>>= 0
@@ -3292,123 +3608,179 @@ cd test\cli\work_rmt_a & bit remote add origin ..\fs_remote_rmt
 # SECTION 3: TEST REMOTE-TARGETED INIT
 # ======================================================================
 
-# ---- Test @origin init - scan the remote and build metadata workspace ----
-cd test\cli\work_rmt_a & bit @origin init
+# ---- Test @origin init - creates empty bundle on remote ----
+cd test\cli\output\work_rmt_a & bit @origin init
 <<<
->>> /Scanning remote/
+>>> /[Ii]nitialized.*bit.*repository.*on.*remote/
 >>>= 0
 
-# ---- Verify workspace was created ----
-cd test\cli\work_rmt_a & if exist .bit\remote-workspaces\origin\.git echo workspace exists
+# ---- Verify NO persistent workspace was created ----
+cd test\cli\output\work_rmt_a & if exist .bit\remote-workspaces\origin\.git (echo workspace exists) else (echo no workspace)
 <<<
 >>>
-workspace exists
->>>= 0
-
-# ---- Test error: workspace already exists ----
-cd test\cli\work_rmt_a & bit @origin init
-<<<
->>>2 /already exists/
->>>= 1
-
-# ======================================================================
-# SECTION 4: TEST REMOTE-TARGETED ADD
-# ======================================================================
-
-# ---- Stage all files in remote workspace ----
-cd test\cli\work_rmt_a & bit @origin add .
-<<<
->>>
->>>= 0
-
-# ---- Test error: add without init ----
-cd test\cli\work_rmt_a & bit @nonexistent add .
-<<<
->>>2 /not found/
->>>= 1
-
-# ======================================================================
-# SECTION 5: TEST REMOTE-TARGETED STATUS
-# ======================================================================
-
-# ---- Check status of remote workspace ----
-cd test\cli\work_rmt_a & bit @origin status
-<<<
->>> /Changes to be committed|new file/
->>>= 0
-
-# ======================================================================
-# SECTION 6: TEST REMOTE-TARGETED COMMIT
-# ======================================================================
-
-# ---- Commit in remote workspace (creates bundle and pushes it) ----
-cd test\cli\work_rmt_a & bit @origin commit -m "Initial commit from remote scan"
-<<<
->>> /Pushing.*bundle|Remote is now a bit repository/
+no workspace
 >>>= 0
 
 # ---- Verify bundle was created on remote ----
-cd test\cli\work_rmt_a & if exist ..\fs_remote_rmt\.bit\bit.bundle echo bundle exists
+cd test\cli\output\work_rmt_a & if exist ..\fs_remote_rmt\.bit\bit.bundle echo bundle exists
 <<<
 >>>
 bundle exists
 >>>= 0
 
-# ---- Test status after commit (should be clean) ----
-cd test\cli\work_rmt_a & bit @origin status
+# ---- Test error: init when already initialized ----
+cd test\cli\output\work_rmt_a & bit @origin init
 <<<
->>> /nothing to commit|working tree clean/
+>>>2 /already has a bit repository/
+>>>= 1
+
+# ======================================================================
+# SECTION 4: TEST REMOTE-TARGETED ADD (scans remote, writes metadata)
+# ======================================================================
+
+# ---- Test add . — scans remote files, writes metadata, auto-commits ----
+cd test\cli\output\work_rmt_a & bit @origin add .
+<<<
+>>> /Scanning remote|Remote metadata updated/
+>>>= 0
+
+# ---- Verify bundle was updated on remote ----
+cd test\cli\output\work_rmt_a & if exist ..\fs_remote_rmt\.bit\bit.bundle echo bundle exists
+<<<
+>>>
+bundle exists
+>>>= 0
+
+# ---- Test add again with no changes (should report up to date) ----
+cd test\cli\output\work_rmt_a & bit @origin add .
+<<<
+>>> /Nothing to add|up to date/
+>>>= 0
+
+# ---- Test error: add with non-existent remote ----
+cd test\cli\output\work_rmt_a & bit @nonexistent add .
+<<<
+>>>2 /not found/
+>>>= 1
+
+# ======================================================================
+# SECTION 5: TEST REMOTE-TARGETED STATUS (read-only, ephemeral)
+# ======================================================================
+
+# ---- Check status — scans remote and shows git status ----
+cd test\cli\output\work_rmt_a & bit @origin status
+<<<
+>>> /Scanning remote|On branch main/
+>>>= 0
+
+# ---- Add a new file to the remote (simulating untracked file) ----
+echo New untracked file > test\cli\output\fs_remote_rmt\newfile.txt
+<<<
+>>>
+>>>= 0
+
+# ---- Status should now show the untracked file ----
+cd test\cli\output\work_rmt_a & bit @origin status
+<<<
+>>> /newfile\.txt/
+>>>= 0
+
+# ---- Add and commit the new file ----
+cd test\cli\output\work_rmt_a & bit @origin add .
+<<<
+>>> /Remote metadata updated/
 >>>= 0
 
 # ======================================================================
-# SECTION 7: TEST REMOTE-TARGETED LOG
+# SECTION 6: TEST REMOTE-TARGETED LOG (read-only, ephemeral)
 # ======================================================================
 
-# ---- View commit history in remote workspace ----
-cd test\cli\work_rmt_a & bit @origin log --oneline
+# ---- View commit history — should show initial + add commits ----
+cd test\cli\output\work_rmt_a & bit @origin log --oneline
 <<<
->>> /Initial commit from remote scan/
+>>> /Initial remote repository|Update remote metadata/
 >>>= 0
 
 # ======================================================================
-# SECTION 8: TEST ERROR CASES
+# SECTION 7: TEST REMOTE-TARGETED LS-FILES
+# ======================================================================
+
+# ---- List tracked files — should show all committed files ----
+cd test\cli\output\work_rmt_a & bit @origin ls-files
+<<<
+>>> /file1\.txt/
+>>>= 0
+
+# ---- ls-files with --remote flag ----
+cd test\cli\output\work_rmt_a & bit --remote origin ls-files
+<<<
+>>> /file2\.md/
+>>>= 0
+
+# ======================================================================
+# SECTION 8: TEST REMOTE-TARGETED COMMIT (amend use case)
+# ======================================================================
+
+# ---- Amend the last commit message ----
+cd test\cli\output\work_rmt_a & bit @origin commit --amend -m "Initial metadata scan"
+<<<
+>>> /Initial metadata scan/
+>>>= 0
+
+# ---- Verify the amended message shows in log ----
+cd test\cli\output\work_rmt_a & bit @origin log --oneline
+<<<
+>>> /Initial metadata scan/
+>>>= 0
+
+# ======================================================================
+# SECTION 9: TEST --remote FLAG (portable alternative to @)
+# ======================================================================
+
+# ---- Test --remote flag for status ----
+cd test\cli\output\work_rmt_a & bit --remote origin status
+<<<
+>>> /Scanning remote|On branch main/
+>>>= 0
+
+# ---- Test --remote flag for log ----
+cd test\cli\output\work_rmt_a & bit --remote origin log --oneline
+<<<
+>>> /Initial metadata scan/
+>>>= 0
+
+# ======================================================================
+# SECTION 10: TEST ERROR CASES
 # ======================================================================
 
 # ---- Test unsupported command in remote context ----
-cd test\cli\work_rmt_a & bit @origin push
+cd test\cli\output\work_rmt_a & bit @origin push
 <<<
 >>>2 /not supported in remote context/
 >>>= 1
 
 # ---- Test with non-existent remote ----
-cd test\cli\work_rmt_a & bit @fake init
+cd test\cli\output\work_rmt_a & bit @fake init
 <<<
 >>>2 /remote.*not found/
 >>>= 1
 
 # ---- Test @remote commands without a bit repository ----
-mkdir test\cli\work_rmt_a\notrepo
+mkdir test\cli\output\work_rmt_a\notrepo
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work_rmt_a\notrepo & bit @origin init
+cd test\cli\output\work_rmt_a\notrepo & bit @origin init
 <<<
 >>>2 /not a bit repository/
 >>>= 1
 
 # ======================================================================
-# SECTION 9: VERIFY BUNDLE ON REMOTE
-# ======================================================================
-
-# Note: Full pull integration test would go here.
-# The bundle exists on the remote and can be fetched separately.
-
-# ======================================================================
 # CLEANUP
 # ======================================================================
 
-timeout /t 1 >nul & rmdir /s /q test\cli\work_rmt_a 2>nul & rmdir /s /q test\cli\fs_remote_rmt 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_rmt_a 2>nul & rmdir /s /q test\cli\output\fs_remote_rmt 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -3426,126 +3798,296 @@ cleanup done
 ```text
 # Test restore and checkout commands (git-compatible syntax)
 # Setup: fresh repo with committed file
-rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit init
+rmdir /s /q test\cli\output\work 2>nul & mkdir test\cli\output\work & cd test\cli\output\work & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
-cd test\cli\work & echo original> file.txt & bit add file.txt & bit commit -m "Add file"
+cd test\cli\output\work & echo original> file.txt & bit add file.txt & bit commit -m "Add file"
 <<<
 >>> /\[master|main|files? changed/
 >>>= 0
 
 # Modify file, then restore (discard working tree changes)
-cd test\cli\work & echo modified> file.txt
+cd test\cli\output\work & echo modified> file.txt
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work & bit restore file.txt
+cd test\cli\output\work & bit restore file.txt
 <<<
 >>>
 >>>= 0
 
-findstr /C:"original" test\cli\work\file.txt >nul
+findstr /C:"original" test\cli\output\work\file.txt >nul
 <<<
 >>>
 >>>= 0
 
 # Modify again, use restore -- (explicit pathspec separator, like git)
-cd test\cli\work & echo changed> file.txt & bit restore -- file.txt
+cd test\cli\output\work & echo changed> file.txt & bit restore -- file.txt
 <<<
 >>>
 >>>= 0
 
-findstr /C:"original" test\cli\work\file.txt >nul
+findstr /C:"original" test\cli\output\work\file.txt >nul
 <<<
 >>>
 >>>= 0
 
 # Modify, then checkout -- (legacy git syntax)
-cd test\cli\work & echo discarded> file.txt & bit checkout -- file.txt
+cd test\cli\output\work & echo discarded> file.txt & bit checkout -- file.txt
 <<<
 >>>
 >>>= 0
 
-findstr /C:"original" test\cli\work\file.txt >nul
+findstr /C:"original" test\cli\output\work\file.txt >nul
 <<<
 >>>
 >>>= 0
 
 # Test restore --staged (unstage without discarding working tree)
-cd test\cli\work & echo staged change> file.txt & bit add file.txt
+cd test\cli\output\work & echo staged change> file.txt & bit add file.txt
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work & bit restore --staged file.txt
+cd test\cli\output\work & bit restore --staged file.txt
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work & bit status
+cd test\cli\output\work & bit status
 <<<
 >>> /modified:.*file\.txt/
 >>>= 0
 
-findstr /C:"staged change" test\cli\work\file.txt >nul
+findstr /C:"staged change" test\cli\output\work\file.txt >nul
 <<<
 >>>
 >>>= 0
 
 # Restore working tree (discard the modification)
-cd test\cli\work & bit restore file.txt
+cd test\cli\output\work & bit restore file.txt
 <<<
 >>>
 >>>= 0
 
-findstr /C:"original" test\cli\work\file.txt >nul
+findstr /C:"original" test\cli\output\work\file.txt >nul
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work & bit status
+cd test\cli\output\work & bit status
 <<<
 >>> /nothing to commit|working tree clean/
 >>>= 0
 
 # Test restore . (all files)
-cd test\cli\work & echo a> a.txt & echo b> b.txt & bit add . & bit commit -m "Add a and b"
+cd test\cli\output\work & echo a> a.txt & echo b> b.txt & bit add . & bit commit -m "Add a and b"
 <<<
 >>> /\[master|main|files? changed/
 >>>= 0
 
-cd test\cli\work & echo x> a.txt & echo y> b.txt & bit restore .
+cd test\cli\output\work & echo x> a.txt & echo y> b.txt & bit restore .
 <<<
 >>>
 >>>= 0
 
-findstr /C:"a" test\cli\work\a.txt >nul
+findstr /C:"a" test\cli\output\work\a.txt >nul
 <<<
 >>>
 >>>= 0
 
-findstr /C:"b" test\cli\work\b.txt >nul
+findstr /C:"b" test\cli\output\work\b.txt >nul
 <<<
 >>>
 >>>= 0
 
 # Test checkout -- with multiple paths
-cd test\cli\work & echo XX> a.txt & echo YY> b.txt & bit checkout -- a.txt b.txt
+cd test\cli\output\work & echo XX> a.txt & echo YY> b.txt & bit checkout -- a.txt b.txt
 <<<
 >>>
 >>>= 0
 
-findstr /C:"a" test\cli\work\a.txt >nul
+findstr /C:"a" test\cli\output\work\a.txt >nul
 <<<
 >>>
 >>>= 0
 
-findstr /C:"b" test\cli\work\b.txt >nul
+findstr /C:"b" test\cli\output\work\b.txt >nul
 <<<
 >>>
+>>>= 0
+```
+
+---
+
+## test/cli/rm.test
+
+**Path:** `test/cli/rm.test`
+
+*Source file.*
+
+```text
+# Test bit rm — remove files from tracking and working directory
+# Setup: fresh repo with committed files
+timeout /t 1 >nul & rmdir /s /q test\cli\output\rmwork 2>nul & mkdir test\cli\output\rmwork & cd test\cli\output\rmwork & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+cd test\cli\output\rmwork & echo hello> file.txt & echo world> other.txt & bit add . & bit commit -m "Add files"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+# ---- Basic rm: removes from index AND working directory ----
+cd test\cli\output\rmwork & bit rm file.txt
+<<<
+>>> /rm 'file.txt'/
+>>>= 0
+
+# Verify actual file is gone from working directory
+if exist test\cli\output\rmwork\file.txt (echo FAIL file still exists) else (echo OK file removed)
+<<<
+>>>
+OK file removed
+>>>= 0
+
+# Verify metadata file is gone from index
+if exist test\cli\output\rmwork\.bit\index\file.txt (echo FAIL meta still exists) else (echo OK meta removed)
+<<<
+>>>
+OK meta removed
+>>>= 0
+
+# Commit the removal so we have a clean state
+cd test\cli\output\rmwork & bit commit -m "Remove file"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+# ---- rm --cached: removes from staging only, keeps working dir file ----
+cd test\cli\output\rmwork & bit rm --cached other.txt
+<<<
+>>> /rm 'other.txt'/
+>>>= 0
+
+# Verify actual file still exists in working directory
+if exist test\cli\output\rmwork\other.txt (echo OK file kept) else (echo FAIL file removed)
+<<<
+>>>
+OK file kept
+>>>= 0
+
+# Re-add other.txt so it's tracked again for subsequent tests
+cd test\cli\output\rmwork & bit add .
+<<<
+>>>
+>>>= 0
+
+# ---- rm --dry-run: shows what would be removed, removes nothing ----
+cd test\cli\output\rmwork & bit rm -n other.txt
+<<<
+>>> /rm 'other.txt'/
+>>>= 0
+
+# Verify actual file still exists after dry run
+if exist test\cli\output\rmwork\other.txt (echo OK file kept) else (echo FAIL file removed)
+<<<
+>>>
+OK file kept
+>>>= 0
+
+# Verify metadata file still exists after dry run
+if exist test\cli\output\rmwork\.bit\index\other.txt (echo OK meta kept) else (echo FAIL meta removed)
+<<<
+>>>
+OK meta kept
+>>>= 0
+
+# ---- rm nonexistent file: git errors, no files removed ----
+cd test\cli\output\rmwork & bit rm nonexistent.txt 2>&1
+<<<
+>>> /pathspec .* did not match/
+>>>= /[1-9]/
+
+# ---- rm with file already deleted from working dir ----
+cd test\cli\output\rmwork & del other.txt & bit rm other.txt
+<<<
+>>> /rm 'other.txt'/
+>>>= 0
+
+cd test\cli\output\rmwork & bit commit -m "Remove other"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+# ---- rm in subdirectory: also cleans up empty parent dirs ----
+timeout /t 1 >nul & rmdir /s /q test\cli\output\rmwork2 2>nul & mkdir test\cli\output\rmwork2 & cd test\cli\output\rmwork2 & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+cd test\cli\output\rmwork2 & mkdir subdir & echo nested> subdir\deep.txt & bit add . & bit commit -m "Add nested"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+cd test\cli\output\rmwork2 & bit rm subdir\deep.txt
+<<<
+>>> /rm 'subdir\/deep.txt'/
+>>>= 0
+
+# Verify nested file is gone
+if exist test\cli\output\rmwork2\subdir\deep.txt (echo FAIL) else (echo OK file removed)
+<<<
+>>>
+OK file removed
+>>>= 0
+
+# Verify empty parent directory was cleaned up
+if exist test\cli\output\rmwork2\subdir (echo FAIL dir still exists) else (echo OK dir cleaned)
+<<<
+>>>
+OK dir cleaned
+>>>= 0
+
+# ---- rm -r: recursive removal ----
+timeout /t 1 >nul & rmdir /s /q test\cli\output\rmwork3 2>nul & mkdir test\cli\output\rmwork3 & cd test\cli\output\rmwork3 & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+cd test\cli\output\rmwork3 & mkdir mydir & echo a> mydir\a.txt & echo b> mydir\b.txt & bit add . & bit commit -m "Add dir"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+cd test\cli\output\rmwork3 & bit rm -r mydir
+<<<
+>>> /rm 'mydir/
+>>>= 0
+
+# Verify both files are gone from working directory
+if exist test\cli\output\rmwork3\mydir\a.txt (echo FAIL a exists) else (echo OK a removed)
+<<<
+>>>
+OK a removed
+>>>= 0
+
+if exist test\cli\output\rmwork3\mydir\b.txt (echo FAIL b exists) else (echo OK b removed)
+<<<
+>>>
+OK b removed
+>>>= 0
+
+# Verify mydir directory was cleaned up
+if exist test\cli\output\rmwork3\mydir (echo FAIL dir exists) else (echo OK dir cleaned)
+<<<
+>>>
+OK dir cleaned
 >>>= 0
 ```
 
@@ -3561,98 +4103,98 @@ findstr /C:"b" test\cli\work\b.txt >nul
 # Test scan cache feature - skip re-hashing unchanged files
 
 # Setup: fresh repo
-rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit init
+rmdir /s /q test\cli\output\work 2>nul & mkdir test\cli\output\work & cd test\cli\output\work & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
 # Create test files and add them
-cd test\cli\work & echo test1> file1.txt & echo test2> file2.txt & bit add .
+cd test\cli\output\work & echo test1> file1.txt & echo test2> file2.txt & bit add .
 <<<
 >>>= 0
 
 # Verify cache directory was created
-if exist "test\cli\work\.bit\cache\" (echo cache exists) else (echo missing)
+if exist "test\cli\output\work\.bit\cache\" (echo cache exists) else (echo missing)
 <<<
 >>>
 cache exists
 >>>= 0
 
 # Verify cache files were created for each file
-if exist "test\cli\work\.bit\cache\file1.txt" (echo file1 cached) else (echo missing)
+if exist "test\cli\output\work\.bit\cache\file1.txt" (echo file1 cached) else (echo missing)
 <<<
 >>>
 file1 cached
 >>>= 0
 
 # Verify cache file format contains expected fields
-findstr /C:"mtime:" test\cli\work\.bit\cache\file1.txt >nul
+findstr /C:"mtime:" test\cli\output\work\.bit\cache\file1.txt >nul
 <<<
 >>>= 0
 
 # Verify cache contains size field
-findstr /C:"size:" test\cli\work\.bit\cache\file1.txt >nul
+findstr /C:"size:" test\cli\output\work\.bit\cache\file1.txt >nul
 <<<
 >>>= 0
 
 # Verify cache contains hash field
-findstr /C:"hash:" test\cli\work\.bit\cache\file1.txt >nul
+findstr /C:"hash:" test\cli\output\work\.bit\cache\file1.txt >nul
 <<<
 >>>= 0
 
 # Verify cache contains isText field
-findstr /C:"isText:" test\cli\work\.bit\cache\file1.txt >nul
+findstr /C:"isText:" test\cli\output\work\.bit\cache\file1.txt >nul
 <<<
 >>>= 0
 
 # Save original hash for comparison
-cd test\cli\work & findstr "hash:" .bit\cache\file1.txt
+cd test\cli\output\work & findstr "hash:" .bit\cache\file1.txt
 <<<
 >>> /hash: md5:[a-f0-9]+/
 >>>= 0
 
 # Run add again without changes - should use cache (no errors)
-cd test\cli\work & bit add .
+cd test\cli\output\work & bit add .
 <<<
 >>>= 0
 
 # Modify file1.txt
-cd test\cli\work & echo modified content> file1.txt
+cd test\cli\output\work & echo modified content> file1.txt
 <<<
 >>>= 0
 
 # Run add after modification - cache should be updated
-cd test\cli\work & bit add .
+cd test\cli\output\work & bit add .
 <<<
 >>>= 0
 
 # Verify cache was updated with new hash (different from original)
-cd test\cli\work & findstr "hash:" .bit\cache\file1.txt
+cd test\cli\output\work & findstr "hash:" .bit\cache\file1.txt
 <<<
 >>> /hash: md5:[a-f0-9]+/
 >>>= 0
 
 # file2.txt cache should still exist (unchanged file)
-if exist "test\cli\work\.bit\cache\file2.txt" (echo file2 still cached) else (echo missing)
+if exist "test\cli\output\work\.bit\cache\file2.txt" (echo file2 still cached) else (echo missing)
 <<<
 >>>
 file2 still cached
 >>>= 0
 
 # Test cache with subdirectory
-cd test\cli\work & mkdir subdir & echo subfile> subdir\nested.txt & bit add .
+cd test\cli\output\work & mkdir subdir & echo subfile> subdir\nested.txt & bit add .
 <<<
 >>>= 0
 
 # Verify cache was created for nested file
-if exist "test\cli\work\.bit\cache\subdir\nested.txt" (echo nested cached) else (echo missing)
+if exist "test\cli\output\work\.bit\cache\subdir\nested.txt" (echo nested cached) else (echo missing)
 <<<
 >>>
 nested cached
 >>>= 0
 
 # Cleanup
-rmdir /s /q test\cli\work 2>nul
+rmdir /s /q test\cli\output\work 2>nul
 <<<
 >>>= 0
 ```
@@ -3704,7 +4246,7 @@ cleanup() {
 # =============================================================================
 
 # ---- CLEANUP: remove any leftover state from previous runs ----
-timeout /t 1 >nul & rmdir /s /q test\cli\work_skipscan 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_skipscan 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -3715,26 +4257,26 @@ cleanup done
 # ======================================================================
 
 # Create repo with test files
-mkdir test\cli\work_skipscan
+mkdir test\cli\output\work_skipscan
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work_skipscan & bit init
+cd test\cli\output\work_skipscan & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
 # Create multiple files to make scanning detectable
-cd test\cli\work_skipscan & echo file1> file1.txt & echo file2> file2.txt & echo file3> file3.txt & echo file4> file4.txt
+cd test\cli\output\work_skipscan & echo file1> file1.txt & echo file2> file2.txt & echo file3> file3.txt & echo file4> file4.txt
 <<<
 >>>= 0
 
-cd test\cli\work_skipscan & bit add .
+cd test\cli\output\work_skipscan & bit add .
 <<<
 >>>= 0
 
-cd test\cli\work_skipscan & bit commit -m "Initial commit"
+cd test\cli\output\work_skipscan & bit commit -m "Initial commit"
 <<<
 >>> /.*\[main.*\].*/
 >>>= 0
@@ -3744,50 +4286,50 @@ cd test\cli\work_skipscan & bit commit -m "Initial commit"
 # ======================================================================
 
 # ---- Test: log should not scan ----
-cd test\cli\work_skipscan & bit log 2>&1 | findstr /C:"Scanned" >nul
+cd test\cli\output\work_skipscan & bit log 2>&1 | findstr /C:"Scanned" >nul
 <<<
 >>>= 1
 
 # ---- Test: log should show commit history ----
-cd test\cli\work_skipscan & bit log
+cd test\cli\output\work_skipscan & bit log
 <<<
 >>> /Initial commit/
 >>>= 0
 
 # ---- Test: ls-files should not scan ----
-cd test\cli\work_skipscan & bit ls-files 2>&1 | findstr /C:"Scanned" >nul
+cd test\cli\output\work_skipscan & bit ls-files 2>&1 | findstr /C:"Scanned" >nul
 <<<
 >>>= 1
 
 # ---- Test: ls-files should list files ----
-cd test\cli\work_skipscan & bit ls-files
+cd test\cli\output\work_skipscan & bit ls-files
 <<<
 >>> /file1.txt/
 >>>= 0
 
 # ---- Test: ls-files with --stage should not scan ----
-cd test\cli\work_skipscan & bit ls-files --stage 2>&1 | findstr /C:"Scanned" >nul
+cd test\cli\output\work_skipscan & bit ls-files --stage 2>&1 | findstr /C:"Scanned" >nul
 <<<
 >>>= 1
 
 # ---- Test: remote show should not scan (even when no remote configured) ----
-cd test\cli\work_skipscan & bit remote show 2>&1 | findstr /C:"Scanned" >nul
+cd test\cli\output\work_skipscan & bit remote show 2>&1 | findstr /C:"Scanned" >nul
 <<<
 >>>= 1
 
 # ---- Test: remote show should display message when no remote configured ----
-cd test\cli\work_skipscan & bit remote show
+cd test\cli\output\work_skipscan & bit remote show
 <<<
 >>> /No remotes? configured/
 >>>= 0
 
 # ---- Test: verify should not scan ----
-cd test\cli\work_skipscan & bit verify 2>&1 | findstr /C:"Scanned" >nul
+cd test\cli\output\work_skipscan & bit verify 2>&1 | findstr /C:"Scanned" >nul
 <<<
 >>>= 1
 
 # ---- Test: fsck should not scan ----
-cd test\cli\work_skipscan & bit fsck 2>&1 | findstr /C:"Scanned" >nul
+cd test\cli\output\work_skipscan & bit fsck 2>&1 | findstr /C:"Scanned" >nul
 <<<
 >>>= 1
 
@@ -3798,7 +4340,7 @@ cd test\cli\work_skipscan & bit fsck 2>&1 | findstr /C:"Scanned" >nul
 # ---- Test: status should scan (baseline - shows "Scanned" may appear) ----
 # Note: We're not strictly requiring "Scanned" output here because it may be
 # optimized away in the future, but we verify status still works correctly
-cd test\cli\work_skipscan & echo newfile> newfile.txt & bit status
+cd test\cli\output\work_skipscan & echo newfile> newfile.txt & bit status
 <<<
 >>> /newfile.txt|nothing to commit/
 >>>= 0
@@ -3807,7 +4349,7 @@ cd test\cli\work_skipscan & echo newfile> newfile.txt & bit status
 # CLEANUP
 # ======================================================================
 
-timeout /t 1 >nul & rmdir /s /q test\cli\work_skipscan 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_skipscan 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -3824,13 +4366,13 @@ cleanup done
 
 ```text
 # Setup: fresh repo with one file
-rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit init & echo data> file.bin
+rmdir /s /q test\cli\output\work 2>nul & mkdir test\cli\output\work & cd test\cli\output\work & bit init & echo data> file.bin
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
 # Status should show untracked file
-cd test\cli\work & bit status
+cd test\cli\output\work & bit status
 <<<
 >>> /file\.bin/
 >>>= 0
@@ -3857,7 +4399,7 @@ cd test\cli\work & bit status
 # =============================================================================
 
 # ---- CLEANUP: remove any leftover state from previous runs ----
-timeout /t 1 >nul & rmdir /s /q test\cli\work_unicode_remote 2>nul & rmdir /s /q test\cli\fs_unicode_remote 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_unicode_remote 2>nul & rmdir /s /q test\cli\output\fs_unicode_remote 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -3867,23 +4409,23 @@ cleanup done
 # SECTION 1: SETUP
 # ======================================================================
 
-mkdir test\cli\work_unicode_remote
+mkdir test\cli\output\work_unicode_remote
 <<<
 >>>
 >>>= 0
 
-mkdir test\cli\fs_unicode_remote
+mkdir test\cli\output\fs_unicode_remote
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work_unicode_remote & bit init
+cd test\cli\output\work_unicode_remote & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
 # Add filesystem remote (using rclone path syntax to ensure rclone is involved)
-cd test\cli\work_unicode_remote & bit remote add origin ..\fs_unicode_remote
+cd test\cli\output\work_unicode_remote & bit remote add origin ..\fs_unicode_remote
 <<<
 >>> /Remote 'origin' added/
 >>>= 0
@@ -3895,24 +4437,24 @@ cd test\cli\work_unicode_remote & bit remote add origin ..\fs_unicode_remote
 # ---- Create files with ASCII names but Unicode content ----
 # This tests the core functionality: rclone JSON parsing with Unicode in filenames
 # Note: We use ASCII filenames to avoid Windows cmd.exe Unicode handling issues in tests
-cd test\cli\work_unicode_remote & echo שלום Hebrew content> test-hebrew.txt
+cd test\cli\output\work_unicode_remote & echo שלום Hebrew content> test-hebrew.txt
 <<<
 >>>= 0
 
-cd test\cli\work_unicode_remote & echo 中文 Chinese content> test-chinese.txt
+cd test\cli\output\work_unicode_remote & echo 中文 Chinese content> test-chinese.txt
 <<<
 >>>= 0
 
-cd test\cli\work_unicode_remote & echo 😀 Emoji content> test-emoji.txt
+cd test\cli\output\work_unicode_remote & echo 😀 Emoji content> test-emoji.txt
 <<<
 >>>= 0
 
-cd test\cli\work_unicode_remote & echo café 日本語 Mixed> test-mixed.txt
+cd test\cli\output\work_unicode_remote & echo café 日本語 Mixed> test-mixed.txt
 <<<
 >>>= 0
 
 # ---- Add and commit all files ----
-cd test\cli\work_unicode_remote & bit add . & bit commit -m "Add Unicode files"
+cd test\cli\output\work_unicode_remote & bit add . & bit commit -m "Add Unicode files"
 <<<
 >>> /\[main|files? changed/
 >>>= 0
@@ -3920,31 +4462,31 @@ cd test\cli\work_unicode_remote & bit add . & bit commit -m "Add Unicode files"
 # ---- Push to remote (this is where the bug would occur) ----
 # Before the fix, if any file had Unicode in its name, rclone JSON parsing would fail
 # This should succeed without "Failed to parse rclone JSON output" error
-cd test\cli\work_unicode_remote & bit push
+cd test\cli\output\work_unicode_remote & bit push
 <<<
 >>> /Push complete/
 >>>= 0
 
 # ---- Verify files exist at remote ----
-if exist "test\cli\fs_unicode_remote\test-hebrew.txt" (echo hebrew exists) else (echo missing)
+if exist "test\cli\output\fs_unicode_remote\test-hebrew.txt" (echo hebrew exists) else (echo missing)
 <<<
 >>>
 hebrew exists
 >>>= 0
 
-if exist "test\cli\fs_unicode_remote\test-chinese.txt" (echo chinese exists) else (echo missing)
+if exist "test\cli\output\fs_unicode_remote\test-chinese.txt" (echo chinese exists) else (echo missing)
 <<<
 >>>
 chinese exists
 >>>= 0
 
-if exist "test\cli\fs_unicode_remote\test-emoji.txt" (echo emoji exists) else (echo missing)
+if exist "test\cli\output\fs_unicode_remote\test-emoji.txt" (echo emoji exists) else (echo missing)
 <<<
 >>>
 emoji exists
 >>>= 0
 
-if exist "test\cli\fs_unicode_remote\test-mixed.txt" (echo mixed exists) else (echo missing)
+if exist "test\cli\output\fs_unicode_remote\test-mixed.txt" (echo mixed exists) else (echo missing)
 <<<
 >>>
 mixed exists
@@ -3955,36 +4497,36 @@ mixed exists
 # ======================================================================
 
 # ---- Create a new workspace and pull from remote ----
-mkdir test\cli\work_unicode_remote_b
+mkdir test\cli\output\work_unicode_remote_b
 <<<
 >>>
 >>>= 0
 
-cd test\cli\work_unicode_remote_b & bit init
+cd test\cli\output\work_unicode_remote_b & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
-cd test\cli\work_unicode_remote_b & bit remote add origin ..\fs_unicode_remote
+cd test\cli\output\work_unicode_remote_b & bit remote add origin ..\fs_unicode_remote
 <<<
 >>> /Remote 'origin' added/
 >>>= 0
 
 # Pull should succeed and parse rclone JSON correctly
 # Before the fix, this would fail with "Failed to parse rclone JSON output"
-cd test\cli\work_unicode_remote_b & bit pull
+cd test\cli\output\work_unicode_remote_b & bit pull
 <<<
 >>> /Pull|Updating/
 >>>= 0
 
 # Verify files were pulled correctly
-if exist "test\cli\work_unicode_remote_b\test-hebrew.txt" (echo hebrew pulled) else (echo missing)
+if exist "test\cli\output\work_unicode_remote_b\test-hebrew.txt" (echo hebrew pulled) else (echo missing)
 <<<
 >>>
 hebrew pulled
 >>>= 0
 
-if exist "test\cli\work_unicode_remote_b\test-chinese.txt" (echo chinese pulled) else (echo missing)
+if exist "test\cli\output\work_unicode_remote_b\test-chinese.txt" (echo chinese pulled) else (echo missing)
 <<<
 >>>
 chinese pulled
@@ -3994,7 +4536,7 @@ chinese pulled
 # CLEANUP
 # ======================================================================
 
-timeout /t 1 >nul & rmdir /s /q test\cli\work_unicode_remote 2>nul & rmdir /s /q test\cli\work_unicode_remote_b 2>nul & rmdir /s /q test\cli\fs_unicode_remote 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_unicode_remote 2>nul & rmdir /s /q test\cli\output\work_unicode_remote_b 2>nul & rmdir /s /q test\cli\output\fs_unicode_remote 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -4021,14 +4563,14 @@ cleanup done
 # is not in UTF-8 mode, but core functionality (tracking Unicode files) works.
 
 # Setup: clean environment and initialize repo
-rmdir /s /q test\cli\work 2>nul & mkdir test\cli\work & cd test\cli\work & bit init
+rmdir /s /q test\cli\output\work 2>nul & mkdir test\cli\output\work & cd test\cli\output\work & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
 
 # TEST 1: Verify core.quotePath was set to "false" (enables Unicode filenames)
 # This is the primary test - ensures git won't quote non-ASCII filenames
-cd test\cli\work & git -C .bit\index config --get core.quotePath
+cd test\cli\output\work & git -C .bit\index config --get core.quotePath
 <<<
 >>>
 false
@@ -4036,46 +4578,46 @@ false
 
 # TEST 2: Create a file with Hebrew characters in the name
 # Hebrew: שלום (shalom, means "hello/peace")
-cd test\cli\work & echo test content> test-hebrew.txt
+cd test\cli\output\work & echo test content> test-hebrew.txt
 <<<
 >>>= 0
 
 # TEST 3: Add the Hebrew filename - should work without quoting issues
-cd test\cli\work & bit add test-hebrew.txt
+cd test\cli\output\work & bit add test-hebrew.txt
 <<<
 >>>= 0
 
 # TEST 4: Verify git ls-files works (file is tracked)
-cd test\cli\work & git -C .bit\index ls-files
+cd test\cli\output\work & git -C .bit\index ls-files
 <<<
 >>> /test-hebrew.txt/
 >>>= 0
 
 # TEST 5: Commit the file
-cd test\cli\work & bit commit -m "Add test file"
+cd test\cli\output\work & bit commit -m "Add test file"
 <<<
 >>> /\[main|file/
 >>>= 0
 
 # TEST 6: Verify status shows clean (no encoding issues)
-cd test\cli\work & bit status
+cd test\cli\output\work & bit status
 <<<
 >>> /nothing to commit|working tree clean/
 >>>= 0
 
 # TEST 7: Create another test file
-cd test\cli\work & echo mixed> test-mixed.txt
+cd test\cli\output\work & echo mixed> test-mixed.txt
 <<<
 >>>= 0
 
 # TEST 8: Add and commit the file
-cd test\cli\work & bit add test-mixed.txt & bit commit -m "Mixed Unicode"
+cd test\cli\output\work & bit add test-mixed.txt & bit commit -m "Mixed Unicode"
 <<<
 >>> /\[main|file/
 >>>= 0
 
 # TEST 9: Verify git log works
-cd test\cli\work & git -C .bit\index log --oneline
+cd test\cli\output\work & git -C .bit\index log --oneline
 <<<
 >>> /Mixed Unicode/
 >>>= 0
@@ -4090,220 +4632,220 @@ cd test\cli\work & git -C .bit\index log --oneline
 *Source file.*
 
 ```text
-# =============================================================================
-# Upstream Tracking Tests
-#
-# Tests git-standard upstream tracking behavior:
-# - bit remote add does NOT auto-set upstream (even for "origin")
-# - bit push -u / --set-upstream sets upstream and pushes
-# - bit push/pull/fetch <remote> works without setting upstream
-# - Clear error messages when no upstream configured
-# =============================================================================
-
-# ---- CLEANUP: remove any leftover state from previous runs ----
-timeout /t 1 >nul & rmdir /s /q test\cli\upstream-local 2>nul & rmdir /s /q test\cli\upstream-local2 2>nul & rmdir /s /q test\cli\upstream-local3 2>nul & rmdir /s /q test\cli\upstream-local4 2>nul & rmdir /s /q test\cli\upstream-remote 2>nul & rmdir /s /q test\cli\upstream-remote3 2>nul & rmdir /s /q test\cli\upstream-remote4 2>nul & echo cleanup done
-<<<
->>>
-cleanup done
->>>= 0
-
-# ======================================================================
-# SECTION 1: SETUP AND BASIC TESTS
-# ======================================================================
-
-# Setup: Create local repo
-rmdir /s /q test\cli\upstream-local 2>nul & mkdir test\cli\upstream-local & cd test\cli\upstream-local & bit init
-<<<
->>> /.*[Ii]nitialized.*/
->>>= 0
-
-# Setup: Create remote repo (filesystem)
-rmdir /s /q test\cli\upstream-remote 2>nul & mkdir test\cli\upstream-remote & cd test\cli\upstream-remote & bit init
-<<<
->>> /.*[Ii]nitialized.*/
->>>= 0
-
-# Add remote (should NOT auto-set upstream, even for "origin")
-cd test\cli\upstream-local & bit remote add origin ..\upstream-remote
-<<<
->>> /Remote 'origin' added/
->>>= 0
-
-# Check branch.main.remote is NOT set (git config will fail)
-cd test\cli\upstream-local & git -C .bit\index config --get branch.main.remote 2>nul
-<<<
->>>
->>>= 1
-
-# Create initial commit in local
-cd test\cli\upstream-local & echo hello> test.txt & bit add test.txt & bit commit -m "Initial commit"
-<<<
->>> /\[master|main|files? changed/
->>>= 0
-
-# Test 1: bit push without upstream but with "origin" uses origin as fallback (git behavior)
-cd test\cli\upstream-local & bit push
-<<<
->>> /Push complete/
->>>= 0
-
-# Test 2: bit push <remote> should work without setting upstream
-cd test\cli\upstream-local & bit push origin
-<<<
->>> /Push complete/
->>>= 0
-
-# Verify upstream is still NOT set
-cd test\cli\upstream-local & git -C .bit\index config --get branch.main.remote 2>nul
-<<<
->>>
->>>= 1
-
-# Create second commit
-cd test\cli\upstream-local & echo world> test2.txt & bit add test2.txt & bit commit -m "Second commit"
-<<<
->>> /\[master|main|files? changed/
->>>= 0
-
-# Test 3: bit push -u <remote> should push and set upstream
-cd test\cli\upstream-local & bit push -u origin
-<<<
->>> /branch 'main' set up to track 'origin\/main'/
->>>= 0
-
-# Verify upstream IS now set
-cd test\cli\upstream-local & git -C .bit\index config --get branch.main.remote
-<<<
->>>
-origin
->>>= 0
-
-# Test 4: After -u, plain bit push should work
-cd test\cli\upstream-local & echo more> test3.txt & bit add test3.txt & bit commit -m "Third commit"
-<<<
->>> /\[master|main|files? changed/
->>>= 0
-
-cd test\cli\upstream-local & bit push
-<<<
->>> /Push complete/
->>>= 0
-
-# Setup for pull/fetch test: Create second local repo without upstream
-rmdir /s /q test\cli\upstream-local2 2>nul & mkdir test\cli\upstream-local2 & cd test\cli\upstream-local2 & bit init
-<<<
->>> /.*[Ii]nitialized.*/
->>>= 0
-
-cd test\cli\upstream-local2 & bit remote add origin ..\upstream-remote
-<<<
->>> /Remote 'origin' added/
->>>= 0
-
-# Test 5: bit fetch <remote> should work without setting upstream
-cd test\cli\upstream-local2 & bit fetch origin 2>&1
-<<<
->>> /From origin/
->>>= 0
-
-# Verify upstream still NOT set
-cd test\cli\upstream-local2 & git -C .bit\index config --get branch.main.remote 2>nul
-<<<
->>>
->>>= 1
-
-# Test 6: bit pull <remote> works without setting upstream
-cd test\cli\upstream-local2 & bit pull origin
-<<<
->>> /Pull complete|Syncing binaries/
->>>= 0
-
-# Verify upstream still NOT set after pull (git pull doesn't auto-set tracking)
-cd test\cli\upstream-local2 & git -C .bit\index config --get branch.main.remote 2>nul
-<<<
->>>
->>>= 1
-
-# Test 7: bit push --set-upstream <remote> is equivalent to -u
-rmdir /s /q test\cli\upstream-local3 2>nul & mkdir test\cli\upstream-local3 & cd test\cli\upstream-local3 & bit init
-<<<
->>> /.*[Ii]nitialized.*/
->>>= 0
-
-# Create separate remote for this test
-rmdir /s /q test\cli\upstream-remote3 2>nul & mkdir test\cli\upstream-remote3 & cd test\cli\upstream-remote3 & bit init
-<<<
->>> /.*[Ii]nitialized.*/
->>>= 0
-
-cd test\cli\upstream-local3 & bit remote add myremote ..\upstream-remote3
-<<<
->>> /Remote 'myremote' added/
->>>= 0
-
-cd test\cli\upstream-local3 & echo test> file.txt & bit add file.txt & bit commit -m "Test commit"
-<<<
->>> /\[master|main|files? changed/
->>>= 0
-
-cd test\cli\upstream-local3 & bit push --set-upstream myremote
-<<<
->>> /branch 'main' set up to track 'myremote\/main'/
->>>= 0
-
-# Verify upstream is set to myremote (not origin)
-cd test\cli\upstream-local3 & git -C .bit\index config --get branch.main.remote
-<<<
->>>
-myremote
->>>= 0
-
-# Test 8: bit push fails with clear error when no upstream and no origin
-rmdir /s /q test\cli\upstream-local4 2>nul & mkdir test\cli\upstream-local4 & cd test\cli\upstream-local4 & bit init
-<<<
->>> /.*[Ii]nitialized.*/
->>>= 0
-
-# Create separate remote for this test
-rmdir /s /q test\cli\upstream-remote4 2>nul & mkdir test\cli\upstream-remote4 & cd test\cli\upstream-remote4 & bit init
-<<<
->>> /.*[Ii]nitialized.*/
->>>= 0
-
-cd test\cli\upstream-local4 & bit remote add foo ..\upstream-remote4
-<<<
->>> /Remote 'foo' added/
->>>= 0
-
-cd test\cli\upstream-local4 & echo test> file.txt & bit add file.txt & bit commit -m "Test"
-<<<
->>> /\[master|main|files? changed/
->>>= 0
-
-cd test\cli\upstream-local4 & bit push 2>&1
-<<<
->>> /fatal: No upstream configured/
->>>= 1
-
-cd test\cli\upstream-local4 & bit push 2>&1
-<<<
->>> /hint: bit push <remote>/
->>>= 1
-
-cd test\cli\upstream-local4 & bit push 2>&1
-<<<
->>> /hint: bit push -u <remote>/
->>>= 1
-
-# ======================================================================
-# CLEANUP
-# ======================================================================
-
-timeout /t 1 >nul & rmdir /s /q test\cli\upstream-local 2>nul & rmdir /s /q test\cli\upstream-local2 2>nul & rmdir /s /q test\cli\upstream-local3 2>nul & rmdir /s /q test\cli\upstream-local4 2>nul & rmdir /s /q test\cli\upstream-remote 2>nul & rmdir /s /q test\cli\upstream-remote3 2>nul & rmdir /s /q test\cli\upstream-remote4 2>nul & echo cleanup done
-<<<
->>>
-cleanup done
->>>= 0
+# =============================================================================
+# Upstream Tracking Tests
+#
+# Tests git-standard upstream tracking behavior:
+# - bit remote add does NOT auto-set upstream (even for "origin")
+# - bit push -u / --set-upstream sets upstream and pushes
+# - bit push/pull/fetch <remote> works without setting upstream
+# - Clear error messages when no upstream configured
+# =============================================================================
+
+# ---- CLEANUP: remove any leftover state from previous runs ----
+timeout /t 1 >nul & rmdir /s /q test\cli\output\upstream-local 2>nul & rmdir /s /q test\cli\output\upstream-local2 2>nul & rmdir /s /q test\cli\output\upstream-local3 2>nul & rmdir /s /q test\cli\output\upstream-local4 2>nul & rmdir /s /q test\cli\output\upstream-remote 2>nul & rmdir /s /q test\cli\output\upstream-remote3 2>nul & rmdir /s /q test\cli\output\upstream-remote4 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
+>>>= 0
+
+# ======================================================================
+# SECTION 1: SETUP AND BASIC TESTS
+# ======================================================================
+
+# Setup: Create local repo
+rmdir /s /q test\cli\output\upstream-local 2>nul & mkdir test\cli\output\upstream-local & cd test\cli\output\upstream-local & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+# Setup: Create remote repo (filesystem)
+rmdir /s /q test\cli\output\upstream-remote 2>nul & mkdir test\cli\output\upstream-remote & cd test\cli\output\upstream-remote & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+# Add remote (should NOT auto-set upstream, even for "origin")
+cd test\cli\output\upstream-local & bit remote add origin ..\upstream-remote
+<<<
+>>> /Remote 'origin' added/
+>>>= 0
+
+# Check branch.main.remote is NOT set (git config will fail)
+cd test\cli\output\upstream-local & git -C .bit\index config --get branch.main.remote 2>nul
+<<<
+>>>
+>>>= 1
+
+# Create initial commit in local
+cd test\cli\output\upstream-local & echo hello> test.txt & bit add test.txt & bit commit -m "Initial commit"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+# Test 1: bit push without upstream but with "origin" uses origin as fallback (git behavior)
+cd test\cli\output\upstream-local & bit push
+<<<
+>>> /Push complete/
+>>>= 0
+
+# Test 2: bit push <remote> should work without setting upstream
+cd test\cli\output\upstream-local & bit push origin
+<<<
+>>> /Push complete/
+>>>= 0
+
+# Verify upstream is still NOT set
+cd test\cli\output\upstream-local & git -C .bit\index config --get branch.main.remote 2>nul
+<<<
+>>>
+>>>= 1
+
+# Create second commit
+cd test\cli\output\upstream-local & echo world> test2.txt & bit add test2.txt & bit commit -m "Second commit"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+# Test 3: bit push -u <remote> should push and set upstream
+cd test\cli\output\upstream-local & bit push -u origin
+<<<
+>>> /branch 'main' set up to track 'origin\/main'/
+>>>= 0
+
+# Verify upstream IS now set
+cd test\cli\output\upstream-local & git -C .bit\index config --get branch.main.remote
+<<<
+>>>
+origin
+>>>= 0
+
+# Test 4: After -u, plain bit push should work
+cd test\cli\output\upstream-local & echo more> test3.txt & bit add test3.txt & bit commit -m "Third commit"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+cd test\cli\output\upstream-local & bit push
+<<<
+>>> /Push complete/
+>>>= 0
+
+# Setup for pull/fetch test: Create second local repo without upstream
+rmdir /s /q test\cli\output\upstream-local2 2>nul & mkdir test\cli\output\upstream-local2 & cd test\cli\output\upstream-local2 & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+cd test\cli\output\upstream-local2 & bit remote add origin ..\upstream-remote
+<<<
+>>> /Remote 'origin' added/
+>>>= 0
+
+# Test 5: bit fetch <remote> should work without setting upstream
+cd test\cli\output\upstream-local2 & bit fetch origin 2>&1
+<<<
+>>> /From origin/
+>>>= 0
+
+# Verify upstream still NOT set
+cd test\cli\output\upstream-local2 & git -C .bit\index config --get branch.main.remote 2>nul
+<<<
+>>>
+>>>= 1
+
+# Test 6: bit pull <remote> works without setting upstream
+cd test\cli\output\upstream-local2 & bit pull origin
+<<<
+>>> /Pull complete|Syncing binaries/
+>>>= 0
+
+# Verify upstream still NOT set after pull (git pull doesn't auto-set tracking)
+cd test\cli\output\upstream-local2 & git -C .bit\index config --get branch.main.remote 2>nul
+<<<
+>>>
+>>>= 1
+
+# Test 7: bit push --set-upstream <remote> is equivalent to -u
+rmdir /s /q test\cli\output\upstream-local3 2>nul & mkdir test\cli\output\upstream-local3 & cd test\cli\output\upstream-local3 & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+# Create separate remote for this test
+rmdir /s /q test\cli\output\upstream-remote3 2>nul & mkdir test\cli\output\upstream-remote3 & cd test\cli\output\upstream-remote3 & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+cd test\cli\output\upstream-local3 & bit remote add myremote ..\upstream-remote3
+<<<
+>>> /Remote 'myremote' added/
+>>>= 0
+
+cd test\cli\output\upstream-local3 & echo test> file.txt & bit add file.txt & bit commit -m "Test commit"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+cd test\cli\output\upstream-local3 & bit push --set-upstream myremote
+<<<
+>>> /branch 'main' set up to track 'myremote\/main'/
+>>>= 0
+
+# Verify upstream is set to myremote (not origin)
+cd test\cli\output\upstream-local3 & git -C .bit\index config --get branch.main.remote
+<<<
+>>>
+myremote
+>>>= 0
+
+# Test 8: bit push fails with clear error when no upstream and no origin
+rmdir /s /q test\cli\output\upstream-local4 2>nul & mkdir test\cli\output\upstream-local4 & cd test\cli\output\upstream-local4 & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+# Create separate remote for this test
+rmdir /s /q test\cli\output\upstream-remote4 2>nul & mkdir test\cli\output\upstream-remote4 & cd test\cli\output\upstream-remote4 & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+cd test\cli\output\upstream-local4 & bit remote add foo ..\upstream-remote4
+<<<
+>>> /Remote 'foo' added/
+>>>= 0
+
+cd test\cli\output\upstream-local4 & echo test> file.txt & bit add file.txt & bit commit -m "Test"
+<<<
+>>> /\[master|main|files? changed/
+>>>= 0
+
+cd test\cli\output\upstream-local4 & bit push 2>&1
+<<<
+>>> /fatal: No upstream configured/
+>>>= 1
+
+cd test\cli\output\upstream-local4 & bit push 2>&1
+<<<
+>>> /hint: bit push <remote>/
+>>>= 1
+
+cd test\cli\output\upstream-local4 & bit push 2>&1
+<<<
+>>> /hint: bit push -u <remote>/
+>>>= 1
+
+# ======================================================================
+# CLEANUP
+# ======================================================================
+
+timeout /t 1 >nul & rmdir /s /q test\cli\output\upstream-local 2>nul & rmdir /s /q test\cli\output\upstream-local2 2>nul & rmdir /s /q test\cli\output\upstream-local3 2>nul & rmdir /s /q test\cli\output\upstream-local4 2>nul & rmdir /s /q test\cli\output\upstream-remote 2>nul & rmdir /s /q test\cli\output\upstream-remote3 2>nul & rmdir /s /q test\cli\output\upstream-remote4 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
+>>>= 0
 ```
 
 ---
@@ -4324,7 +4866,7 @@ cleanup done
 # =============================================================================
 
 # ---- CLEANUP: remove any leftover state from previous runs ----
-timeout /t 1 >nul & rmdir /s /q test\cli\work_verify_progress 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_verify_progress 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
@@ -4334,13 +4876,13 @@ cleanup done
 # SETUP
 # ======================================================================
 
-mkdir test\cli\work_verify_progress
+mkdir test\cli\output\work_verify_progress
 <<<
 >>>
 >>>= 0
 
 # Initialize repo with multiple files
-cd test\cli\work_verify_progress & bit init
+cd test\cli\output\work_verify_progress & bit init
 <<<
 >>> /.*[Ii]nitialized.*/
 >>>= 0
@@ -4349,7 +4891,7 @@ cd test\cli\work_verify_progress & bit init
 # TEST: Verify with no files (edge case)
 # ======================================================================
 
-cd test\cli\work_verify_progress & bit verify
+cd test\cli\output\work_verify_progress & bit verify
 <<<
 >>> /\[OK\] All 0 files match|All.*files match/
 >>>= 0
@@ -4359,13 +4901,13 @@ cd test\cli\work_verify_progress & bit verify
 # ======================================================================
 
 # Add several files to trigger progress code path (need >5 files)
-cd test\cli\work_verify_progress & echo file1> f1.txt & echo file2> f2.txt & echo file3> f3.txt & echo file4> f4.txt & echo file5> f5.txt & echo file6> f6.txt & bit add . & bit commit -m "Add files"
+cd test\cli\output\work_verify_progress & echo file1> f1.txt & echo file2> f2.txt & echo file3> f3.txt & echo file4> f4.txt & echo file5> f5.txt & echo file6> f6.txt & bit add . & bit commit -m "Add files"
 <<<
 >>> /\[main|files? changed/
 >>>= 0
 
 # Verify should succeed with all files matching
-cd test\cli\work_verify_progress & bit verify
+cd test\cli\output\work_verify_progress & bit verify
 <<<
 >>> /\[OK\] All.*files match/
 >>>= 0
@@ -4375,13 +4917,13 @@ cd test\cli\work_verify_progress & bit verify
 # ======================================================================
 
 # Corrupt a file
-cd test\cli\work_verify_progress & echo corrupted> f1.txt
+cd test\cli\output\work_verify_progress & echo corrupted> f1.txt
 <<<
 >>>
 >>>= 0
 
 # Verify should detect mismatch
-cd test\cli\work_verify_progress & bit verify
+cd test\cli\output\work_verify_progress & bit verify
 <<<
 >>> /Checked.*files.*issues found|hash mismatch/
 >>>= 0
@@ -4391,13 +4933,13 @@ cd test\cli\work_verify_progress & bit verify
 # ======================================================================
 
 # Restore f1.txt and delete f2.txt
-cd test\cli\work_verify_progress & echo file1> f1.txt & del f2.txt
+cd test\cli\output\work_verify_progress & echo file1> f1.txt & del f2.txt
 <<<
 >>>
 >>>= 0
 
 # Verify should detect missing file
-cd test\cli\work_verify_progress & bit verify
+cd test\cli\output\work_verify_progress & bit verify
 <<<
 >>> /Checked.*files.*issues found|Missing/
 >>>= 0
@@ -4407,25 +4949,194 @@ cd test\cli\work_verify_progress & bit verify
 # ======================================================================
 
 # Restore f2.txt (it was deleted earlier)
-cd test\cli\work_verify_progress & echo file2> f2.txt
+cd test\cli\output\work_verify_progress & echo file2> f2.txt
 <<<
 >>>
 >>>= 0
 
-# Fsck with progress code - exits 1 if issues found, 0 if OK
-cd test\cli\work_verify_progress & bit fsck
+# Fsck is a passthrough to git fsck — exits 0 on a healthy repo
+cd test\cli\output\work_verify_progress & bit fsck
 <<<
->>>2 /\[1\/2\]|OK|Issues found/
->>>=
+>>>= 0
 
 # ======================================================================
 # CLEANUP
 # ======================================================================
 
-timeout /t 1 >nul & rmdir /s /q test\cli\work_verify_progress 2>nul & echo cleanup done
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_verify_progress 2>nul & echo cleanup done
 <<<
 >>>
 cleanup done
+>>>= 0
+```
+
+---
+
+## test/cli/verify-remote.test
+
+**Path:** `test/cli/verify-remote.test`
+
+*Source file.*
+
+```text
+# bit verify --remote tests (filesystem remotes)
+# Verifies that verify --remote works for filesystem remotes by scanning
+# the remote working directory instead of using the cloud bundle path.
+
+# ---- CLEANUP ----
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_vr 2>nul & rmdir /s /q test\cli\output\remote_vr 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
+>>>= 0
+
+# ======================================================================
+# SETUP: init, add remote, add files, commit, push
+# ======================================================================
+
+mkdir test\cli\output\work_vr & mkdir test\cli\output\remote_vr & cd test\cli\output\work_vr & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+cd test\cli\output\work_vr & bit remote add origin ..\remote_vr
+<<<
+>>> /Remote.*added/
+>>>= 0
+
+cd test\cli\output\work_vr & echo hello> greet.txt & echo binarydata> data.bin & bit add greet.txt data.bin & bit commit -m "Add files"
+<<<
+>>> /\[main|files? changed/
+>>>= 0
+
+cd test\cli\output\work_vr & bit push
+<<<
+>>> /Push complete/
+>>>= 0
+
+# ======================================================================
+# TEST: Clean verify — all files match
+# ======================================================================
+
+cd test\cli\output\work_vr & bit verify --remote
+<<<
+>>> /\[OK\] All [0-9]+ files match metadata/
+>>>= 0
+
+# ======================================================================
+# TEST: Corrupted file — hash mismatch detected
+# ======================================================================
+
+cd test\cli\output\remote_vr & echo corrupted> data.bin
+<<<
+>>>
+>>>= 0
+
+cd test\cli\output\work_vr & bit verify --remote
+<<<
+>>>2 /\[ERROR\] Hash mismatch.*data\.bin/
+>>>= 0
+
+# ======================================================================
+# TEST: Missing file — detected
+# ======================================================================
+
+cd test\cli\output\remote_vr & del greet.txt
+<<<
+>>>
+>>>= 0
+
+cd test\cli\output\work_vr & bit verify --remote
+<<<
+>>>2 /\[ERROR\] Missing.*greet\.txt/
+>>>= 0
+
+# ---- CLEANUP ----
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_vr 2>nul & rmdir /s /q test\cli\output\remote_vr 2>nul & echo cleanup done
+<<<
+>>>
+cleanup done
+>>>= 0
+```
+
+---
+
+## test/cli/verify.test
+
+**Path:** `test/cli/verify.test`
+
+*Source file.*
+
+```text
+# bit verify tests — verify files match committed metadata (scan + git diff)
+
+# --- verify on fresh repo: nothing to check ---
+rmdir /s /q test\cli\output\work_verify 2>nul & mkdir test\cli\output\work_verify & cd test\cli\output\work_verify & bit init
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+cd test\cli\output\work_verify & bit verify
+<<<
+>>> /All.*0.*files match/
+>>>= 0
+
+# --- verify on repo with committed files: all OK ---
+rmdir /s /q test\cli\output\work_verify 2>nul & mkdir test\cli\output\work_verify & cd test\cli\output\work_verify & bit init & echo hello> a.txt & bit add a.txt & bit commit -m "Add a"
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+cd test\cli\output\work_verify & bit verify
+<<<
+>>> /All.*files match/
+>>>= 0
+
+# --- verify detects corrupted binary file ---
+rmdir /s /q test\cli\output\work_verify 2>nul & mkdir test\cli\output\work_verify & cd test\cli\output\work_verify & bit init & echo original> file.bin & bit add file.bin & bit commit -m "Add file"
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+cd test\cli\output\work_verify & echo corrupted> file.bin
+<<<
+>>>
+>>>= 0
+
+cd test\cli\output\work_verify & bit verify
+<<<
+>>> /issues found|hash mismatch|file\.bin/
+>>>= 0
+
+# --- verify detects corrupted file even after scan (stale metadata regression) ---
+cd test\cli\output\work_verify & bit status
+<<<
+>>>= 0
+
+cd test\cli\output\work_verify & bit verify
+<<<
+>>> /issues found|hash mismatch|file\.bin/
+>>>= 0
+
+# --- verify detects missing file ---
+rmdir /s /q test\cli\output\work_verify 2>nul & mkdir test\cli\output\work_verify & cd test\cli\output\work_verify & bit init & echo x> missing.txt & bit add missing.txt & bit commit -m "Add missing"
+<<<
+>>> /.*[Ii]nitialized.*/
+>>>= 0
+
+del test\cli\output\work_verify\missing.txt
+<<<
+>>>
+>>>= 0
+
+cd test\cli\output\work_verify & bit verify
+<<<
+>>> /issues found|missing|missing\.txt/
+>>>= 0
+
+# --- cleanup ---
+timeout /t 1 >nul & rmdir /s /q test\cli\output\work_verify 2>nul
+<<<
 >>>= 0
 ```
 
