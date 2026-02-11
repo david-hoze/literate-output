@@ -2165,6 +2165,7 @@ bit/Commands.hs → Bit.hs → Internal/Transport.hs → rclone (only here!)
 | `Resolution` | `bit.Conflict` | KeepLocal or TakeRemote — conflict resolution choice |
 | `DeletedSide` | `bit.Conflict` | DeletedInOurs or DeletedInTheirs — which side deleted in modify/delete conflict |
 | `ConflictInfo` | `bit.Conflict` | ContentConflict, ModifyDelete path DeletedSide, AddAdd — conflict type from git ls-files -u |
+| `NameStatusChange` | `Internal.Git` | Added, Deleted, Modified, Renamed, Copied — parsed `git diff --name-status` output (replaces bare `(Char, FilePath, Maybe FilePath)` tuple) |
 | `VerifyTarget` | `bit.Core.Verify` | VerifyLocal or VerifyRemote — whether verify checks local or remote |
 | `DeviceInfo` | `bit.Device` | UUID + storage type + optional hardware serial |
 | `RemoteTarget` | `bit.Device` | TargetCloud, TargetDevice, TargetLocalPath |
