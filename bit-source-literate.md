@@ -883,7 +883,7 @@ finallyC action cleanup = UnsafeConcurrentIO $
 
 module Bit.Conflict
   ( Resolution(..)
-  , DeletedSide(..)
+  , DeletedSide(..)  -- re-exported from Internal.Git
   , ConflictInfo(..)
   , resolveConflict
   , resolveAll
@@ -898,17 +898,12 @@ import Text.Read (readMaybe)
 import Control.Monad (void, when)
 import System.Exit (ExitCode(..))
 import qualified Internal.Git as Git
+import Internal.Git (DeletedSide(..))
 import System.IO (hPutStrLn, stderr, hFlush, stdout)
 import Bit.Internal.Metadata (MetaContent(..), parseMetadata, displayHash)
 
 -- | A conflict resolution choice: keep local or take remote.
 data Resolution = KeepLocal | TakeRemote
-  deriving (Show, Eq)
-
--- | Which side deleted the file in a modify/delete conflict.
-data DeletedSide
-  = DeletedInOurs   -- ^ Deleted in HEAD (ours); modified in origin/main (theirs)
-  | DeletedInTheirs -- ^ Deleted in origin/main (theirs); modified in HEAD (ours)
   deriving (Show, Eq)
 
 -- | Conflict type (mirrors Internal.Git.ConflictType but doesn't depend on IO module).
@@ -7948,6 +7943,7 @@ module Internal.Git
     , runGitWithOutput
     , runGitAt
     , rewriteGitHints
+    , DeletedSide(..)
     , ConflictType(..)
     , readFileFromRef
     , listFilesInRef
@@ -8283,11 +8279,17 @@ getConflictedFiles = do
     ExitSuccess -> filter (not . null) (lines out)
     _ -> []
 
+-- | Which side deleted the file in a modify/delete conflict.
+data DeletedSide
+  = DeletedInOurs   -- ^ Deleted in HEAD (ours); modified in theirs
+  | DeletedInTheirs -- ^ Deleted in theirs; modified in HEAD (ours)
+  deriving (Show, Eq)
+
 -- | Conflict type for Git-like messages. Path is work-tree relative (e.g. index/src/model.bin).
 data ConflictType
-  = ContentConflict FilePath   -- both modified
-  | ModifyDelete FilePath Bool -- True = deleted in HEAD (ours)
-  | AddAdd FilePath            -- both added different
+  = ContentConflict FilePath
+  | ModifyDelete FilePath DeletedSide
+  | AddAdd FilePath
   deriving (Show, Eq)
 
 -- | Determine conflict type using git ls-files -u. Path is as in index (e.g. index/foo).
@@ -8308,8 +8310,8 @@ getConflictType path = do
   let has3 = 3 `elem` stageNums
   pure $ if | has2 && has3 && has1     -> ContentConflict path
             | has2 && has3 && not has1 -> AddAdd path
-            | has2 && not has3         -> ModifyDelete path False  -- deleted in theirs
-            | has3 && not has2         -> ModifyDelete path True   -- deleted in ours (HEAD)
+            | has2 && not has3         -> ModifyDelete path DeletedInTheirs
+            | has3 && not has2         -> ModifyDelete path DeletedInOurs
             | otherwise                -> ContentConflict path
 
 -- | Check out our version for path (work-tree path under .rgit/index).

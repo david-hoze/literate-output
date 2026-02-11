@@ -2163,7 +2163,7 @@ bit/Commands.hs → Bit.hs → Internal/Transport.hs → rclone (only here!)
 | `RcloneAction` | `bit.Plan` | Copy, Move, Delete, Swap — concrete rclone operations |
 | `FileIndex` | `bit.Diff` | Dual-indexed file map (byPath + byHash) for efficient diff/rename detection |
 | `Resolution` | `bit.Conflict` | KeepLocal or TakeRemote — conflict resolution choice |
-| `DeletedSide` | `bit.Conflict` | DeletedInOurs or DeletedInTheirs — which side deleted in modify/delete conflict |
+| `DeletedSide` | `Internal.Git` (re-exported by `bit.Conflict`) | DeletedInOurs or DeletedInTheirs — which side deleted in modify/delete conflict |
 | `ConflictInfo` | `bit.Conflict` | ContentConflict, ModifyDelete path DeletedSide, AddAdd — conflict type from git ls-files -u |
 | `NameStatusChange` | `Internal.Git` | Added, Deleted, Modified, Renamed, Copied — parsed `git diff --name-status` output (replaces bare `(Char, FilePath, Maybe FilePath)` tuple) |
 | `DivergentFile` | `bit.Core.Pull` | Record for remote divergence: path, expected/actual hash and size (replaces bare 5-tuple) |
