@@ -1298,7 +1298,7 @@ module Bit.Core.Fetch
 
 import qualified System.Directory as Dir
 import System.FilePath ((</>))
-import Control.Monad (when)
+import Control.Monad (when, void)
 import System.Exit (ExitCode(..), exitWith)
 import qualified Internal.Git as Git
 import qualified Internal.Transport as Transport
@@ -1307,11 +1307,11 @@ import Bit.Remote (Remote, remoteName, remoteUrl, RemoteState(..), FetchResult(.
 import Bit.Types (BitM, BitEnv(..))
 import Control.Monad.Trans.Reader (asks)
 import Control.Monad.IO.Class (liftIO)
-import Internal.Config (fromCwdPath, bundleCwdPath, fetchedBundle)
-import Bit.Core.Helpers (getRemoteTargetType, withRemote, safeRemove, checkFilesystemRemoteIsRepo)
+import Internal.Config (fromCwdPath, bundleCwdPath, fetchedBundle, bundleGitRelPath, fromGitRelPath)
+import Bit.Core.Helpers (getRemoteType, withRemote, safeRemove, checkFilesystemRemoteIsRepo)
 import qualified Bit.Device as Device
 import System.Directory (copyFile)
-import Control.Monad (void)
+import Bit.Utils (trimGitOutput)
 
 -- ============================================================================
 -- Types
@@ -1331,11 +1331,11 @@ data FetchOutcome
 fetch :: BitM ()
 fetch = withRemote $ \remote -> do
     cwd <- asks envCwd
-    
+
     -- Determine if this is a filesystem or cloud remote
-    mTarget <- liftIO $ getRemoteTargetType cwd (remoteName remote)
-    case mTarget of
-        Just t | Device.isFilesystemTarget t -> liftIO $ filesystemFetch cwd remote
+    mType <- liftIO $ getRemoteType cwd (remoteName remote)
+    case mType of
+        Just t | Device.isFilesystemType t -> liftIO $ filesystemFetch cwd remote
         _ -> cloudFetch remote  -- Cloud remote or no target info (use cloud flow)
 
 -- | Fetch from a cloud remote (original flow, unchanged).
@@ -1345,29 +1345,29 @@ cloudFetch remote = do
     outcome <- liftIO $ saveFetchedBundle remote mb
     liftIO $ renderFetchOutcome remote outcome
 
--- | Fetch from a filesystem remote. Fetches commits without merging or syncing files.
+-- | Fetch from a filesystem remote using named git remote.
 filesystemFetch :: FilePath -> Remote -> IO ()
 filesystemFetch _cwd remote = do
-    let remotePath = remoteUrl remote
+    let name = remoteName remote
+        remotePath = remoteUrl remote
     putStrLn $ "Fetching from filesystem remote: " ++ remotePath
-    
+
     -- Check if remote has .bit/ directory
     checkFilesystemRemoteIsRepo remotePath
-    
-    -- Fetch remote into local
-    let remoteIndexGit = remotePath </> ".bit" </> "index" </> ".git"
-    
+
+    -- Ensure git remote URL is current (device may have moved)
+    void $ Git.addRemote name (remotePath </> ".bit" </> "index")
+
+    -- Native git fetch — handles refspec automatically
     putStrLn "Fetching remote commits..."
-    (fetchCode, _fetchOut, fetchErr) <- Git.runGitWithOutput 
-        ["fetch", remoteIndexGit, "main:refs/remotes/origin/main"]
-    
+    (fetchCode, _fetchOut, fetchErr) <- Git.runGitWithOutput ["fetch", name]
+
     when (fetchCode /= ExitSuccess) $ do
         hPutStrLn stderr $ "Error fetching from remote: " ++ fetchErr
         exitWith fetchCode
-    
-    -- Output fetch results similar to cloud fetch
-    hPutStrLn stderr $ "From " ++ remoteName remote
-    hPutStrLn stderr $ " * [new branch]      main       -> origin/main"
+
+    hPutStrLn stderr $ "From " ++ name
+    hPutStrLn stderr $ " * [new branch]      main       -> " ++ name ++ "/main"
 
     putStrLn "Fetch complete."
 
@@ -1452,35 +1452,51 @@ fetchRemoteBundle remote = do
 saveFetchedBundle :: Remote -> Maybe FilePath -> IO FetchOutcome
 saveFetchedBundle _remote Nothing = pure (FetchError "No bundle to save")
 saveFetchedBundle remote (Just bPath) = do
-    let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
-    hadPrevious <- Dir.doesFileExist fetchedPath
-    maybeOldHash <- if hadPrevious
-        then Git.getHashFromBundle fetchedBundle
-        else pure Nothing
+    let name = remoteName remote
+        fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
+        bundleGitPath = fromGitRelPath (bundleGitRelPath fetchedBundle)
 
-    -- Copy FIRST, then read hash from the correct location
+    -- Read old tracking ref hash (before overwriting)
+    maybeOldHash <- revParseTrackingRef name
+
+    -- Copy bundle to local path
     copyFile bPath fetchedPath
     safeRemove bPath
-    maybeNewHash <- Git.getHashFromBundle fetchedBundle
 
-    -- Ensure the internal git remote "origin" points to the right URL.
-    -- This is the git-internal remote used for fetching refs from bundles,
-    -- NOT the user's configured bit remotes (those are in .bit/remotes/).
-    -- This ensures "git fetch origin/main" works correctly for pull/merge.
-    void $ Git.setupRemote (remoteUrl remote)
+    -- Register bundle as named git remote and fetch objects + refs
+    void $ Git.addRemote name bundleGitPath
+    (fetchCode, _, _) <- Git.runGitWithOutput ["fetch", name]
 
-    -- Update remote tracking branch and determine outcome
-    case (maybeOldHash, maybeNewHash) of
-        -- If we already had a fetched bundle and the hash is unchanged, silent.
-        -- Tests expect `bit fetch` to produce no output in this case.
+    -- Read new tracking ref hash (populated by git fetch)
+    maybeNewHash <- if fetchCode == ExitSuccess
+        then revParseTrackingRef name
+        else Git.getHashFromBundle fetchedBundle  -- fallback
+
+    -- If git fetch didn't update the ref (e.g. bundle has no matching refspec),
+    -- manually set it from the bundle hash
+    when (fetchCode /= ExitSuccess || maybeNewHash == Nothing) $ do
+        mHash <- Git.getHashFromBundle fetchedBundle
+        case mHash of
+            Just h  -> void $ Git.updateRemoteTrackingBranchToHash name h
+            Nothing -> pure ()
+
+    -- Determine outcome
+    let effectiveNewHash = case maybeNewHash of
+            Just h  -> Just h
+            Nothing -> Nothing  -- will be caught below
+    case (maybeOldHash, effectiveNewHash) of
         (Just oldHash, Just newHash) | oldHash == newHash -> pure UpToDate
-        (Just oldHash, Just newHash) -> do
-            void $ Git.updateRemoteTrackingBranch fetchedBundle
-            pure (Updated oldHash newHash)
-        (Nothing, Just newHash) -> do
-            void $ Git.updateRemoteTrackingBranch fetchedBundle
-            pure (FetchedFirst newHash)
+        (Just oldHash, Just newHash) -> pure (Updated oldHash newHash)
+        (Nothing, Just newHash) -> pure (FetchedFirst newHash)
         _ -> pure (FetchError "Could not extract hash from bundle")
+
+-- | Read the tracking ref for a named remote. Returns Nothing if ref doesn't exist.
+revParseTrackingRef :: String -> IO (Maybe String)
+revParseTrackingRef name = do
+    (code, out, _) <- Git.runGitWithOutput ["rev-parse", Git.remoteTrackingRef name]
+    pure $ case code of
+        ExitSuccess -> Just (trimGitOutput out)
+        _ -> Nothing
 
 -- | Render fetch outcome to stdout/stderr.
 renderFetchOutcome :: Remote -> FetchOutcome -> IO ()
@@ -1567,7 +1583,7 @@ import Bit.Core.Helpers
     , restoreCheckoutPaths
     , expandPathsToFiles
     , getLocalHeadE
-    , getRemoteTargetType
+    , getRemoteType
     )
 
 -- ============================================================================
@@ -1671,9 +1687,9 @@ mergeContinue = do
                         void $ Git.runGitRaw ["commit", "-m", "Merge remote"]
                         putStrLn "Merge complete."
                     traverse_ (\remote -> do
-                            mTarget <- liftIO $ getRemoteTargetType cwd (remoteName remote)
-                            let transport = case mTarget of
-                                  Just t | Device.isFilesystemTarget t -> Transport.mkFilesystemTransport (remoteUrl remote)
+                            mType <- liftIO $ getRemoteType cwd (remoteName remote)
+                            let transport = case mType of
+                                  Just t | Device.isFilesystemType t -> Transport.mkFilesystemTransport (remoteUrl remote)
                                   _ -> Transport.mkCloudTransport remote
                             Transport.syncBinariesAfterMerge transport remote oldHead) mRemote
                 _ -> liftIO $ do
@@ -1688,7 +1704,9 @@ mergeContinue = do
                 oldHead <- liftIO getLocalHeadE
                 (code, _, _) <- liftIO $ Git.runGitWithOutput ["rev-parse", "--verify", "MERGE_HEAD"]
                 when (code /= ExitSuccess) $ do
-                    (mergeCode, _, _) <- liftIO $ Git.runGitWithOutput ["merge", "--no-commit", "--no-ff", "refs/remotes/origin/main"]
+                    -- Use actual remote name if available, fall back to "origin"
+                    let remName = maybe "origin" remoteName mRemote
+                    (mergeCode, _, _) <- liftIO $ Git.runGitWithOutput ["merge", "--no-commit", "--no-ff", Git.remoteTrackingRef remName]
                     when (mergeCode /= ExitSuccess) $
                         liftIO $ hPutStrLn stderr "warning: Could not start merge. Proceeding anyway."
 
@@ -1699,9 +1717,9 @@ mergeContinue = do
                     putStrLn "Conflict directories cleaned up."
 
                 traverse_ (\remote -> do
-                        mTarget <- liftIO $ getRemoteTargetType cwd (remoteName remote)
-                        let transport = case mTarget of
-                              Just t | Device.isFilesystemTarget t -> Transport.mkFilesystemTransport (remoteUrl remote)
+                        mType <- liftIO $ getRemoteType cwd (remoteName remote)
+                        let transport = case mType of
+                              Just t | Device.isFilesystemType t -> Transport.mkFilesystemTransport (remoteUrl remote)
                               _ -> Transport.mkCloudTransport remote
                         Transport.syncBinariesAfterMerge transport remote oldHead) mRemote
 
@@ -1859,6 +1877,7 @@ module Bit.Core.Helpers
     , getLocalHeadE
     , checkIsAheadE
     , hasStagedChangesE
+    , getRemoteType
     , getRemoteTargetType
     , checkFilesystemRemoteIsRepo
       -- Monadic helpers
@@ -1945,7 +1964,12 @@ hasStagedChangesE =
     (\(code, _, _) -> code == ExitFailure 1) <$>
     Git.runGitWithOutput ["diff", "--cached", "--quiet"]
 
--- | Determine the remote target type from a remote name.
+-- | Determine the remote type from a remote name.
+-- Returns the RemoteType if the remote is configured, Nothing otherwise.
+getRemoteType :: FilePath -> String -> IO (Maybe Device.RemoteType)
+getRemoteType cwd remName = Device.readRemoteType cwd remName
+
+-- | Determine the remote target type from a remote name (legacy, for backward compat).
 -- Returns the RemoteTarget if the remote is configured, Nothing otherwise.
 getRemoteTargetType :: FilePath -> String -> IO (Maybe Device.RemoteTarget)
 getRemoteTargetType cwd remName = Device.readRemoteFile cwd remName
@@ -2247,7 +2271,7 @@ import Bit.Core.Helpers
     ( PullMode(..)
     , PullOptions(..)
     , defaultPullOptions
-    , getRemoteTargetType
+    , getRemoteType
     , withRemote
     , getLocalHeadE
     , hasStagedChangesE
@@ -2280,9 +2304,9 @@ pull opts = withRemote $ \remote -> do
     cwd <- asks envCwd
     
     -- Determine if this is a filesystem or cloud remote
-    mTarget <- liftIO $ getRemoteTargetType cwd (remoteName remote)
-    case mTarget of
-        Just t | Device.isFilesystemTarget t -> liftIO $ filesystemPull cwd remote opts
+    mType <- liftIO $ getRemoteType cwd (remoteName remote)
+    case mType of
+        Just t | Device.isFilesystemType t -> liftIO $ filesystemPull cwd remote opts
         _ -> cloudPull remote opts  -- Cloud remote or no target info (use cloud flow)
 
 -- | Pull from a cloud remote (uses unified transport abstraction).
@@ -2294,36 +2318,35 @@ cloudPull remote opts =
         PullManualMerge  -> pullManualMergeImpl remote
         PullNormal       -> pullWithCleanup transport remote opts
 
--- | Pull from a filesystem remote. Fetches directly from the remote's .bit/index/.git.
+-- | Pull from a filesystem remote using named git remote.
 filesystemPull :: FilePath -> Remote -> PullOptions -> IO ()
 filesystemPull cwd remote opts = do
-    let remotePath = remoteUrl remote
+    let name = remoteName remote
+        remotePath = remoteUrl remote
     putStrLn $ "Pulling from filesystem remote: " ++ remotePath
-    
+
     -- Check if remote has .bit/ directory
     checkFilesystemRemoteIsRepo remotePath
-    
-    -- 1. Fetch remote into local
-    let remoteIndexGit = remotePath </> ".bit" </> "index" </> ".git"
-    
+
+    -- 1. Ensure git remote URL is current and fetch
+    void $ Git.addRemote name (remotePath </> ".bit" </> "index")
+
     putStrLn "Fetching remote commits..."
-    (fetchCode, _fetchOut, fetchErr) <- Git.runGitWithOutput 
-        ["fetch", remoteIndexGit, "main:refs/remotes/origin/main"]
-    
+    (fetchCode, _fetchOut, fetchErr) <- Git.runGitWithOutput ["fetch", name]
+
     when (fetchCode /= ExitSuccess) $ do
         hPutStrLn stderr $ "Error fetching from remote: " ++ fetchErr
         exitWith fetchCode
-    
-    -- Output fetch results similar to cloud pull
-    hPutStrLn stderr $ "From " ++ remoteName remote
-    hPutStrLn stderr $ " * [new branch]      main       -> origin/main"
-    
+
+    hPutStrLn stderr $ "From " ++ name
+    hPutStrLn stderr $ " * [new branch]      main       -> " ++ name ++ "/main"
+
     -- 3. Get remote HEAD hash
-    (remoteHeadCode, remoteHeadOut, _) <- Git.runGitWithOutput ["rev-parse", "refs/remotes/origin/main"]
+    (remoteHeadCode, remoteHeadOut, _) <- Git.runGitWithOutput ["rev-parse", Git.remoteTrackingRef name]
     when (remoteHeadCode /= ExitSuccess) $ do
         hPutStrLn stderr "Error: Could not get remote HEAD"
         exitWith (ExitFailure 1)
-    
+
     let remoteHash = trimGitOutput remoteHeadOut
     
     -- Proof of possession — always verify filesystem remote before pulling
@@ -2348,37 +2371,38 @@ filesystemPull cwd remote opts = do
     
     -- Delegate to the unified path
     case pullMode opts of
-        PullAcceptRemote -> runBitM env (filesystemPullAcceptRemoteImpl transport remoteHash)
+        PullAcceptRemote -> runBitM env (filesystemPullAcceptRemoteImpl transport name remoteHash)
         _                -> runBitM env (filesystemPullLogicImpl transport remote remoteHash)
 
 -- | Filesystem pull logic (simplified - no bundle fetching, just merge + sync)
 filesystemPullLogicImpl :: FileTransport -> Remote -> String -> BitM ()
-filesystemPullLogicImpl transport _remote remoteHash = do
+filesystemPullLogicImpl transport remote remoteHash = do
     cwd <- asks envCwd
     oldHash <- lift getLocalHeadE
-    
+    let name = remoteName remote
+
     case oldHash of
         Nothing -> do
             lift $ putStrLn $ "Checking out " ++ take 7 remoteHash ++ " (first pull)"
-            checkoutCode <- lift $ Git.checkoutRemoteAsMain
+            checkoutCode <- lift $ Git.checkoutRemoteAsMain name
             case checkoutCode of
                 ExitSuccess -> lift $ do
                     transportSyncAllFiles transport cwd
                     putStrLn "Syncing binaries... done."
-                    void $ Git.updateRemoteTrackingBranchToHash remoteHash
+                    void $ Git.updateRemoteTrackingBranchToHash name remoteHash
                 _ -> lift $ hPutStrLn stderr "Error: Failed to checkout remote branch."
-        
+
         Just localHash -> do
-            (mergeCode, mergeOut, mergeErr) <- lift $ Git.runGitWithOutput 
-                ["merge", "--no-commit", "--no-ff", "refs/remotes/origin/main"]
-            
+            (mergeCode, mergeOut, mergeErr) <- lift $ Git.runGitWithOutput
+                ["merge", "--no-commit", "--no-ff", Git.remoteTrackingRef name]
+
             (finalMergeCode, finalMergeOut, finalMergeErr) <-
                 lift $ if mergeCode /= ExitSuccess && "refusing to merge unrelated histories" `List.isInfixOf` (mergeOut ++ mergeErr)
                 then do
                     putStrLn "Merging unrelated histories..."
-                    Git.runGitWithOutput ["merge", "--no-commit", "--no-ff", "--allow-unrelated-histories", "refs/remotes/origin/main"]
+                    Git.runGitWithOutput ["merge", "--no-commit", "--no-ff", "--allow-unrelated-histories", Git.remoteTrackingRef name]
                 else pure (mergeCode, mergeOut, mergeErr)
-            
+
             case finalMergeCode of
                 ExitSuccess -> do
                     lift $ putStrLn $ "Updating " ++ take 7 localHash ++ ".." ++ take 7 remoteHash
@@ -2388,7 +2412,7 @@ filesystemPullLogicImpl transport _remote remoteHash = do
                     -- CRITICAL: Always read actual HEAD after merge, never use remoteHash
                     lift $ applyMergeToWorkingDir transport cwd localHash
                     lift $ putStrLn "Syncing binaries... done."
-                    lift $ void $ Git.updateRemoteTrackingBranchToHash remoteHash
+                    lift $ void $ Git.updateRemoteTrackingBranchToHash name remoteHash
                 _ -> do
                     lift $ do
                         putStrLn finalMergeOut
@@ -2397,17 +2421,17 @@ filesystemPullLogicImpl transport _remote remoteHash = do
                         putStrLn "bit requires you to pick a version for each conflict."
                         putStrLn ""
                         putStrLn "Resolving conflicts..."
-                    
+
                     conflicts <- lift Conflict.getConflictedFilesE
                     resolutions <- lift $ Conflict.resolveAll conflicts
                     let total = length resolutions
-                    
+
                     invalid <- lift $ validateMetadataDir (cwd </> bitIndexPath)
                     unless (null invalid) $ lift $ do
                         void $ Git.runGitRaw ["merge", "--abort"]
                         hPutStrLn stderr "fatal: Metadata files contain conflict markers. Merge aborted."
                         throwIO (userError "Invalid metadata")
-                    
+
                     conflictsNow <- lift Conflict.getConflictedFilesE
                     when (null conflictsNow) $ lift $ do
                         void $ Git.runGitRaw ["commit", "-m", "Merge remote (resolved " ++ show total ++ " conflict(s))"]
@@ -2415,28 +2439,28 @@ filesystemPullLogicImpl transport _remote remoteHash = do
                         -- CRITICAL: Always read actual HEAD after merge, never use remoteHash
                         applyMergeToWorkingDir transport cwd localHash
                         putStrLn "Syncing binaries... done."
-                        void $ Git.updateRemoteTrackingBranchToHash remoteHash
+                        void $ Git.updateRemoteTrackingBranchToHash name remoteHash
 
 -- | Filesystem pull --accept-remote implementation
-filesystemPullAcceptRemoteImpl :: FileTransport -> String -> BitM ()
-filesystemPullAcceptRemoteImpl transport remoteHash = do
+filesystemPullAcceptRemoteImpl :: FileTransport -> String -> String -> BitM ()
+filesystemPullAcceptRemoteImpl transport name remoteHash = do
     cwd <- asks envCwd
     lift $ putStrLn "Accepting remote file state as truth..."
-    
+
     -- Record current HEAD before checkout
     oldHead <- lift getLocalHeadE
-    
+
     -- Force-checkout the remote branch
-    checkoutCode <- lift Git.checkoutRemoteAsMain
+    checkoutCode <- lift $ Git.checkoutRemoteAsMain name
     case checkoutCode of
         ExitSuccess -> do
             -- Sync actual files based on what changed
             maybe (lift $ transportSyncAllFiles transport cwd)
                   (\oh -> lift $ applyMergeToWorkingDir transport cwd oh) oldHead
-            
+
             -- Update tracking ref
             lift $ do
-                void $ Git.updateRemoteTrackingBranchToHash remoteHash
+                void $ Git.updateRemoteTrackingBranchToHash name remoteHash
                 putStrLn "Pull with --accept-remote completed."
         _ -> lift $ hPutStrLn stderr "Error: Failed to checkout remote state."
 
@@ -2445,6 +2469,7 @@ filesystemPullAcceptRemoteImpl transport remoteHash = do
 pullAcceptRemoteImpl :: FileTransport -> Remote -> BitM ()
 pullAcceptRemoteImpl transport remote = do
     cwd <- asks envCwd
+    let name = remoteName remote
     lift $ tell "Accepting remote file state as truth..."
 
     -- 1. Fetch the remote bundle so git has the remote's history
@@ -2461,21 +2486,19 @@ pullAcceptRemoteImpl transport remote = do
             oldHead <- lift getLocalHeadE
 
             -- 3. Force-checkout the remote branch.
-            --    This makes .bit/index/ match the remote's metadata exactly:
-            --    text files get actual content, binary files get hash/size.
             lift $ tell "Scanning remote files..."
-            checkoutCode <- lift Git.checkoutRemoteAsMain
+            checkoutCode <- lift $ Git.checkoutRemoteAsMain name
             case checkoutCode of
                 ExitSuccess -> do
                     -- 4. Sync actual files to working tree based on what changed in git
-                    (_remoteCode, remoteOut, _) <- lift $ gitQuery ["rev-parse", "refs/remotes/origin/main"]
+                    (_remoteCode, remoteOut, _) <- lift $ gitQuery ["rev-parse", Git.remoteTrackingRef name]
                     let _newHash = takeWhile (/= '\n') remoteOut
-                    maybe (lift $ transportSyncAllFiles transport cwd)  -- First time, no diff available
+                    maybe (lift $ transportSyncAllFiles transport cwd)
                           (\oh -> lift $ applyMergeToWorkingDir transport cwd oh) oldHead
 
                     -- 5. Update tracking ref
                     maybeRemoteHash <- lift $ Git.getHashFromBundle fetchedBundle
-                    lift $ traverse_ (void . Git.updateRemoteTrackingBranchToHash) maybeRemoteHash
+                    lift $ traverse_ (void . Git.updateRemoteTrackingBranchToHash name) maybeRemoteHash
 
                     lift $ tell "Pull with --accept-remote completed."
                 _ -> lift $ tellErr "Error: Failed to checkout remote state."
@@ -2484,6 +2507,7 @@ pullAcceptRemoteImpl transport remote = do
 pullManualMergeImpl :: Remote -> BitM ()
 pullManualMergeImpl remote = do
     cwd <- asks envCwd
+    let name = remoteName remote
     lift $ tell "Fetching remote metadata... done."
 
     maybeBundlePath <- lift $ fetchRemoteBundle remote
@@ -2523,12 +2547,12 @@ pullManualMergeImpl remote = do
                             pullWithCleanup transport remote defaultPullOptions
                         else do
                             _oldHash <- lift getLocalHeadE
-                            (_remoteCode, remoteOut, _) <- lift $ gitQuery ["rev-parse", "refs/remotes/origin/main"]
+                            (_remoteCode, remoteOut, _) <- lift $ gitQuery ["rev-parse", Git.remoteTrackingRef name]
                             let _newHash = takeWhile (/= '\n') remoteOut
 
-                            (mergeCode, mergeOut, mergeErr) <- lift $ gitQuery ["merge", "--no-commit", "--no-ff", "refs/remotes/origin/main"]
+                            (mergeCode, mergeOut, mergeErr) <- lift $ gitQuery ["merge", "--no-commit", "--no-ff", Git.remoteTrackingRef name]
                             (_finalMergeCode, _, _) <- lift $ if mergeCode /= ExitSuccess && "refusing to merge unrelated histories" `List.isInfixOf` (mergeOut ++ mergeErr)
-                                then do tell "Merging unrelated histories (e.g. first pull)..."; gitQuery ["merge", "--no-commit", "--no-ff", "--allow-unrelated-histories", "refs/remotes/origin/main"]
+                                then do tell "Merging unrelated histories (e.g. first pull)..."; gitQuery ["merge", "--no-commit", "--no-ff", "--allow-unrelated-histories", Git.remoteTrackingRef name]
                                 else pure (mergeCode, mergeOut, mergeErr)
 
                             createConflictDirectories remote divergentFiles remoteFileMap remoteMetaMap localMetaMap
@@ -2561,6 +2585,7 @@ pullWithCleanup transport remote opts = do
 pullLogic :: FileTransport -> Remote -> PullOptions -> BitM ()
 pullLogic transport remote _opts = do
     cwd <- asks envCwd
+    let name = remoteName remote
     maybeBundlePath <- lift $ fetchRemoteBundle remote
     case maybeBundlePath of
         Nothing -> pure ()
@@ -2569,7 +2594,7 @@ pullLogic transport remote _opts = do
             case outcome of
                 FetchError err -> lift $ tellErr $ "Error: " ++ err
                 _ -> pure ()  -- No need to render fetch output during pull
-            (_, countOut, _) <- lift $ gitQuery ["rev-list", "--count", "refs/remotes/origin/main"]
+            (_, countOut, _) <- lift $ gitQuery ["rev-list", "--count", Git.remoteTrackingRef name]
             let n = takeWhile (`elem` ['0'..'9']) (filter (/= '\n') countOut)
             lift $ tell $ "remote: Counting objects: " ++ (if null n then "0" else n) ++ ", done."
 
@@ -2586,13 +2611,13 @@ pullLogic transport remote _opts = do
                     exitWith (ExitFailure 1)
 
             oldHash <- lift getLocalHeadE
-            (_remoteCode, remoteOut, _) <- lift $ gitQuery ["rev-parse", "refs/remotes/origin/main"]
+            (_remoteCode, remoteOut, _) <- lift $ gitQuery ["rev-parse", Git.remoteTrackingRef name]
             let newHash = takeWhile (/= '\n') remoteOut
 
             case oldHash of
                 Nothing -> do
                     lift $ tell $ "Checking out " ++ take 7 newHash ++ " (first pull)"
-                    checkoutCode <- lift $ Git.checkoutRemoteAsMain
+                    checkoutCode <- lift $ Git.checkoutRemoteAsMain name
                     case checkoutCode of
                         ExitSuccess -> lift $ do
                             transportSyncAllFiles transport cwd
@@ -2600,11 +2625,11 @@ pullLogic transport remote _opts = do
                         _ -> lift $ tellErr "Error: Failed to checkout remote branch."
 
                 Just localHead -> do
-                    (mergeCode, mergeOut, mergeErr) <- lift $ gitQuery ["merge", "--no-commit", "--no-ff", "refs/remotes/origin/main"]
+                    (mergeCode, mergeOut, mergeErr) <- lift $ gitQuery ["merge", "--no-commit", "--no-ff", Git.remoteTrackingRef name]
 
                     (finalMergeCode, finalMergeOut, finalMergeErr) <-
                         lift $ if mergeCode /= ExitSuccess && "refusing to merge unrelated histories" `List.isInfixOf` (mergeOut ++ mergeErr)
-                        then do tell "Merging unrelated histories..."; gitQuery ["merge", "--no-commit", "--no-ff", "--allow-unrelated-histories", "refs/remotes/origin/main"]
+                        then do tell "Merging unrelated histories..."; gitQuery ["merge", "--no-commit", "--no-ff", "--allow-unrelated-histories", Git.remoteTrackingRef name]
                         else pure (mergeCode, mergeOut, mergeErr)
 
                     case finalMergeCode of
@@ -2618,7 +2643,7 @@ pullLogic transport remote _opts = do
                             applyMergeToWorkingDir transport cwd localHead
                             tell "Syncing binaries... done."
                         maybeRemoteHash <- lift $ Git.getHashFromBundle fetchedBundle
-                        lift $ traverse_ (void . Git.updateRemoteTrackingBranchToHash) maybeRemoteHash
+                        lift $ traverse_ (void . Git.updateRemoteTrackingBranchToHash name) maybeRemoteHash
                       _ -> do
                         lift $ do
                             tell finalMergeOut
@@ -2644,7 +2669,7 @@ pullLogic transport remote _opts = do
                             tell $ "Merge complete. " ++ show total ++ " conflict(s) resolved."
                             applyMergeToWorkingDir transport cwd localHead
                             tell "Syncing binaries... done."
-                            void $ Git.updateRemoteTrackingBranchToHash newHash
+                            void $ Git.updateRemoteTrackingBranchToHash name newHash
 
 -- ============================================================================
 -- Helper functions
@@ -2774,7 +2799,7 @@ import Bit.Concurrency (Concurrency(..))
 import qualified Bit.Device as Device
 import System.Directory (copyFile)
 import Bit.Core.Helpers
-    ( getRemoteTargetType
+    ( getRemoteType
     , withRemote
     , getLocalHeadE
     , checkIsAheadE
@@ -2809,9 +2834,9 @@ push = withRemote $ \remote -> do
             exitWith (ExitFailure 1)
 
     -- Determine if this is a filesystem or cloud remote
-    mTarget <- liftIO $ getRemoteTargetType cwd (remoteName remote)
-    case mTarget of
-        Just t | Device.isFilesystemTarget t -> liftIO $ filesystemPush cwd remote
+    mType <- liftIO $ getRemoteType cwd (remoteName remote)
+    case mType of
+        Just t | Device.isFilesystemType t -> liftIO $ filesystemPush cwd remote
         _ -> cloudPush remote  -- Cloud remote or no target info (use cloud flow)
 
 -- | Push to a cloud remote (original flow, unchanged).
@@ -2876,38 +2901,38 @@ filesystemPush cwd remote = do
         putStrLn "First push: initializing bit repo at remote..."
         initializeRepoAt remotePath
     
-    -- 2. Fetch local into remote
+    -- 2. Fetch local into remote (at the remote, "origin" is the local side)
     let localIndexGit = cwd </> ".bit" </> "index" </> ".git"
     let remoteIndex = remotePath </> ".bit" </> "index"
-    
+
     putStrLn "Fetching local commits into remote..."
-    (fetchCode, _fetchOut, fetchErr) <- Git.runGitAt remoteIndex 
-        ["fetch", localIndexGit, "main:refs/remotes/origin/main"]
-    
+    (fetchCode, _fetchOut, fetchErr) <- Git.runGitAt remoteIndex
+        ["fetch", localIndexGit, "main:" ++ Git.remoteTrackingRef "origin"]
+
     when (fetchCode /= ExitSuccess) $ do
         hPutStrLn stderr $ "Error fetching into remote: " ++ fetchErr
         exitWith fetchCode
-    
+
     -- 3. Capture remote HEAD before merge
     (oldHeadCode, oldHeadOut, _) <- Git.runGitAt remoteIndex ["rev-parse", "HEAD"]
     let mOldHead = case oldHeadCode of
             ExitSuccess -> Just (trimGitOutput oldHeadOut)
             _ -> Nothing
-    
+
     -- 4. Check if remote HEAD is ancestor of what we're pushing (fast-forward check)
     traverse_ (const $ do
-        (checkCode, _, _) <- Git.runGitAt remoteIndex 
-            ["merge-base", "--is-ancestor", "HEAD", "refs/remotes/origin/main"]
+        (checkCode, _, _) <- Git.runGitAt remoteIndex
+            ["merge-base", "--is-ancestor", "HEAD", Git.remoteTrackingRef "origin"]
         when (checkCode /= ExitSuccess) $ do
             hPutStrLn stderr "error: Remote has local commits that you don't have."
             hPutStrLn stderr "hint: Run 'bit pull' to merge remote changes first, then push again."
             exitWith (ExitFailure 1)
         ) mOldHead
-    
+
     -- 5. Merge at remote (ff-only)
     putStrLn "Merging at remote (fast-forward only)..."
-    (mergeCode, _mergeOut, mergeErr) <- Git.runGitAt remoteIndex 
-        ["merge", "--ff-only", "refs/remotes/origin/main"]
+    (mergeCode, _mergeOut, mergeErr) <- Git.runGitAt remoteIndex
+        ["merge", "--ff-only", Git.remoteTrackingRef "origin"]
     
     case mergeCode of
         ExitSuccess -> do
@@ -2932,7 +2957,7 @@ filesystemPush cwd remote = do
             
             -- 8. Update local tracking ref
             putStrLn "Updating local tracking ref..."
-            void $ Git.updateRemoteTrackingBranchToHead
+            void $ Git.updateRemoteTrackingBranchToHead (remoteName remote)
 
             putStrLn "Push complete."
         _ -> do
@@ -2981,12 +3006,15 @@ pushToRemote remote = do
   updateLocalBundleAfterPush
 
 -- | After a successful push, update the local fetched_remote.bundle to current HEAD
--- so rgit status shows up to date instead of "ahead of remote".
+-- so bit status shows up to date instead of "ahead of remote".
 updateLocalBundleAfterPush :: BitM ()
 updateLocalBundleAfterPush = do
+    mRemote <- asks envRemote
     code <- liftIO $ Git.createBundle fetchedBundle
     case code of
-        ExitSuccess -> void $ liftIO $ Git.updateRemoteTrackingBranch fetchedBundle
+        ExitSuccess -> case mRemote of
+            Just remote -> void $ liftIO $ Git.updateRemoteTrackingBranchToHead (remoteName remote)
+            Nothing     -> pure ()
         _ -> pure ()
 
 syncRemoteFiles :: BitM ()
@@ -3108,12 +3136,12 @@ import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import qualified Data.Text as T
-import Internal.Config (bitDevicesDir, bitRemotesDir, fetchedBundle, bundleCwdPath, fromCwdPath, BundleName(..), bitIndexPath)
+import Internal.Config (bitDevicesDir, bitRemotesDir, fetchedBundle, bundleCwdPath, fromCwdPath, BundleName(..), bitIndexPath, bundleGitRelPath, fromGitRelPath)
 import Bit.Types (BitM, BitEnv(..), Path(..), Hash(..), HashAlgo(..), hashToText)
 import Control.Monad.Trans.Reader (asks)
 import Control.Monad.IO.Class (liftIO)
 import Bit.Remote (Remote, remoteUrl, remoteName, displayRemote, resolveRemote)
-import Bit.Core.Helpers (getRemoteTargetType)
+import Bit.Core.Helpers (getRemoteType)
 import qualified Bit.Core.Fetch as Fetch
 import qualified Bit.Verify as Verify
 import Bit.Concurrency (Concurrency(..))
@@ -3135,8 +3163,10 @@ addRemote name pathOrUrl = do
     pathType <- Device.classifyRemotePath pathOrUrl
     case pathType of
         Device.CloudRemote url -> do
-            Device.writeRemoteFile cwd name (Device.TargetCloud url)
-            void $ Git.addRemote name url
+            Device.writeRemoteFile cwd name Device.RemoteCloud (Just url)
+            -- Register bundle path as named git remote (bundle may not exist yet)
+            let bundleGitPath = fromGitRelPath (bundleGitRelPath fetchedBundle)
+            void $ Git.addRemote name bundleGitPath
             putStrLn $ "Remote '" ++ name ++ "' added (" ++ url ++ ")."
         Device.FilesystemPath filePath -> addRemoteFilesystem cwd name filePath
 
@@ -3152,6 +3182,21 @@ addRemoteFilesystem cwd name filePath = do
         hPutStrLn stderr ("fatal: Path does not exist or is not accessible: " ++ filePath)
         exitWith (ExitFailure 1)
     volRoot <- Device.getVolumeRoot absPath
+    isFixed <- Device.isFixedDrive volRoot
+    if isFixed
+        then addRemoteFixed cwd name absPath
+        else addRemoteDevice cwd name absPath volRoot
+
+-- | Add a fixed-drive filesystem remote. Path stored only in git config.
+addRemoteFixed :: FilePath -> String -> FilePath -> IO ()
+addRemoteFixed cwd name absPath = do
+    void $ Git.addRemote name (absPath </> ".bit" </> "index")
+    Device.writeRemoteFile cwd name Device.RemoteFilesystem Nothing
+    putStrLn $ "Remote '" ++ name ++ "' added (" ++ absPath ++ ")."
+
+-- | Add a removable/network device remote. Uses device UUID tracking.
+addRemoteDevice :: FilePath -> String -> FilePath -> FilePath -> IO ()
+addRemoteDevice cwd name absPath volRoot = do
     let relPath = Device.getRelativePath volRoot absPath
     mStoreUuid <- Device.readBitStore volRoot
     mExistingDevice <- maybe (pure Nothing) (Device.findDeviceByUuid cwd) mStoreUuid
@@ -3159,7 +3204,8 @@ addRemoteFilesystem cwd name filePath = do
         (Just _u, Just dev) -> do
             putStrLn $ "Using existing device '" ++ dev ++ "'."
             _mInfo <- Device.readDeviceFile cwd dev
-            Device.writeRemoteFile cwd name (Device.TargetDevice dev relPath)
+            Device.writeRemoteFile cwd name Device.RemoteDevice (Just (dev ++ ":" ++ relPath))
+            void $ Git.addRemote name (absPath </> ".bit" </> "index")
             putStrLn $ "Remote '" ++ name ++ "' → " ++ dev ++ ":" ++ relPath
             putStrLn $ "(using existing device '" ++ dev ++ "')"
             pure ()
@@ -3167,19 +3213,21 @@ addRemoteFilesystem cwd name filePath = do
             mLabel <- Device.getVolumeLabel volRoot
             deviceName' <- promptDeviceName cwd volRoot mLabel
             registerDevice cwd name volRoot deviceName' relPath u
+            void $ Git.addRemote name (absPath </> ".bit" </> "index")
         (Nothing, _) -> do
             mLabel <- Device.getVolumeLabel volRoot
             deviceName' <- promptDeviceName cwd volRoot mLabel
             u <- Device.generateStoreUuid
             Device.writeBitStore volRoot u
             registerDevice cwd name volRoot deviceName' relPath u
+            void $ Git.addRemote name (absPath </> ".bit" </> "index")
     case result of
         Right () -> pure ()
         Left _err -> do
             -- Cannot create .bit-store at volume root (e.g. permission denied on C:\)
             -- Fall back to path-based storage for local directories
-            Device.writeRemoteFile cwd name (Device.TargetLocalPath absPath)
-            void $ Git.addRemote name absPath
+            Device.writeRemoteFile cwd name Device.RemoteFilesystem Nothing
+            void $ Git.addRemote name (absPath </> ".bit" </> "index")
             putStrLn $ "Remote '" ++ name ++ "' added (" ++ absPath ++ ")."
 
 -- | Detect storage type, get serial, write device + remote files, and print confirmation.
@@ -3191,7 +3239,7 @@ registerDevice cwd name volRoot deviceName' relPath u = do
         Device.Physical -> Device.getHardwareSerial volRoot
         Device.Network -> pure Nothing
     Device.writeDeviceFile cwd deviceName' (Device.DeviceInfo u storeType' mSerial)
-    Device.writeRemoteFile cwd name (Device.TargetDevice deviceName' relPath)
+    Device.writeRemoteFile cwd name Device.RemoteDevice (Just (deviceName' ++ ":" ++ relPath))
     putStrLn $ "Remote '" ++ name ++ "' → " ++ deviceName' ++ ":" ++ relPath
     putStrLn $ "Device '" ++ deviceName' ++ "' registered (" ++ displayStorageType storeType' ++ ")."
 
@@ -3216,45 +3264,54 @@ remoteShow mRemoteName = do
                     remoteNames <- liftIO $ Dir.listDirectory remotesDir
                     if null remoteNames
                         then liftIO $ putStrLn "No remotes configured. Use 'bit remote add <name> <url>' to add one."
-                        else liftIO $ forM_ remoteNames $ \name -> do
-                            mTarget <- Device.readRemoteFile cwd name
-                            display <- formatRemoteDisplay cwd name mTarget
+                        else liftIO $ forM_ remoteNames $ \rName -> do
+                            mRemote' <- resolveRemote cwd rName
+                            mType' <- Device.readRemoteType cwd rName
+                            display <- case mRemote' of
+                                Just r  -> formatRemoteDisplayByType cwd rName mType' r
+                                Nothing -> do
+                                    mTarget' <- Device.readRemoteFile cwd rName
+                                    formatRemoteDisplay cwd rName mTarget'
                             putStrLn display
         Just name -> do
-            (mRemote, mTarget) <- liftIO $ (,) <$> resolveRemote cwd name <*> Device.readRemoteFile cwd name
-            display <- liftIO $ case mTarget of
-                Just _ -> formatRemoteDisplay cwd name mTarget
-                Nothing -> pure (name ++ " → " ++ maybe "(not configured)" displayRemote mRemote)
+            (mRemote, mType) <- liftIO $ (,) <$> resolveRemote cwd name <*> Device.readRemoteType cwd name
             case mRemote of
                 Nothing -> liftIO $ putStrLn "No remotes configured. Use 'bit remote add <name> <url>' to add one."
                 Just remote -> do
+                    -- Display the remote line
+                    display <- liftIO $ formatRemoteDisplayByType cwd name mType remote
                     liftIO $ do
                         putStrLn display
                         putStrLn ""
-                    let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
-                    hasBundle <- liftIO $ Dir.doesFileExist fetchedPath
-                    if hasBundle
-                        then liftIO $ showRemoteStatusFromBundle name (Just (remoteUrl remote))
+                    -- Show status: ref-based for filesystem/device, bundle-based for cloud
+                    let isFs = maybe False Device.isFilesystemType mType
+                    if isFs
+                        then liftIO $ showRefBasedRemoteStatus name (remoteUrl remote)
                         else do
-                            maybeBundlePath <- liftIO $ Fetch.fetchRemoteBundle remote
-                            case maybeBundlePath of
-                                Just bPath -> do
-                                    outcome <- liftIO $ Fetch.saveFetchedBundle remote (Just bPath)
-                                    case outcome of
-                                        Fetch.FetchError err -> liftIO $ hPutStrLn stderr $ "Warning: " ++ err
-                                        _ -> pure ()  -- No need to render fetch output in remote show
-                                    liftIO $ showRemoteStatusFromBundle name (Just (remoteUrl remote))
-                                Nothing -> liftIO $ do
-                                    putStrLn $ "  Fetch URL: " ++ remoteUrl remote
-                                    putStrLn $ "  Push  URL: " ++ remoteUrl remote
-                                    putStrLn ""
-                                    putStrLn "  HEAD branch: (unknown)"
-                                    putStrLn ""
-                                    putStrLn "  Local branch configured for 'bit pull':"
-                                    putStrLn "    main merges with remote (unknown)"
-                                    putStrLn ""
-                                    putStrLn "  Local refs configured for 'bit push':"
-                                    putStrLn "    main pushes to main (unknown)"
+                            let fetchedPath = fromCwdPath (bundleCwdPath fetchedBundle)
+                            hasBundle <- liftIO $ Dir.doesFileExist fetchedPath
+                            if hasBundle
+                                then liftIO $ showRemoteStatusFromBundle name (Just (remoteUrl remote))
+                                else do
+                                    maybeBundlePath <- liftIO $ Fetch.fetchRemoteBundle remote
+                                    case maybeBundlePath of
+                                        Just bPath -> do
+                                            outcome <- liftIO $ Fetch.saveFetchedBundle remote (Just bPath)
+                                            case outcome of
+                                                Fetch.FetchError err -> liftIO $ hPutStrLn stderr $ "Warning: " ++ err
+                                                _ -> pure ()
+                                            liftIO $ showRemoteStatusFromBundle name (Just (remoteUrl remote))
+                                        Nothing -> liftIO $ do
+                                            putStrLn $ "  Fetch URL: " ++ remoteUrl remote
+                                            putStrLn $ "  Push  URL: " ++ remoteUrl remote
+                                            putStrLn ""
+                                            putStrLn "  HEAD branch: (unknown)"
+                                            putStrLn ""
+                                            putStrLn "  Local branch configured for 'bit pull':"
+                                            putStrLn "    main merges with remote (unknown)"
+                                            putStrLn ""
+                                            putStrLn "  Local refs configured for 'bit push':"
+                                            putStrLn "    main pushes to main (unknown)"
 
 -- ============================================================================
 -- Remote repair
@@ -3292,8 +3349,8 @@ remoteRepair mName concurrency = do
             putStrLn ""
 
             -- Determine if filesystem or cloud remote
-            mTarget <- getRemoteTargetType cwd (remoteName remote)
-            let isFilesystem = maybe False Device.isFilesystemTarget mTarget
+            mType <- getRemoteType cwd (remoteName remote)
+            let isFilesystem = maybe False Device.isFilesystemType mType
                 remotePath = remoteUrl remote
 
             if isFilesystem
@@ -3528,6 +3585,74 @@ formatRemoteDisplay cwd name = maybe (pure (name ++ " → (no target)")) $ \case
             Device.NotConnected _ -> pure (name ++ " → " ++ dev ++ ":" ++ devPath ++ " (" ++ typ ++ ", NOT CONNECTED)")
     Device.TargetCloud u -> pure (name ++ " → " ++ u ++ " (cloud)")
 
+-- | Format remote display line using RemoteType instead of RemoteTarget.
+formatRemoteDisplayByType :: FilePath -> String -> Maybe Device.RemoteType -> Remote -> IO String
+formatRemoteDisplayByType cwd name mType remote = case mType of
+    Just Device.RemoteFilesystem -> pure (name ++ " → " ++ remoteUrl remote ++ " (filesystem)")
+    Just Device.RemoteDevice -> do
+        -- Read the target to get device info
+        mTarget <- Device.readRemoteFile cwd name
+        case mTarget of
+            Just (Device.TargetDevice dev devPath) -> do
+                mInfo <- Device.readDeviceFile cwd dev
+                let typ = maybe "unknown" (displayStorageType . Device.deviceType) mInfo
+                pure (name ++ " → " ++ dev ++ ":" ++ devPath ++ " (" ++ typ ++ ", connected at " ++ remoteUrl remote ++ ")")
+            _ -> pure (name ++ " → " ++ displayRemote remote ++ " (device)")
+    Just Device.RemoteCloud -> pure (name ++ " → " ++ remoteUrl remote ++ " (cloud)")
+    Nothing -> pure (name ++ " → " ++ displayRemote remote)
+
+-- | Show remote status using git tracking refs (for filesystem/device remotes).
+-- No bundle needed — reads directly from refs/remotes/<name>/main.
+showRefBasedRemoteStatus :: String -> String -> IO ()
+showRefBasedRemoteStatus name url = do
+    maybeLocal <- Git.getLocalHead
+    (refCode, refOut, _) <- Git.runGitWithOutput ["rev-parse", Git.remoteTrackingRef name]
+    let maybeRemote = case refCode of
+            ExitSuccess -> Just (filter (/= '\n') refOut)
+            _ -> Nothing
+    putStrLn $ "* remote " ++ name
+    putStrLn $ "  Fetch URL: " ++ url
+    putStrLn $ "  Push  URL: " ++ url
+    putStrLn ""
+    case (maybeLocal, maybeRemote) of
+        (Nothing, Just _) -> do
+            putStrLn "  HEAD branch: (unknown)"
+            putStrLn ""
+            putStrLn "  Local branch configured for 'bit pull':"
+            putStrLn "    main merges with remote (unknown)"
+            putStrLn ""
+            putStrLn "  Local refs configured for 'bit push':"
+            putStrLn "    main pushes to main (local out of date)"
+        (Just lHash, Just rHash) -> do
+            putStrLn "  HEAD branch: main"
+            putStrLn ""
+            if lHash == rHash
+                then do
+                    putStrLn "  Local branch configured for 'bit pull':"
+                    putStrLn "    main merges with remote main"
+                    putStrLn ""
+                    putStrLn "  Local refs configured for 'bit push':"
+                    putStrLn "    main pushes to main (up to date)"
+                else do
+                    status <- classifyPushStatus lHash rHash
+                    putStrLn "  Local branch configured for 'bit pull':"
+                    putStrLn "    main merges with remote main"
+                    putStrLn ""
+                    putStrLn "  Local refs configured for 'bit push':"
+                    case status of
+                        PushRefFastForwardable -> putStrLn "    main pushes to main (fast-forwardable)"
+                        PushRefLocalOutOfDate  -> putStrLn "    main pushes to main (local out of date)"
+                        PushRefDiverged       -> putStrLn "    main pushes to main (diverged)"
+                        PushRefUpToDate       -> putStrLn "    main pushes to main (up to date)"
+        _ -> do
+            putStrLn "  HEAD branch: (unknown)"
+            putStrLn ""
+            putStrLn "  Local branch configured for 'bit pull':"
+            putStrLn "    main merges with remote (unknown)"
+            putStrLn ""
+            putStrLn "  Local refs configured for 'bit push':"
+            putStrLn "    main pushes to main (unknown)"
+
 showRemoteStatusFromBundle :: String -> Maybe String -> IO ()
 showRemoteStatusFromBundle name mUrl = do
     maybeLocal <- Git.getLocalHead
@@ -3650,7 +3775,7 @@ import Control.Concurrent (getNumCapabilities)
 import System.IO (stderr, hPutStrLn)
 import Bit.Utils (toPosix)
 import Bit.Plan (RcloneAction(..))
-import Bit.Remote (Remote)
+import Bit.Remote (Remote, remoteName)
 import Bit.Types (BitM, BitEnv(..), unPath)
 import Control.Monad.Trans.Reader (asks)
 import Control.Monad.IO.Class (liftIO)
@@ -4082,13 +4207,14 @@ getFileSizeFromIndex localRoot filePath = do
 
 -- | Sync binaries after a successful merge commit
 syncBinariesAfterMerge :: FileTransport -> Remote -> Maybe String -> BitM ()
-syncBinariesAfterMerge transport _remote oldHead = do
+syncBinariesAfterMerge transport remote oldHead = do
     cwd <- asks envCwd
+    let name = remoteName remote
     liftIO $ putStrLn "Syncing binaries... done."
     -- Apply diff-based sync or full sync depending on whether we have an old HEAD
     liftIO $ maybe (transportSyncAllFiles transport cwd) (applyMergeToWorkingDir transport cwd) oldHead
     maybeRemoteHash <- liftIO $ Git.getHashFromBundle fetchedBundle
-    liftIO $ traverse_ (void . Git.updateRemoteTrackingBranchToHash) maybeRemoteHash
+    liftIO $ traverse_ (void . Git.updateRemoteTrackingBranchToHash name) maybeRemoteHash
 
 -- | Executes/Prints the command to be run in the shell (push: local -> remote).
 executeCommand :: FilePath -> Remote -> RcloneAction -> IO ()
@@ -4182,7 +4308,7 @@ import Internal.Config (fetchedBundle)
 import Bit.Progress (reportProgress, clearProgress)
 
 import qualified Bit.Device as Device
-import Bit.Core.Helpers (withRemote, printVerifyIssue, getRemoteTargetType)
+import Bit.Core.Helpers (withRemote, printVerifyIssue, getRemoteType)
 import Bit.Remote (Remote, remoteName, remoteUrl)
 
 -- | Whether to verify local working tree or remote.
@@ -4193,8 +4319,8 @@ verify :: VerifyTarget -> Concurrency -> BitM ()
 verify target concurrency = case target of
   VerifyRemote -> withRemote $ \remote -> do
       cwd <- asks envCwd
-      mTarget <- liftIO $ getRemoteTargetType cwd (remoteName remote)
-      let isFilesystem = maybe False Device.isFilesystemTarget mTarget
+      mType <- liftIO $ getRemoteType cwd (remoteName remote)
+      let isFilesystem = maybe False Device.isFilesystemType mType
       if isFilesystem
         then verifyFilesystemRemote (remoteUrl remote) concurrency
         else verifyCloudRemote cwd remote concurrency
@@ -4325,6 +4451,7 @@ module Bit.Device
   , RemotePathType(..)
   , RemoteTarget(..)
   , ResolveResult(..)
+  , RemoteType(..)
     -- Classification
   , classifyRemotePath
   , getRcloneRemotes
@@ -4334,6 +4461,7 @@ module Bit.Device
   , detectStorageType
   , getHardwareSerial
   , getVolumeLabel
+  , isFixedDrive
     -- .bit-store
   , readBitStore
   , writeBitStore
@@ -4341,6 +4469,7 @@ module Bit.Device
   , readDeviceFile
   , writeDeviceFile
   , readRemoteFile
+  , readRemoteType
   , writeRemoteFile
   , listDeviceNames
   , findDeviceByUuid
@@ -4350,6 +4479,7 @@ module Bit.Device
   , generateStoreUuid
     -- Predicates
   , isFilesystemTarget
+  , isFilesystemType
   ) where
 
 import Data.List (dropWhileEnd, isPrefixOf, intercalate)
@@ -4407,6 +4537,15 @@ data ResolveResult
   = Resolved FilePath     -- Runtime path (e.g. E:\Backup)
   | NotConnected String   -- Device not found
   deriving (Show, Eq)
+
+-- | Classification of a remote by transport type.
+data RemoteType = RemoteFilesystem | RemoteDevice | RemoteCloud
+  deriving (Show, Eq)
+
+-- | True for types that resolve to a local filesystem path.
+isFilesystemType :: RemoteType -> Bool
+isFilesystemType RemoteCloud = False
+isFilesystemType _           = True
 
 -- ---------------------------------------------------------------------------
 -- Classification: cloud vs filesystem
@@ -4536,6 +4675,25 @@ detectStorageTypeLinux _ = do
       in if fstype `elem` ["nfs", "nfs4", "cifs", "smb", "smbfs", "sshfs"]
             then Network else Physical
     _ -> Physical
+
+-- | Is the volume a fixed (non-removable, non-network) drive?
+-- Fixed drives use RemoteFilesystem; removable/network use RemoteDevice.
+isFixedDrive :: FilePath -> IO Bool
+isFixedDrive volumeRoot
+  | isWindows = isFixedDriveWindows volumeRoot
+  | otherwise = (== Physical) <$> detectStorageType volumeRoot
+
+isFixedDriveWindows :: FilePath -> IO Bool
+isFixedDriveWindows volRoot = do
+  let drive = take 2 (filter (`elem` ['A'..'Z'] ++ ['a'..'z'] ++ ":") volRoot)
+  case drive of
+    [] -> pure False  -- UNC: treat as network
+    _ -> do
+      (code, out, _) <- readProcessWithExitCode "powershell" ["-NoProfile", "-Command",
+        "[int]([System.IO.DriveInfo]::new('" ++ drive ++ "').DriveType)"] ""
+      pure $ case code of
+        ExitSuccess -> trim out == "3"  -- DriveType.Fixed == 3
+        _ -> True  -- Default to fixed if detection fails
 
 trim :: String -> String
 trim = dropWhileEnd (== ' ') . dropWhile (== ' ')
@@ -4736,16 +4894,42 @@ readRemoteFile repoRoot remoteName = do
         pure $ Just $ maybe (TargetCloud (device ++ ":" ++ relPath))
           (const $ TargetDevice device relPath) mDev
 
-writeRemoteFile :: FilePath -> String -> RemoteTarget -> IO ()
-writeRemoteFile repoRoot remoteName target = do
+-- | Read the remote type from .bit/remotes/<name>.
+-- New format: "type: filesystem|device|cloud". Old format: inferred from "target:" line.
+readRemoteType :: FilePath -> String -> IO (Maybe RemoteType)
+readRemoteType repoRoot name = do
+  let path = repoRoot </> bitRemotesDir </> name
+  exists <- Dir.doesFileExist path
+  if not exists then pure Nothing
+  else do
+    bs <- BS.readFile path
+    let content = either (const "") T.unpack (decodeUtf8' bs)
+        ls = lines content
+        getVal prefix = listToMaybe [ trim (drop (length prefix) l) | l <- ls, prefix `isPrefixOf` l ]
+    case getVal "type: " of
+      Just "filesystem" -> pure (Just RemoteFilesystem)
+      Just "device"     -> pure (Just RemoteDevice)
+      Just "cloud"      -> pure (Just RemoteCloud)
+      _ -> -- Old format: infer from target line
+        case getVal "target: " of
+          Just t | "local:" `isPrefixOf` t -> pure (Just RemoteFilesystem)
+          Just t -> case break (== ':') t of
+            (dev, ':':_) | not (null dev) -> do
+              mDev <- readDeviceFile repoRoot dev
+              pure $ Just $ maybe RemoteCloud (const RemoteDevice) mDev
+            _ -> pure (Just RemoteCloud)
+          Nothing -> pure Nothing
+
+writeRemoteFile :: FilePath -> String -> RemoteType -> Maybe String -> IO ()
+writeRemoteFile repoRoot name remoteType mTarget = do
   Dir.createDirectoryIfMissing True (repoRoot </> bitRemotesDir)
-  let path = repoRoot </> bitRemotesDir </> remoteName
-  let line = case target of
-        TargetCloud url -> "target: " ++ url
-        TargetDevice dev p -> "target: " ++ dev ++ ":" ++ p
-        TargetLocalPath p -> "target: local:" ++ p
+  let path = repoRoot </> bitRemotesDir </> name
+  let content = case remoteType of
+        RemoteFilesystem -> "type: filesystem"
+        RemoteCloud      -> "type: cloud\ntarget: " ++ fromMaybe "" mTarget
+        RemoteDevice     -> "type: device\ntarget: " ++ fromMaybe "" mTarget
   -- Use atomic write for crash safety and Windows compatibility
-  atomicWriteFile path (encodeUtf8 (T.pack line))
+  atomicWriteFile path (encodeUtf8 (T.pack content))
 
 -- | Parse a target string (e.g. "black_usb:Backup" or "gdrive:Projects/foo")
 parseRemoteTarget :: String -> RemoteTarget
@@ -5781,6 +5965,7 @@ module Bit.Remote
 
 import qualified Internal.Git as Git
 import qualified Bit.Device as Device
+import Data.List (isSuffixOf)
 
 -- | A resolved remote. Bit.hs works with this; only Transport sees the url.
 data Remote = Remote
@@ -5804,13 +5989,55 @@ displayRemote r = _remoteName r ++ " (" ++ _remoteUrl r ++ ")"
 mkRemote :: String -> String -> Remote
 mkRemote = Remote
 
--- | Resolve a remote name to a Remote. Checks:
---   1. .rgit/remotes/<name> (device resolution via Device.hs)
---   2. Git config (git remote get-url <name>)
--- Returns Nothing if remote doesn't exist or device is not connected.
+-- | Resolve a remote name to a Remote. Dispatches on RemoteType:
+--   Filesystem: reads URL from git config, strips .bit/index suffix
+--   Device:     resolves device UUID to mount path
+--   Cloud:      reads target from remote file (rclone URL)
+--   Nothing:    backward compat fallback
 resolveRemote :: FilePath -> String -> IO (Maybe Remote)
 resolveRemote cwd name = do
-    -- Try .rgit/remotes/<name> first (device-aware resolution)
+    mType <- Device.readRemoteType cwd name
+    case mType of
+        Just Device.RemoteFilesystem -> resolveFromGitConfig name
+        Just Device.RemoteDevice     -> resolveDeviceRemote cwd name
+        Just Device.RemoteCloud      -> resolveCloudRemote cwd name
+        Nothing                      -> resolveOldFormat cwd name
+
+-- | Filesystem remote: URL is in git config, strip .bit/index suffix to get base path.
+resolveFromGitConfig :: String -> IO (Maybe Remote)
+resolveFromGitConfig name = do
+    mUrl <- Git.getRemoteUrl name
+    case mUrl of
+        Just url | not (null url) -> pure (Just (mkRemote name (stripBitIndexSuffix url)))
+        _ -> pure Nothing
+
+-- | Device remote: read target from file, resolve device UUID.
+resolveDeviceRemote :: FilePath -> String -> IO (Maybe Remote)
+resolveDeviceRemote cwd name = do
+    mTarget <- Device.readRemoteFile cwd name
+    case mTarget of
+        Just target -> do
+            res <- Device.resolveRemoteTarget cwd target
+            case res of
+                Device.Resolved url -> pure (Just (mkRemote name url))
+                Device.NotConnected _ -> pure Nothing
+        Nothing -> pure Nothing
+
+-- | Cloud remote: read target from file (rclone URL).
+resolveCloudRemote :: FilePath -> String -> IO (Maybe Remote)
+resolveCloudRemote cwd name = do
+    mTarget <- Device.readRemoteFile cwd name
+    case mTarget of
+        Just target -> do
+            res <- Device.resolveRemoteTarget cwd target
+            case res of
+                Device.Resolved url -> pure (Just (mkRemote name url))
+                Device.NotConnected _ -> pure Nothing
+        Nothing -> pure Nothing
+
+-- | Backward compat: try remote file, then git config.
+resolveOldFormat :: FilePath -> String -> IO (Maybe Remote)
+resolveOldFormat cwd name = do
     mTarget <- Device.readRemoteFile cwd name
     case mTarget of
         Just target -> do
@@ -5819,11 +6046,19 @@ resolveRemote cwd name = do
                 Device.Resolved url -> pure (Just (mkRemote name url))
                 Device.NotConnected _ -> pure Nothing
         Nothing -> do
-            -- Fall back to git remote URL
             mUrl <- Git.getRemoteUrl name
             case mUrl of
-                Just url | not (null url) -> pure (Just (mkRemote name url))
+                Just url | not (null url) -> pure (Just (mkRemote name (stripBitIndexSuffix url)))
                 _ -> pure Nothing
+
+-- | Strip /.bit/index or \.bit\index suffix from a git remote URL to get the base path.
+stripBitIndexSuffix :: String -> String
+stripBitIndexSuffix url =
+    let normalized = map (\c -> if c == '\\' then '/' else c) url
+        suffix = "/.bit/index"
+    in if suffix `isSuffixOf` normalized
+       then take (length url - length suffix) url
+       else url
 
 -- | Get the default remote for push/pull/fetch.
 -- Checks branch tracking config, falls back to "origin".
@@ -7303,25 +7538,30 @@ verifyLocal :: FilePath -> Maybe (IORef Int) -> Concurrency -> IO (Int, [VerifyI
 verifyLocal cwd = verifyLocalAt cwd
 
 -- | Extract metadata from a bundle's HEAD commit.
--- First fetches the bundle into the repo, then reads metadata from refs/remotes/origin/main.
+-- Reads the hash from the bundle, then loads metadata from that commit.
+-- The objects must already be in the repo (via git fetch <name> in saveFetchedBundle).
+-- Falls back to fetching from the bundle file directly if objects aren't available.
 -- Returns all metadata entries (binary + text). Callers extract what they need
 -- via 'binaryEntries' or 'allEntryPaths'.
 loadMetadataFromBundle :: BundleName -> IO [MetadataEntry]
 loadMetadataFromBundle bundleName = do
-  -- First, fetch the bundle into the repo so we can read from it
-  fetchCode <- Git.fetchFromBundle bundleName
-  case fetchCode of
-    ExitSuccess -> do
-      -- Get the remote HEAD hash (now available as refs/remotes/origin/main)
-      (_code, out, _) <- readProcessWithExitCode "git"
-        [ "-C", bitIndexPath
-        , "rev-parse"
-        , "refs/remotes/origin/main"
-        ] ""
-      case filter (not . isSpace) out of
-        [] -> pure []
-        headHash -> loadMetadata (FromCommit headHash) Sequential
-    _ -> pure []
+  -- Get the hash from the bundle
+  mHash <- Git.getHashFromBundle bundleName
+  case mHash of
+    Nothing -> pure []
+    Just headHash -> do
+      -- Try to load from the commit (objects should already be fetched)
+      entries <- loadMetadata (FromCommit headHash) Sequential
+      if null entries
+        then do
+          -- Objects not in repo yet — fetch from bundle file directly
+          let bundlePath = fromCwdPath (bundleCwdPath bundleName)
+          (fetchCode, _, _) <- readProcessWithExitCode "git"
+            ["-C", bitIndexPath, "fetch", bundlePath, "+refs/heads/*:refs/remotes/bundle/*"] ""
+          case fetchCode of
+            ExitSuccess -> loadMetadata (FromCommit headHash) Sequential
+            _ -> pure []
+        else pure entries
 
 -- | Verify remote files match remote metadata.
 -- Sets up a temporary working tree in .bit/vremotes/<name>/, checks out the
@@ -7641,538 +7881,509 @@ parseExtensions linesOfText =
 *Source file.*
 
 ```haskell
-{-# LANGUAGE MultiWayIf #-}
-
-module Internal.Git
-    ( add
-    , commit
-    , commitFile
-    , diff
-    , init
-    , reset
-    , rm
-    , mv
-    , branch
-    , merge
-    , createBundle
-    , config
-    , getLocalHead
-    , checkIsAhead
-    , getHashFromBundle
-    , restore
-    , checkout
-    , status
-    , setupRemote
-    , addRemote
-    , getRemoteUrl
-    , getTrackedRemoteName
-    , fetchFromBundle
-    , updateRemoteTrackingBranch
-    , updateRemoteTrackingBranchToHead
-    , updateRemoteTrackingBranchToHash
-    , setupBranchTracking
-    , setupBranchTrackingFor
-    , unsetBranchUpstream
-    , mergeOriginMain
-    , mergeNoCommit
-    , mergeNoCommitAllowUnrelated
-    , mergeAbort
-    , isMergeInProgress
-    , checkoutRemoteAsMain
-    , getConflictedFiles
-    , getConflictType
-    , checkoutOurs
-    , checkoutTheirs
-    , runGitRaw
-    , runGitRawAt
-    , runGitWithOutput
-    , runGitAt
-    , rewriteGitHints
-    , ConflictType(..)
-    , readFileFromRef
-    , listFilesInRef
-    , fsck
-    , hasStagedChanges
-    , getDiffNameStatus
-    , getFilesAtCommit
-    , NameStatusChange(..)
-    , parseNameStatusOutput
-    ) where
-
-import Data.Maybe (mapMaybe, listToMaybe)
-
-import System.Process (readProcessWithExitCode)
-import System.Exit (ExitCode(..))
-import Internal.Config
-import Data.Char (isSpace)
-import Control.Monad (when, guard)
-import Prelude hiding (init)
-import Data.List (isPrefixOf)
-import System.IO (hPutStr, hPutStrLn, stderr)
-import System.Environment (lookupEnv)
-
-baseFlags :: [String]
-baseFlags = ["-C", bitIndexPath]
-
--- | Represents the subset of Git functionality rgit uses
-data GitCommand
-    = Init { _separateGitDir :: FilePath }
-    | Config { _configName :: String, _configValue :: String }
-    | RevParse { _revParseRef :: String }
-    | CommitFile { _commitMessage :: String, _commitFile :: FilePath }
-    | RevList { _revListLeft :: String, _revListRight :: String }
-    | CreateBundle { _createBundlePath :: FilePath }
-    | GetBundleHead { _getBundleHeadPath :: FilePath }
-    | IsAncestor { _ancestorHash :: String, _descendantHash :: String }
-    | GetHead
-
--- | Run a Git command and return (ExitCode, StdOut, StdErr)
-runGit :: GitCommand -> IO (ExitCode, String, String)
-runGit cmd = do
-    let subArgs = translateCommand cmd
-    let fullArgs = baseFlags ++ subArgs
-    -- We use readProcessWithExitCode so we can handle errors without crashing
-    readProcessWithExitCode "git" fullArgs ""
-  where
-    translateCommand :: GitCommand -> [String]
-    translateCommand c = case c of
-        Init _dir ->
-            -- dir is the full path to .git directory (e.g., .rgit/index/.git)
-            -- We need to change to the parent directory and run git init there
-            -- Git will automatically create .git in the current directory
-            ["init"]
-
-        Config k v ->
-            ["config", k, v]
-
-        RevParse r ->
-            ["rev-parse", r]
-
-        CommitFile msg f ->
-            -- Using "-- f" at the end tells Git to only look at that path
-            ["commit", "-m", msg, "--", f]
-
-        RevList l r ->
-            ["rev-list", "--left-right", "--count", l ++ "..." ++ r]
-
-        CreateBundle path ->
-            ["bundle", "create", path, "--all"]
-
-        GetBundleHead path ->
-            ["bundle", "list-heads", path]
-
-        IsAncestor a d ->
-            ["merge-base", "--is-ancestor", a, d]
-
-        GetHead ->
-            ["rev-parse", "HEAD"]
-
-getLocalHead :: IO (Maybe String)
-getLocalHead = do
-    (code, out, _) <- runGit GetHead
-    pure (guard (code == ExitSuccess) >> Just (filter (not . isSpace) out))
-
-getHashFromBundle :: BundleName -> IO (Maybe String)
-getHashFromBundle bundleName = do
-    let (GitRelPath relPath) = bundleGitRelPath bundleName
-    (code, out, _) <- runGit (GetBundleHead relPath)
-    pure (guard (code == ExitSuccess && not (null out)) >> listToMaybe (words out))
-
-runGitCommand :: GitCommand -> IO ExitCode
-runGitCommand cmd = do
-    (c, o, e) <- runGit cmd
-    -- Don't print error messages for IsAncestor since non-zero exit codes are expected
-    -- (they indicate "no, not an ancestor" which is a valid answer, not an error)
-    when (c /= ExitSuccess && not (isAncestorCommand cmd)) $ 
-        hPutStrLn stderr ("bit: git command failed: " ++ e)
-    putStr o
-    hPutStr stderr e
-    pure c
-  where
-    isAncestorCommand (IsAncestor _ _) = True
-    isAncestorCommand _ = False
-
-commitFile :: String -> FilePath -> IO ExitCode
-commitFile msg filePath = runGitCommand (CommitFile msg filePath)
-
-init :: FilePath -> IO ExitCode
-init dir = runGitCommand (Init dir)
-
-createBundle :: BundleName -> IO ExitCode
-createBundle bundleName =
-    let (GitRelPath relPath) = bundleGitRelPath bundleName
-    in runGitCommand (CreateBundle relPath)
-
-config :: String -> String -> IO ExitCode
-config configName configValue = runGitCommand (Config configName configValue)
-
--- | Check if @localHash@ is ahead of @remoteHash@ (i.e., remote is an ancestor of local).
--- Parameter order: remote hash first, local hash second — matching @git merge-base --is-ancestor@.
-checkIsAhead :: String -> String -> IO Bool
-checkIsAhead remoteHash localHash =
-    (== ExitSuccess) <$> runGitCommand (IsAncestor remoteHash localHash)
-
-replace :: String -> String -> String -> String
-replace _ _ [] = []
-replace old new str@(c:cs)
-    | old `isPrefixOf` str = new ++ replace old new (drop (length old) str)
-    | otherwise            = c : replace old new cs
-
-rewriteGitHints :: String -> String
-rewriteGitHints =
-    replace "(use \"git " "(use \"bit "
-
-
-
-runGitRaw :: [String] -> IO ExitCode
-runGitRaw args = do
-  noColor <- lookupEnv "BIT_NO_COLOR"
-  let colorFlag = case noColor of
-        Just "1" -> "never"
-        Just "true" -> "never"
-        _ -> "auto"
-  let fullArgs =
-        baseFlags
-        ++ ["-c", "color.ui=" ++ colorFlag]
-        ++ args
-
-  (code, out, err) <- readProcessWithExitCode "git" fullArgs ""
-
-  putStr (rewriteGitHints out)
-  hPutStr stderr (rewriteGitHints err)
-
-  case code of
-    ExitSuccess   -> pure ()
-    ExitFailure n ->
-      hPutStrLn stderr ("bit: git exited with code " ++ show n)
-
-  pure code
-
--- | Like runGitRaw but targets an arbitrary directory instead of .bit/index.
-runGitRawAt :: FilePath -> [String] -> IO ExitCode
-runGitRawAt dir args = do
-  noColor <- lookupEnv "BIT_NO_COLOR"
-  let colorFlag = case noColor of
-        Just "1" -> "never"
-        Just "true" -> "never"
-        _ -> "auto"
-  let fullArgs =
-        ["-C", dir]
-        ++ ["-c", "color.ui=" ++ colorFlag]
-        ++ args
-
-  (code, out, err) <- readProcessWithExitCode "git" fullArgs ""
-
-  putStr (rewriteGitHints out)
-  hPutStr stderr (rewriteGitHints err)
-
-  case code of
-    ExitSuccess   -> pure ()
-    ExitFailure n ->
-      hPutStrLn stderr ("bit: git exited with code " ++ show n)
-
-  pure code
-
-add :: [String] -> IO ExitCode
-add     = runGitRaw . ("add" :)
-commit :: [String] -> IO ExitCode
-commit  = runGitRaw . ("commit" :)
-diff :: [String] -> IO ExitCode
-diff    = runGitRaw . ("diff" :)
-restore :: [String] -> IO ExitCode
-restore  = runGitRaw . ("restore" :)
-checkout :: [String] -> IO ExitCode
-checkout = runGitRaw . ("checkout" :)
-status :: [String] -> IO ExitCode
-status   = runGitRaw . ("status" :)
-reset :: [String] -> IO ExitCode
-reset   = runGitRaw . ("reset" :)
-rm :: [String] -> IO ExitCode
-rm      = runGitRaw . ("rm" :)
-mv :: [String] -> IO ExitCode
-mv      = runGitRaw . ("mv" :)
-branch :: [String] -> IO ExitCode
-branch  = runGitRaw . ("branch" :)
-merge :: [String] -> IO ExitCode
-merge   = runGitRaw . ("merge" :)
-
--- | Add or update a remote (Git-style: git remote add <name> <url> / set-url if exists)
-addRemote :: String -> String -> IO ExitCode
-addRemote remoteName url = do
-    (code, _, _) <- readProcessWithExitCode "git" (baseFlags ++ ["remote", "get-url", remoteName]) ""
-    case code of
-        ExitSuccess -> do
-            readProcessWithExitCode "git" (baseFlags ++ ["remote", "set-url", remoteName, url]) "" >>= \(c, _, _) -> pure c
-        ExitFailure _ -> do
-            readProcessWithExitCode "git" (baseFlags ++ ["remote", "add", remoteName, url]) "" >>= \(c, _, _) -> pure c
-
--- | Get the URL for a remote by name (git remote get-url <name>). Returns Nothing if remote missing.
-getRemoteUrl :: String -> IO (Maybe String)
-getRemoteUrl remoteName = do
-    (code, out, _) <- readProcessWithExitCode "git" (baseFlags ++ ["remote", "get-url", remoteName]) ""
-    pure $ case code of
-        ExitSuccess -> Just (filter (/= '\n') out)
-        _ -> Nothing
-
--- | Get the remote name that the current branch tracks (branch.main.remote).
--- Falls back to "origin" if not configured — this means commands work with
--- a reasonable default even without explicit -u, but callers should be aware
--- that "origin" fallback doesn't mean tracking IS configured.
-getTrackedRemoteName :: IO String
-getTrackedRemoteName = do
-    (code, out, _) <- readProcessWithExitCode "git" (baseFlags ++ ["config", "--get", "branch.main.remote"]) ""
-    pure $ case code of
-        ExitSuccess -> filter (/= '\n') out
-        _ -> "origin"
-
--- | Set up a git remote named "origin" pointing to the given URL (legacy / internal use)
-setupRemote :: String -> IO ExitCode
-setupRemote url = addRemote "origin" url
-
--- | Pull from a bundle file into the local repo: fetch the bundle's refs so all
--- objects and refs/remotes/origin/main exist in .rgit/index/.git. This is the "real"
--- pull from the fetched bundle; without it, the ref would point to a hash not in the repo.
-fetchFromBundle :: BundleName -> IO ExitCode
-fetchFromBundle bundleName = do
-    let (GitRelPath bundle) = bundleGitRelPath bundleName
-    (code, out, err) <- readProcessWithExitCode "git"
-        (baseFlags ++ ["fetch", bundle, "+refs/heads/main:refs/remotes/origin/main"]) ""
-    putStr out
-    hPutStr stderr err
-    pure code
-
--- | Update the remote tracking branch refs/remotes/origin/main to point to the hash from the bundle.
--- Use when the objects are already in the repo (e.g. after push); for fetch/pull use fetchFromBundle.
-updateRemoteTrackingBranch :: BundleName -> IO ExitCode
-updateRemoteTrackingBranch bundleName =
-    getHashFromBundle bundleName >>= maybe (pure (ExitFailure 1)) updateRemoteTrackingBranchToHash
-
--- | Set refs/remotes/origin/main to a specific hash. Use after a successful pull so status shows
--- "up to date with 'origin/main'" instead of "ahead by N commits".
-updateRemoteTrackingBranchToHash :: String -> IO ExitCode
-updateRemoteTrackingBranchToHash hash =
-    readProcessWithExitCode "git" (baseFlags ++ ["update-ref", "refs/remotes/origin/main", hash]) "" >>= \(c, _, _) -> pure c
-
--- | Set refs/remotes/origin/main to current HEAD.
--- WARNING: Only correct after PUSH (where remote now matches local HEAD).
--- After PULL/MERGE, use updateRemoteTrackingBranchToHash with the bundle hash instead,
--- because HEAD includes local merge commits the remote doesn't have.
--- See: "Tracking Ref Invariant" in docs/spec.md.
-updateRemoteTrackingBranchToHead :: IO ExitCode
-updateRemoteTrackingBranchToHead = do
-    (code, out, _) <- readProcessWithExitCode "git" (baseFlags ++ ["rev-parse", "HEAD"]) ""
-    case filter (/= '\n') out of
-        hash | code == ExitSuccess && not (null hash) ->
-            updateRemoteTrackingBranchToHash hash
-        _ -> pure (ExitFailure 1)
-
--- | Set up the local branch to track a specific remote
--- Configures branch.main.remote and branch.main.merge
-setupBranchTrackingFor :: String -> IO ExitCode
-setupBranchTrackingFor remoteName = do
-    (code1, _, _) <- readProcessWithExitCode "git"
-        (baseFlags ++ ["config", "branch.main.remote", remoteName]) ""
-    (code2, _, _) <- readProcessWithExitCode "git"
-        (baseFlags ++ ["config", "branch.main.merge", "refs/heads/main"]) ""
-    case (code1, code2) of
-        (ExitSuccess, ExitSuccess) -> pure ExitSuccess
-        _ -> pure (ExitFailure 1)
-
--- | Set up the local branch to track origin/main
--- This configures branch.main.remote and branch.main.merge so git status knows what to compare
-setupBranchTracking :: IO ExitCode
-setupBranchTracking = setupBranchTrackingFor "origin"
-
--- | Unset the upstream for the current branch (clears "upstream is gone" when remote refs are missing)
-unsetBranchUpstream :: IO ExitCode
-unsetBranchUpstream = do
-    (code, _, _) <- readProcessWithExitCode "git" (baseFlags ++ ["branch", "--unset-upstream"]) ""
-    pure code
-
--- | Merge refs/remotes/origin/main into the current branch (HEAD).
--- Used by rgit pull after fetching the remote bundle.
-mergeOriginMain :: IO ExitCode
-mergeOriginMain = runGitRaw ["merge", "refs/remotes/origin/main", "--no-edit"]
-
--- | Run git with baseFlags; returns (exitCode, stdout, stderr). Does not rewrite hints.
-runGitWithOutput :: [String] -> IO (ExitCode, String, String)
-runGitWithOutput args = do
-  let fullArgs = baseFlags ++ ["-c", "color.ui=never"] ++ args
-  readProcessWithExitCode "git" fullArgs ""
-
--- | Merge without committing (for pull flow). Returns (exitCode, stdout, stderr).
-mergeNoCommit :: IO (ExitCode, String, String)
-mergeNoCommit = runGitWithOutput ["merge", "--no-commit", "--no-ff", "refs/remotes/origin/main"]
-
--- | Like mergeNoCommit but allows merging unrelated histories (e.g. first pull into a fresh init).
-mergeNoCommitAllowUnrelated :: IO (ExitCode, String, String)
-mergeNoCommitAllowUnrelated = runGitWithOutput ["merge", "--no-commit", "--no-ff", "--allow-unrelated-histories", "refs/remotes/origin/main"]
-
--- | Abort an in-progress merge.
-mergeAbort :: IO ExitCode
-mergeAbort = do
-  (code, out, err) <- runGitWithOutput ["merge", "--abort"]
-  putStr (rewriteGitHints out)
-  hPutStr stderr (rewriteGitHints err)
-  pure code
-
--- | True if a merge is in progress (MERGE_HEAD exists).
-isMergeInProgress :: IO Bool
-isMergeInProgress = do
-  (code, _, _) <- runGitWithOutput ["rev-parse", "--verify", "MERGE_HEAD"]
-  pure (code == ExitSuccess)
-
--- | Checkout refs/remotes/origin/main as the local main branch.
--- Used on first pull when there are no local commits (unborn branch).
--- This avoids the need for merge and gives us the remote's history directly.
---
--- TRACKING CONTRACT: This function NEVER modifies branch tracking config.
--- Uses --no-track to prevent git from auto-setting branch.main.remote.
--- Callers who need tracking must call setupBranchTrackingFor explicitly.
---
--- Uses -f (force) to overwrite any local files created during init.
-checkoutRemoteAsMain :: IO ExitCode
-checkoutRemoteAsMain = do
-  -- Use checkout -B to create/reset branch and checkout in one step
-  -- Use -f to force overwrite of any local files (like .gitattributes from init)
-  -- Use --no-track to prevent auto-setting branch.main.remote (git-standard: require explicit -u)
-  (code, _, _) <- runGitWithOutput ["checkout", "-f", "-B", "main", "--no-track", "refs/remotes/origin/main"]
-  pure code
-
--- | Paths relative to work tree (index/...) that are unmerged.
-getConflictedFiles :: IO [FilePath]
-getConflictedFiles = do
-  (code, out, _) <- runGitWithOutput ["diff", "--name-only", "--diff-filter=U"]
-  pure $ case code of
-    ExitSuccess -> filter (not . null) (lines out)
-    _ -> []
-
--- | Conflict type for Git-like messages. Path is work-tree relative (e.g. index/src/model.bin).
-data ConflictType
-  = ContentConflict FilePath   -- both modified
-  | ModifyDelete FilePath Bool -- True = deleted in HEAD (ours)
-  | AddAdd FilePath            -- both added different
-  deriving (Show, Eq)
-
--- | Determine conflict type using git ls-files -u. Path is as in index (e.g. index/foo).
--- Format: "mode SP oid SP stage TAB name"
-getConflictType :: FilePath -> IO ConflictType
-getConflictType path = do
-  (_, out, _) <- runGitWithOutput ["ls-files", "-u", "--", path]
-  let beforeTab line = takeWhile (/= '\t') line
-  let stageNums :: [Int]
-      stageNums = mapMaybe stageNum (lines out)
-      stageNum line = case reverse (words (beforeTab line)) of
-        ("1":_) -> Just (1 :: Int)
-        ("2":_) -> Just 2
-        ("3":_) -> Just 3
-        _ -> Nothing
-  let has1 = 1 `elem` stageNums
-  let has2 = 2 `elem` stageNums
-  let has3 = 3 `elem` stageNums
-  pure $ if | has2 && has3 && has1     -> ContentConflict path
-            | has2 && has3 && not has1 -> AddAdd path
-            | has2 && not has3         -> ModifyDelete path False  -- deleted in theirs
-            | has3 && not has2         -> ModifyDelete path True   -- deleted in ours (HEAD)
-            | otherwise                -> ContentConflict path
-
--- | Check out our version for path (work-tree path under .rgit/index).
-checkoutOurs :: FilePath -> IO ExitCode
-checkoutOurs path = do
-  (code, out, err) <- runGitWithOutput ["checkout", "--ours", "--", path]
-  putStr (rewriteGitHints out)
-  hPutStr stderr (rewriteGitHints err)
-  pure code
-
--- | Check out their version for path.
-checkoutTheirs :: FilePath -> IO ExitCode
-checkoutTheirs path = do
-  (code, out, err) <- runGitWithOutput ["checkout", "--theirs", "--", path]
-  putStr (rewriteGitHints out)
-  hPutStr stderr (rewriteGitHints err)
-  pure code
-
--- | Read file content from a Git ref (e.g., "refs/remotes/origin/main:path/to/file").
--- Returns Nothing if file doesn't exist in that ref.
-readFileFromRef :: String -> FilePath -> IO (Maybe String)
-readFileFromRef gitRef path = do
-  (code, out, _err) <- runGitWithOutput ["show", gitRef ++ ":" ++ path]
-  pure $ case code of
-    ExitSuccess | not (null out) -> Just out
-    _ -> Nothing
-
--- | List all files in a Git ref's tree (recursive). Returns paths relative to work tree root.
-listFilesInRef :: String -> IO [FilePath]
-listFilesInRef gitRef = do
-  (code, out, _) <- runGitWithOutput ["ls-tree", "-r", "--name-only", gitRef]
-  pure $ case code of
-    ExitSuccess -> filter (not . null) (lines out)
-    _ -> []
-
--- | Run git fsck to check metadata history integrity.
--- Returns (exitCode, output, errorOutput).
-fsck :: IO (ExitCode, String, String)
-fsck = runGitWithOutput ["fsck"]
-
--- | Check if there are staged changes ready to commit.
--- Returns True if there are staged changes, False otherwise.
-hasStagedChanges :: IO Bool
-hasStagedChanges = do
-  (code, _, _) <- runGitWithOutput ["diff", "--cached", "--quiet"]
-  pure (code == ExitFailure 1)  -- git diff --cached --quiet exits with 1 if there are changes
-
--- | Parsed line from `git diff --name-status` output.
--- Makes invalid states unrepresentable (no bare Char + Maybe tuple).
-data NameStatusChange
-    = Added FilePath
-    | Deleted FilePath
-    | Modified FilePath
-    | Renamed FilePath FilePath  -- ^ old path, new path
-    | Copied FilePath FilePath   -- ^ old path, new path
-    deriving (Show, Eq)
-
--- | Parse raw `git diff --name-status` output into structured changes.
-parseNameStatusOutput :: String -> [NameStatusChange]
-parseNameStatusOutput = mapMaybe parseLine . lines
-  where
-    parseLine line = case line of
-        (fileStatus:rest)
-            | fileStatus == 'R' || fileStatus == 'C' ->
-                case words (dropWhile (\c -> c /= '\t' && c /= ' ') rest) of
-                    (old:new:_) -> Just $ case fileStatus of
-                        'R' -> Renamed old new
-                        _  -> Copied old new
-                    _ -> Nothing
-            | fileStatus == 'A' ->
-                case words rest of (path:_) -> Just (Added path); _ -> Nothing
-            | fileStatus == 'D' ->
-                case words rest of (path:_) -> Just (Deleted path); _ -> Nothing
-            | fileStatus == 'M' ->
-                case words rest of (path:_) -> Just (Modified path); _ -> Nothing
-            | otherwise -> Nothing
-        _ -> Nothing
-
--- | Get the list of file changes between two commits.
-getDiffNameStatus :: String -> String -> IO [NameStatusChange]
-getDiffNameStatus oldHead newHead = do
-    (code, out, _) <- runGitWithOutput ["diff", "--name-status", oldHead, newHead]
-    pure $ case code of
-        ExitSuccess -> parseNameStatusOutput out
-        _ -> []
-
--- | Get all file paths at a given commit. Used when there's no old HEAD to diff against.
-getFilesAtCommit :: String -> IO [FilePath]
-getFilesAtCommit gitRef = do
-    (code, out, _) <- runGitWithOutput ["ls-tree", "-r", "--name-only", gitRef]
-    pure $ case code of
-        ExitSuccess -> filter (not . null) (lines out)
-        _ -> []
-
--- | Run a git command targeting a specific index path (for filesystem remotes).
--- This is used when operating on a remote filesystem repo directly.
--- The indexPath should be the path to the .bit/index directory (NOT the .git subdirectory).
-runGitAt :: FilePath -> [String] -> IO (ExitCode, String, String)
-runGitAt indexPath args = readProcessWithExitCode "git" (["-C", indexPath] ++ args) ""
+{-# LANGUAGE MultiWayIf #-}
+
+module Internal.Git
+    ( add
+    , commit
+    , commitFile
+    , diff
+    , init
+    , reset
+    , rm
+    , mv
+    , branch
+    , merge
+    , createBundle
+    , config
+    , getLocalHead
+    , checkIsAhead
+    , getHashFromBundle
+    , restore
+    , checkout
+    , status
+    , addRemote
+    , getRemoteUrl
+    , getTrackedRemoteName
+    , updateRemoteTrackingBranch
+    , updateRemoteTrackingBranchToHead
+    , updateRemoteTrackingBranchToHash
+    , setupBranchTracking
+    , setupBranchTrackingFor
+    , unsetBranchUpstream
+    , mergeAbort
+    , isMergeInProgress
+    , checkoutRemoteAsMain
+    , getConflictedFiles
+    , getConflictType
+    , checkoutOurs
+    , checkoutTheirs
+    , runGitRaw
+    , runGitRawAt
+    , runGitWithOutput
+    , runGitAt
+    , rewriteGitHints
+    , ConflictType(..)
+    , readFileFromRef
+    , listFilesInRef
+    , fsck
+    , hasStagedChanges
+    , getDiffNameStatus
+    , getFilesAtCommit
+    , remoteTrackingRef
+    , NameStatusChange(..)
+    , parseNameStatusOutput
+    ) where
+
+import Data.Maybe (mapMaybe, listToMaybe)
+
+import System.Process (readProcessWithExitCode)
+import System.Exit (ExitCode(..))
+import Internal.Config
+import Data.Char (isSpace)
+import Control.Monad (when, guard)
+import Prelude hiding (init)
+import Data.List (isPrefixOf)
+import System.IO (hPutStr, hPutStrLn, stderr)
+import System.Environment (lookupEnv)
+
+baseFlags :: [String]
+baseFlags = ["-C", bitIndexPath]
+
+-- | Build the tracking ref for a named remote: @refs/remotes/\<name\>/main@
+remoteTrackingRef :: String -> String
+remoteTrackingRef name = "refs/remotes/" ++ name ++ "/main"
+
+-- | Represents the subset of Git functionality rgit uses
+data GitCommand
+    = Init { _separateGitDir :: FilePath }
+    | Config { _configName :: String, _configValue :: String }
+    | RevParse { _revParseRef :: String }
+    | CommitFile { _commitMessage :: String, _commitFile :: FilePath }
+    | RevList { _revListLeft :: String, _revListRight :: String }
+    | CreateBundle { _createBundlePath :: FilePath }
+    | GetBundleHead { _getBundleHeadPath :: FilePath }
+    | IsAncestor { _ancestorHash :: String, _descendantHash :: String }
+    | GetHead
+
+-- | Run a Git command and return (ExitCode, StdOut, StdErr)
+runGit :: GitCommand -> IO (ExitCode, String, String)
+runGit cmd = do
+    let subArgs = translateCommand cmd
+    let fullArgs = baseFlags ++ subArgs
+    -- We use readProcessWithExitCode so we can handle errors without crashing
+    readProcessWithExitCode "git" fullArgs ""
+  where
+    translateCommand :: GitCommand -> [String]
+    translateCommand c = case c of
+        Init _dir ->
+            -- dir is the full path to .git directory (e.g., .rgit/index/.git)
+            -- We need to change to the parent directory and run git init there
+            -- Git will automatically create .git in the current directory
+            ["init"]
+
+        Config k v ->
+            ["config", k, v]
+
+        RevParse r ->
+            ["rev-parse", r]
+
+        CommitFile msg f ->
+            -- Using "-- f" at the end tells Git to only look at that path
+            ["commit", "-m", msg, "--", f]
+
+        RevList l r ->
+            ["rev-list", "--left-right", "--count", l ++ "..." ++ r]
+
+        CreateBundle path ->
+            ["bundle", "create", path, "--all"]
+
+        GetBundleHead path ->
+            ["bundle", "list-heads", path]
+
+        IsAncestor a d ->
+            ["merge-base", "--is-ancestor", a, d]
+
+        GetHead ->
+            ["rev-parse", "HEAD"]
+
+getLocalHead :: IO (Maybe String)
+getLocalHead = do
+    (code, out, _) <- runGit GetHead
+    pure (guard (code == ExitSuccess) >> Just (filter (not . isSpace) out))
+
+getHashFromBundle :: BundleName -> IO (Maybe String)
+getHashFromBundle bundleName = do
+    let (GitRelPath relPath) = bundleGitRelPath bundleName
+    (code, out, _) <- runGit (GetBundleHead relPath)
+    pure (guard (code == ExitSuccess && not (null out)) >> listToMaybe (words out))
+
+runGitCommand :: GitCommand -> IO ExitCode
+runGitCommand cmd = do
+    (c, o, e) <- runGit cmd
+    -- Don't print error messages for IsAncestor since non-zero exit codes are expected
+    -- (they indicate "no, not an ancestor" which is a valid answer, not an error)
+    when (c /= ExitSuccess && not (isAncestorCommand cmd)) $ 
+        hPutStrLn stderr ("bit: git command failed: " ++ e)
+    putStr o
+    hPutStr stderr e
+    pure c
+  where
+    isAncestorCommand (IsAncestor _ _) = True
+    isAncestorCommand _ = False
+
+commitFile :: String -> FilePath -> IO ExitCode
+commitFile msg filePath = runGitCommand (CommitFile msg filePath)
+
+init :: FilePath -> IO ExitCode
+init dir = runGitCommand (Init dir)
+
+createBundle :: BundleName -> IO ExitCode
+createBundle bundleName =
+    let (GitRelPath relPath) = bundleGitRelPath bundleName
+    in runGitCommand (CreateBundle relPath)
+
+config :: String -> String -> IO ExitCode
+config configName configValue = runGitCommand (Config configName configValue)
+
+-- | Check if @localHash@ is ahead of @remoteHash@ (i.e., remote is an ancestor of local).
+-- Parameter order: remote hash first, local hash second — matching @git merge-base --is-ancestor@.
+checkIsAhead :: String -> String -> IO Bool
+checkIsAhead remoteHash localHash =
+    (== ExitSuccess) <$> runGitCommand (IsAncestor remoteHash localHash)
+
+replace :: String -> String -> String -> String
+replace _ _ [] = []
+replace old new str@(c:cs)
+    | old `isPrefixOf` str = new ++ replace old new (drop (length old) str)
+    | otherwise            = c : replace old new cs
+
+rewriteGitHints :: String -> String
+rewriteGitHints =
+    replace "(use \"git " "(use \"bit "
+
+
+
+runGitRaw :: [String] -> IO ExitCode
+runGitRaw args = do
+  noColor <- lookupEnv "BIT_NO_COLOR"
+  let colorFlag = case noColor of
+        Just "1" -> "never"
+        Just "true" -> "never"
+        _ -> "auto"
+  let fullArgs =
+        baseFlags
+        ++ ["-c", "color.ui=" ++ colorFlag]
+        ++ args
+
+  (code, out, err) <- readProcessWithExitCode "git" fullArgs ""
+
+  putStr (rewriteGitHints out)
+  hPutStr stderr (rewriteGitHints err)
+
+  case code of
+    ExitSuccess   -> pure ()
+    ExitFailure n ->
+      hPutStrLn stderr ("bit: git exited with code " ++ show n)
+
+  pure code
+
+-- | Like runGitRaw but targets an arbitrary directory instead of .bit/index.
+runGitRawAt :: FilePath -> [String] -> IO ExitCode
+runGitRawAt dir args = do
+  noColor <- lookupEnv "BIT_NO_COLOR"
+  let colorFlag = case noColor of
+        Just "1" -> "never"
+        Just "true" -> "never"
+        _ -> "auto"
+  let fullArgs =
+        ["-C", dir]
+        ++ ["-c", "color.ui=" ++ colorFlag]
+        ++ args
+
+  (code, out, err) <- readProcessWithExitCode "git" fullArgs ""
+
+  putStr (rewriteGitHints out)
+  hPutStr stderr (rewriteGitHints err)
+
+  case code of
+    ExitSuccess   -> pure ()
+    ExitFailure n ->
+      hPutStrLn stderr ("bit: git exited with code " ++ show n)
+
+  pure code
+
+add :: [String] -> IO ExitCode
+add     = runGitRaw . ("add" :)
+commit :: [String] -> IO ExitCode
+commit  = runGitRaw . ("commit" :)
+diff :: [String] -> IO ExitCode
+diff    = runGitRaw . ("diff" :)
+restore :: [String] -> IO ExitCode
+restore  = runGitRaw . ("restore" :)
+checkout :: [String] -> IO ExitCode
+checkout = runGitRaw . ("checkout" :)
+status :: [String] -> IO ExitCode
+status   = runGitRaw . ("status" :)
+reset :: [String] -> IO ExitCode
+reset   = runGitRaw . ("reset" :)
+rm :: [String] -> IO ExitCode
+rm      = runGitRaw . ("rm" :)
+mv :: [String] -> IO ExitCode
+mv      = runGitRaw . ("mv" :)
+branch :: [String] -> IO ExitCode
+branch  = runGitRaw . ("branch" :)
+merge :: [String] -> IO ExitCode
+merge   = runGitRaw . ("merge" :)
+
+-- | Add or update a remote (Git-style: git remote add <name> <url> / set-url if exists)
+addRemote :: String -> String -> IO ExitCode
+addRemote remoteName url = do
+    (code, _, _) <- readProcessWithExitCode "git" (baseFlags ++ ["remote", "get-url", remoteName]) ""
+    case code of
+        ExitSuccess -> do
+            readProcessWithExitCode "git" (baseFlags ++ ["remote", "set-url", remoteName, url]) "" >>= \(c, _, _) -> pure c
+        ExitFailure _ -> do
+            readProcessWithExitCode "git" (baseFlags ++ ["remote", "add", remoteName, url]) "" >>= \(c, _, _) -> pure c
+
+-- | Get the URL for a remote by name (git remote get-url <name>). Returns Nothing if remote missing.
+getRemoteUrl :: String -> IO (Maybe String)
+getRemoteUrl remoteName = do
+    (code, out, _) <- readProcessWithExitCode "git" (baseFlags ++ ["remote", "get-url", remoteName]) ""
+    pure $ case code of
+        ExitSuccess -> Just (filter (/= '\n') out)
+        _ -> Nothing
+
+-- | Get the remote name that the current branch tracks (branch.main.remote).
+-- Falls back to "origin" if not configured — this means commands work with
+-- a reasonable default even without explicit -u, but callers should be aware
+-- that "origin" fallback doesn't mean tracking IS configured.
+getTrackedRemoteName :: IO String
+getTrackedRemoteName = do
+    (code, out, _) <- readProcessWithExitCode "git" (baseFlags ++ ["config", "--get", "branch.main.remote"]) ""
+    pure $ case code of
+        ExitSuccess -> filter (/= '\n') out
+        _ -> "origin"
+
+-- | Update the remote tracking branch refs/remotes/<name>/main to point to the hash from the bundle.
+-- Use when the objects are already in the repo (e.g. after push).
+updateRemoteTrackingBranch :: String -> BundleName -> IO ExitCode
+updateRemoteTrackingBranch name bundleName =
+    getHashFromBundle bundleName >>= maybe (pure (ExitFailure 1)) (updateRemoteTrackingBranchToHash name)
+
+-- | Set refs/remotes/<name>/main to a specific hash. Use after a successful pull so status shows
+-- "up to date with '<name>/main'" instead of "ahead by N commits".
+updateRemoteTrackingBranchToHash :: String -> String -> IO ExitCode
+updateRemoteTrackingBranchToHash name hash =
+    readProcessWithExitCode "git" (baseFlags ++ ["update-ref", remoteTrackingRef name, hash]) "" >>= \(c, _, _) -> pure c
+
+-- | Set refs/remotes/<name>/main to current HEAD.
+-- WARNING: Only correct after PUSH (where remote now matches local HEAD).
+-- After PULL/MERGE, use updateRemoteTrackingBranchToHash with the remote hash instead,
+-- because HEAD includes local merge commits the remote doesn't have.
+-- See: "Tracking Ref Invariant" in docs/spec.md.
+updateRemoteTrackingBranchToHead :: String -> IO ExitCode
+updateRemoteTrackingBranchToHead name = do
+    (code, out, _) <- readProcessWithExitCode "git" (baseFlags ++ ["rev-parse", "HEAD"]) ""
+    case filter (/= '\n') out of
+        hash | code == ExitSuccess && not (null hash) ->
+            updateRemoteTrackingBranchToHash name hash
+        _ -> pure (ExitFailure 1)
+
+-- | Set up the local branch to track a specific remote
+-- Configures branch.main.remote and branch.main.merge
+setupBranchTrackingFor :: String -> IO ExitCode
+setupBranchTrackingFor remoteName = do
+    (code1, _, _) <- readProcessWithExitCode "git"
+        (baseFlags ++ ["config", "branch.main.remote", remoteName]) ""
+    (code2, _, _) <- readProcessWithExitCode "git"
+        (baseFlags ++ ["config", "branch.main.merge", "refs/heads/main"]) ""
+    case (code1, code2) of
+        (ExitSuccess, ExitSuccess) -> pure ExitSuccess
+        _ -> pure (ExitFailure 1)
+
+-- | Set up the local branch to track origin/main
+-- This configures branch.main.remote and branch.main.merge so git status knows what to compare
+setupBranchTracking :: IO ExitCode
+setupBranchTracking = setupBranchTrackingFor "origin"
+
+-- | Unset the upstream for the current branch (clears "upstream is gone" when remote refs are missing)
+unsetBranchUpstream :: IO ExitCode
+unsetBranchUpstream = do
+    (code, _, _) <- readProcessWithExitCode "git" (baseFlags ++ ["branch", "--unset-upstream"]) ""
+    pure code
+
+-- | Run git with baseFlags; returns (exitCode, stdout, stderr). Does not rewrite hints.
+runGitWithOutput :: [String] -> IO (ExitCode, String, String)
+runGitWithOutput args = do
+  let fullArgs = baseFlags ++ ["-c", "color.ui=never"] ++ args
+  readProcessWithExitCode "git" fullArgs ""
+
+-- | Abort an in-progress merge.
+mergeAbort :: IO ExitCode
+mergeAbort = do
+  (code, out, err) <- runGitWithOutput ["merge", "--abort"]
+  putStr (rewriteGitHints out)
+  hPutStr stderr (rewriteGitHints err)
+  pure code
+
+-- | True if a merge is in progress (MERGE_HEAD exists).
+isMergeInProgress :: IO Bool
+isMergeInProgress = do
+  (code, _, _) <- runGitWithOutput ["rev-parse", "--verify", "MERGE_HEAD"]
+  pure (code == ExitSuccess)
+
+-- | Checkout refs/remotes/<name>/main as the local main branch.
+-- Used on first pull when there are no local commits (unborn branch).
+-- This avoids the need for merge and gives us the remote's history directly.
+--
+-- TRACKING CONTRACT: This function NEVER modifies branch tracking config.
+-- Uses --no-track to prevent git from auto-setting branch.main.remote.
+-- Callers who need tracking must call setupBranchTrackingFor explicitly.
+--
+-- Uses -f (force) to overwrite any local files created during init.
+checkoutRemoteAsMain :: String -> IO ExitCode
+checkoutRemoteAsMain name = do
+  -- Use checkout -B to create/reset branch and checkout in one step
+  -- Use -f to force overwrite of any local files (like .gitattributes from init)
+  -- Use --no-track to prevent auto-setting branch.main.remote (git-standard: require explicit -u)
+  (code, _, _) <- runGitWithOutput ["checkout", "-f", "-B", "main", "--no-track", remoteTrackingRef name]
+  pure code
+
+-- | Paths relative to work tree (index/...) that are unmerged.
+getConflictedFiles :: IO [FilePath]
+getConflictedFiles = do
+  (code, out, _) <- runGitWithOutput ["diff", "--name-only", "--diff-filter=U"]
+  pure $ case code of
+    ExitSuccess -> filter (not . null) (lines out)
+    _ -> []
+
+-- | Conflict type for Git-like messages. Path is work-tree relative (e.g. index/src/model.bin).
+data ConflictType
+  = ContentConflict FilePath   -- both modified
+  | ModifyDelete FilePath Bool -- True = deleted in HEAD (ours)
+  | AddAdd FilePath            -- both added different
+  deriving (Show, Eq)
+
+-- | Determine conflict type using git ls-files -u. Path is as in index (e.g. index/foo).
+-- Format: "mode SP oid SP stage TAB name"
+getConflictType :: FilePath -> IO ConflictType
+getConflictType path = do
+  (_, out, _) <- runGitWithOutput ["ls-files", "-u", "--", path]
+  let beforeTab line = takeWhile (/= '\t') line
+  let stageNums :: [Int]
+      stageNums = mapMaybe stageNum (lines out)
+      stageNum line = case reverse (words (beforeTab line)) of
+        ("1":_) -> Just (1 :: Int)
+        ("2":_) -> Just 2
+        ("3":_) -> Just 3
+        _ -> Nothing
+  let has1 = 1 `elem` stageNums
+  let has2 = 2 `elem` stageNums
+  let has3 = 3 `elem` stageNums
+  pure $ if | has2 && has3 && has1     -> ContentConflict path
+            | has2 && has3 && not has1 -> AddAdd path
+            | has2 && not has3         -> ModifyDelete path False  -- deleted in theirs
+            | has3 && not has2         -> ModifyDelete path True   -- deleted in ours (HEAD)
+            | otherwise                -> ContentConflict path
+
+-- | Check out our version for path (work-tree path under .rgit/index).
+checkoutOurs :: FilePath -> IO ExitCode
+checkoutOurs path = do
+  (code, out, err) <- runGitWithOutput ["checkout", "--ours", "--", path]
+  putStr (rewriteGitHints out)
+  hPutStr stderr (rewriteGitHints err)
+  pure code
+
+-- | Check out their version for path.
+checkoutTheirs :: FilePath -> IO ExitCode
+checkoutTheirs path = do
+  (code, out, err) <- runGitWithOutput ["checkout", "--theirs", "--", path]
+  putStr (rewriteGitHints out)
+  hPutStr stderr (rewriteGitHints err)
+  pure code
+
+-- | Read file content from a Git ref (e.g., "refs/remotes/origin/main:path/to/file").
+-- Returns Nothing if file doesn't exist in that ref.
+readFileFromRef :: String -> FilePath -> IO (Maybe String)
+readFileFromRef gitRef path = do
+  (code, out, _err) <- runGitWithOutput ["show", gitRef ++ ":" ++ path]
+  pure $ case code of
+    ExitSuccess | not (null out) -> Just out
+    _ -> Nothing
+
+-- | List all files in a Git ref's tree (recursive). Returns paths relative to work tree root.
+listFilesInRef :: String -> IO [FilePath]
+listFilesInRef gitRef = do
+  (code, out, _) <- runGitWithOutput ["ls-tree", "-r", "--name-only", gitRef]
+  pure $ case code of
+    ExitSuccess -> filter (not . null) (lines out)
+    _ -> []
+
+-- | Run git fsck to check metadata history integrity.
+-- Returns (exitCode, output, errorOutput).
+fsck :: IO (ExitCode, String, String)
+fsck = runGitWithOutput ["fsck"]
+
+-- | Check if there are staged changes ready to commit.
+-- Returns True if there are staged changes, False otherwise.
+hasStagedChanges :: IO Bool
+hasStagedChanges = do
+  (code, _, _) <- runGitWithOutput ["diff", "--cached", "--quiet"]
+  pure (code == ExitFailure 1)  -- git diff --cached --quiet exits with 1 if there are changes
+
+-- | Parsed line from `git diff --name-status` output.
+-- Makes invalid states unrepresentable (no bare Char + Maybe tuple).
+data NameStatusChange
+    = Added FilePath
+    | Deleted FilePath
+    | Modified FilePath
+    | Renamed FilePath FilePath  -- ^ old path, new path
+    | Copied FilePath FilePath   -- ^ old path, new path
+    deriving (Show, Eq)
+
+-- | Parse raw `git diff --name-status` output into structured changes.
+parseNameStatusOutput :: String -> [NameStatusChange]
+parseNameStatusOutput = mapMaybe parseLine . lines
+  where
+    parseLine line = case line of
+        (fileStatus:rest)
+            | fileStatus == 'R' || fileStatus == 'C' ->
+                case words (dropWhile (\c -> c /= '\t' && c /= ' ') rest) of
+                    (old:new:_) -> Just $ case fileStatus of
+                        'R' -> Renamed old new
+                        _  -> Copied old new
+                    _ -> Nothing
+            | fileStatus == 'A' ->
+                case words rest of (path:_) -> Just (Added path); _ -> Nothing
+            | fileStatus == 'D' ->
+                case words rest of (path:_) -> Just (Deleted path); _ -> Nothing
+            | fileStatus == 'M' ->
+                case words rest of (path:_) -> Just (Modified path); _ -> Nothing
+            | otherwise -> Nothing
+        _ -> Nothing
+
+-- | Get the list of file changes between two commits.
+getDiffNameStatus :: String -> String -> IO [NameStatusChange]
+getDiffNameStatus oldHead newHead = do
+    (code, out, _) <- runGitWithOutput ["diff", "--name-status", oldHead, newHead]
+    pure $ case code of
+        ExitSuccess -> parseNameStatusOutput out
+        _ -> []
+
+-- | Get all file paths at a given commit. Used when there's no old HEAD to diff against.
+getFilesAtCommit :: String -> IO [FilePath]
+getFilesAtCommit gitRef = do
+    (code, out, _) <- runGitWithOutput ["ls-tree", "-r", "--name-only", gitRef]
+    pure $ case code of
+        ExitSuccess -> filter (not . null) (lines out)
+        _ -> []
+
+-- | Run a git command targeting a specific index path (for filesystem remotes).
+-- This is used when operating on a remote filesystem repo directly.
+-- The indexPath should be the path to the .bit/index directory (NOT the .git subdirectory).
+runGitAt :: FilePath -> [String] -> IO (ExitCode, String, String)
+runGitAt indexPath args = readProcessWithExitCode "git" (["-C", indexPath] ++ args) ""
 ```
 
 ---

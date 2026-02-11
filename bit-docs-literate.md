@@ -1997,8 +1997,8 @@ project/
     │   │   └── video.mp4   # Metadata file (NOT the actual video)
     │   └── data/
     │       └── dataset.bin # Metadata file (NOT the actual data)
-    ├── remotes/            # Named remote configs (device-aware)
-    │   └── origin          # Remote target (cloud URL or device:path)
+    ├── remotes/            # Named remote configs (typed)
+    │   └── origin          # Remote type + optional target
     ├── devices/            # Device identity files
     ├── target              # Legacy: single remote URL
     └── ignore              # Gitignore-style rules
@@ -2168,7 +2168,7 @@ bit/Commands.hs → Bit.hs → Internal/Transport.hs → rclone (only here!)
 | `NameStatusChange` | `Internal.Git` | Added, Deleted, Modified, Renamed, Copied — parsed `git diff --name-status` output (replaces bare `(Char, FilePath, Maybe FilePath)` tuple) |
 | `VerifyTarget` | `bit.Core.Verify` | VerifyLocal or VerifyRemote — whether verify checks local or remote |
 | `DeviceInfo` | `bit.Device` | UUID + storage type + optional hardware serial |
-| `RemoteTarget` | `bit.Device` | TargetCloud, TargetDevice, TargetLocalPath |
+| `RemoteType` | `bit.Device` | RemoteFilesystem, RemoteDevice, RemoteCloud |
 
 ### Sync Pipeline
 
@@ -2372,27 +2372,41 @@ bit supports two kinds of remotes:
 - **Cloud remotes**: rclone-based (e.g., `gdrive:Projects/foo`). Identified by URL. Uses bundle + rclone sync.
 - **Filesystem remotes**: Local/network paths (USB drives, network shares, local directories). Creates a **full bit repository** at the remote location.
 
-The `bit.Device` module handles filesystem remote resolution:
+The `bit.Device` module handles remote type classification and device resolution:
+- `RemoteType`: `RemoteFilesystem` (fixed paths), `RemoteDevice` (removable/network drives), `RemoteCloud` (rclone-based)
+- `isFilesystemType`: True for both `RemoteFilesystem` and `RemoteDevice` (both use direct git operations)
 - Physical storage: Identified by UUID + hardware serial (survives drive letter changes)
 - Network storage: Identified by UUID only
 - Each volume can have a `.bit-store` file at its root containing its UUID
-- Remote targets are stored in `.bit/remotes/<name>` as either cloud URLs or `device_name:relative_path`
+- Remote configs stored in `.bit/remotes/<name>` with typed format:
+  - `type: filesystem` (path lives only in git config as named remote)
+  - `type: cloud\ntarget: gdrive:Projects/foo` (rclone path for transport)
+  - `type: device\ntarget: black_usb:Backup` (device identity for resolution)
 
-The `bit.Remote` module provides the `Remote` type which abstracts over both:
+All remote types get a **named git remote** inside `.bit/index/.git`:
+- Filesystem: `git remote add dok1 /path/to/remote/.bit/index`
+- Cloud: `git remote add backup .git/fetched_remote.bundle` (bundle as URL)
+- Device: `git remote add usb1 /mnt/usb/.bit/index` (URL updated at operation time)
+
+The `bit.Remote` module provides type-aware resolution via `resolveRemote`:
 ```
 resolveRemote :: FilePath -> String -> IO (Maybe Remote)
--- Tries .bit/remotes/<name> (device-aware), falls back to git config
+-- Dispatches on RemoteType:
+--   RemoteFilesystem → reads URL from git config, strips .bit/index suffix
+--   RemoteDevice     → resolves device UUID to mount path
+--   RemoteCloud      → reads target from remote file
+--   Nothing          → backward-compat fallback (infers type from old format)
 ```
 
 ### Transport Strategies
 
-The transport strategy is determined by `RemoteTarget` classification:
+The transport strategy is determined by `RemoteType` classification:
 
 ```
-Device.classifyRemotePath
-  ├── TargetCloud    → Cloud transport (bundle + rclone, existing flow)
-  ├── TargetDevice   → Filesystem transport (full repo at remote)
-  └── TargetLocalPath → Filesystem transport (full repo at remote)
+Device.readRemoteType / isFilesystemType
+  ├── RemoteCloud      → Cloud transport (bundle + rclone, existing flow)
+  ├── RemoteDevice     → Filesystem transport (full repo at remote)
+  └── RemoteFilesystem → Filesystem transport (full repo at remote)
 ```
 
 #### Cloud Transport (Bundle + Rclone)
@@ -2931,7 +2945,7 @@ Verifies local working tree files match their committed metadata. Scans the work
 
 ### `bit verify --remote`
 
-Detects remote type via `getRemoteTargetType`/`Device.isFilesystemTarget` and routes accordingly:
+Detects remote type via `getRemoteType`/`Device.isFilesystemType` and routes accordingly:
 
 - **Filesystem remotes**: Scans the remote working directory using `Verify.verifyLocalAt`, the same scan + git diff approach as local verification.
 - **Cloud remotes**: Fetches the remote bundle (committed metadata), scans remote files via `rclone lsjson --hash`, and compares.
@@ -3053,11 +3067,11 @@ Interactive per-file conflict resolution:
     (`--accept-remote`, `--force`, `--manual-merge`) serve as escape hatches when
     verification fails.
 
-12. **Transport strategy split**: Push and pull dispatch based on `RemoteTarget`
+12. **Transport strategy split**: Push and pull dispatch based on `RemoteType`
     classification. Cloud remotes use bundle + rclone (dumb storage). Filesystem
     remotes use direct git fetch/merge (smart storage — full bit repo at remote).
-    This split is keyed off `Device.classifyRemotePath` and happens in
-    `Bit.Core.push` and `Bit.Core.pull`. **Merge orchestration is unified**: Both
+    This split is keyed off `Device.readRemoteType`/`isFilesystemType` and happens
+    in `Bit.Core.push` and `Bit.Core.pull`. **Merge orchestration is unified**: Both
     cloud and filesystem pull paths use the same `pullLogic` and
     `pullAcceptRemoteImpl` functions, parameterized by a `FileTransport` that
     abstracts how files are copied. The transport is the only difference — all
@@ -3204,7 +3218,7 @@ Interactive per-file conflict resolution:
 | `bit/Remote.hs` | Remote type, resolution, RemoteState, FetchResult |
 | `bit/Remote/Scan.hs` | Remote file scanning via rclone |
 | `bit/RemoteWorkspace.hs` | Ephemeral remote workspace: `initRemote`, `addRemote`, `commitRemote`, `statusRemote`, `logRemote`; `withRemoteWorkspace` / `withRemoteWorkspaceReadOnly` orchestration; bundle inflation via `init+fetch+reset --hard` |
-| `bit/Device.hs` | Device identity, volume detection, .bit-store (strict IO, atomic writes) |
+| `bit/Device.hs` | Device identity, volume detection, .bit-store (strict IO, atomic writes), `RemoteType` classification, `isFixedDrive` |
 | `bit/DevicePrompt.hs` | Interactive device setup prompts |
 | `bit/Conflict.hs` | Conflict resolution: Resolution, DeletedSide, ConflictInfo, resolveAll |
 | `bit/Utils.hs` | Path utilities, filtering, atomic write re-exports |
